@@ -1,0 +1,117 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["T-Bug"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please provide detailed information to help us understand and fix the issue.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A concise description of the bug in 1-2 sentences.
+      placeholder: kagari-render panics on GPU device loss instead of recreating its resources.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current Behavior
+      description: What is currently happening?
+      placeholder: |
+        After the GPU device is lost (e.g. driver reset / TDR), the next frame
+        panics inside the renderer instead of recovering, terminating the app.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen instead?
+      placeholder: |
+        The renderer should detect the lost device, recreate GPU resources from
+        the CPU-side scene description, and continue rendering (docs/specs §1.11/§2.9).
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal code or steps to reproduce the bug.
+      placeholder: |
+        ```rust
+        use kagari::prelude::*;
+
+        // Build a window, then trigger a device loss (driver reset / GPU hot-unplug).
+        // Next redraw panics instead of recovering.
+        ```
+
+        Or run: `cargo test -p kagari-render -- test_name`
+    validations:
+      required: true
+
+  - type: textarea
+    id: error_output
+    attributes:
+      label: Error Output / Backtrace
+      description: Include any error messages, panics, or backtraces (`RUST_BACKTRACE=1`).
+      placeholder: |
+        thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Lost', crates/kagari-render/src/device.rs:142
+        stack backtrace:
+           0: rust_begin_unwind
+           1: kagari_render::device::acquire_frame
+           ...
+      render: shell
+
+  - type: input
+    id: crate_version
+    attributes:
+      label: Crate Version
+      description: Which version of kagari are you using?
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide your environment information.
+      placeholder: |
+        - OS: Windows 11 / macOS 15 / Ubuntu 24.04
+        - Rust: rustc 1.85.0 (output of `rustc --version`)
+        - wgpu backend: DX12 / Vulkan / Metal / GL
+        - GPU: NVIDIA RTX 4070 (driver 555.xx) / Apple M3 / AMD Radeon
+        - Architecture: x86_64 / aarch64
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other context that might be helpful (screenshot, related issues, workarounds).
+      placeholder: |
+        - Only reproducible on a specific GPU / driver version
+        - Workaround: forcing a single backend with WGPU_BACKEND avoids the panic
+        - Related to issue #123
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I have provided a minimal reproduction case
+          required: true
+        - label: I have tested on the latest published version
+          required: false
