@@ -10,7 +10,11 @@ kagari-base = { workspace = true }
 kagari-core = { workspace = true }
 kagari-style = { workspace = true }
 kagari-widgets = { workspace = true, optional = true }
+# `env-filter` is required for `EnvFilter`; only built under the `dev` feature.
+tracing-subscriber = { workspace = true, optional = true, features = ["env-filter"] }
 
 [features]
 default = ["widgets"]
 widgets = ["dep:kagari-widgets"]
+# Dev/test tracing subscriber init (examples and tests only); never enabled by apps.
+dev = ["dep:tracing-subscriber"]
