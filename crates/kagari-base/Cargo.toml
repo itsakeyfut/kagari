@@ -12,3 +12,6 @@ bytemuck = { workspace = true, optional = true, features = ["derive"] }
 [features]
 # Enables `bytemuck::Pod`/`Zeroable` derives so render can cast value types to bytes.
 bytemuck = ["dep:bytemuck"]
+
+[dev-dependencies]
+proptest = { workspace = true }
