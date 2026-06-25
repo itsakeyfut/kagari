@@ -7,4 +7,6 @@ pub enum AppError {
     DeviceInit(String),
     #[error("failed to create window: {0}")]
     WindowCreate(String),
+    #[error("render error: {0}")]
+    Render(#[from] kagari_render::RenderError),
 }
