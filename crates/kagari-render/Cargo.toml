@@ -7,3 +7,5 @@ rust-version.workspace = true
 
 [dependencies]
 kagari-base = { workspace = true }
+wgpu = { workspace = true }
+thiserror = { workspace = true }

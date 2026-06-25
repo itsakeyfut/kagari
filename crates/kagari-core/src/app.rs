@@ -24,9 +24,10 @@ struct WindowState {
     // path — no hand-written raw-window-handle lifetime and no `unsafe`.
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    // `device` is kept for surface reconfigure; the queue is owned by the renderer.
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
+    renderer: kagari_render::Renderer,
 }
 
 impl App {
@@ -65,20 +66,30 @@ impl App {
             .map_err(|e| AppError::DeviceInit(e.to_string()))?;
         let (device, queue, config) =
             pollster::block_on(init_gpu(&self.instance, &surface, window.inner_size()))?;
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
         surface.configure(&device, &config);
+
+        // The queue is moved into the renderer; the app shell keeps only `device`.
+        let renderer = kagari_render::Renderer::new(
+            device.clone(),
+            queue,
+            (config.width, config.height),
+            config.format,
+        );
 
         Ok(WindowState {
             window,
             surface,
-            device: Arc::new(device),
-            queue: Arc::new(queue),
+            device,
             config,
+            renderer,
         })
     }
 }
 
 impl WindowState {
-    fn redraw(&self) {
+    fn redraw(&mut self) {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
             Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
@@ -95,36 +106,14 @@ impl WindowState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("kagari.clear.encoder"),
-            });
+        // The renderer composites into its offscreen linear target and runs the
+        // output-transform pass into this swapchain frame.
+        if let Err(e) = self
+            .renderer
+            .render(&view, (self.config.width, self.config.height))
         {
-            // Solid clear; the renderer (offscreen + output transform) lands in #10.
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("kagari.clear.pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.07,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+            tracing::error!(error = %e, "render failed");
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
     }
 }
