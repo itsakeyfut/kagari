@@ -4,3 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+# `derive` brings in the Pod/Zeroable derive macros used by the value types.
+bytemuck = { workspace = true, optional = true, features = ["derive"] }
+
+[features]
+# Enables `bytemuck::Pod`/`Zeroable` derives so render can cast value types to bytes.
+bytemuck = ["dep:bytemuck"]
