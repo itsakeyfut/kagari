@@ -42,6 +42,7 @@ accesskit = "0.24.1"
 accesskit_winit = "0.33.1"
 raw-window-handle = "0.6.2"
 directories = "6.0"
+pollster = "0.4"           # block_on for wgpu's async init inside winit's sync handlers
 
 # dev (each crate references via { workspace = true } under [dev-dependencies]).
 proptest = "1.11"

@@ -11,3 +11,8 @@ kagari-render = { workspace = true }
 kagari-layout = { workspace = true }
 kagari-style = { workspace = true }
 kagari-text = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
