@@ -1,0 +1,6 @@
+[package]
+name = "kagari-base"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true

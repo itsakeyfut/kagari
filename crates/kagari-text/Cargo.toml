@@ -1,0 +1,10 @@
+[package]
+name = "kagari-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kagari-base = { workspace = true }
+kagari-render = { workspace = true }

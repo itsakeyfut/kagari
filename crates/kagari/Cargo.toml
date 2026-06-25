@@ -1,0 +1,16 @@
+[package]
+name = "kagari"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kagari-base = { workspace = true }
+kagari-core = { workspace = true }
+kagari-style = { workspace = true }
+kagari-widgets = { workspace = true, optional = true }
+
+[features]
+default = ["widgets"]
+widgets = ["dep:kagari-widgets"]

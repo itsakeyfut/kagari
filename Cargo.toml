@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates (path + version centralized; each crate references via { workspace = true }).
+kagari-base    = { path = "crates/kagari-base",    version = "0.0.0" }
+kagari-render  = { path = "crates/kagari-render",  version = "0.0.0" }
+kagari-style   = { path = "crates/kagari-style",   version = "0.0.0" }
+kagari-layout  = { path = "crates/kagari-layout",  version = "0.0.0" }
+kagari-text    = { path = "crates/kagari-text",    version = "0.0.0" }
+kagari-core    = { path = "crates/kagari-core",    version = "0.0.0" }
+kagari-widgets = { path = "crates/kagari-widgets", version = "0.0.0" }
+
+# External deps (versions centralized only; actually wired per-crate in implementation tasks M0-M9).
+# Pinned to the latest stable minor at scaffold time (caret allows latest patch).
+# winit stays on the 0.30 stable line; 0.31 is pre-release (beta) only.
+# The reactive runtime crate is TBD (added in #31 / Phase 3).
+wgpu = "29.0.3"
+winit = "0.30.13"
+taffy = "0.11"
+cosmic-text = "0.19"
+swash = "0.2.9"
+etagere = "0.3"
+lyon = "1.0.19"
+resvg = "0.47"
+image = "0.25.10"
+bytemuck = "1.25"
+glam = "0.33.1"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+serde = { version = "1.0.228", features = ["derive"] }
+ron = "0.12.2"
+accesskit = "0.24.1"
+accesskit_winit = "0.33.1"
+raw-window-handle = "0.6.2"
+directories = "6.0"
+
+# dev (each crate references via { workspace = true } under [dev-dependencies]).
+proptest = "1.11"
+criterion = "0.8.2"
