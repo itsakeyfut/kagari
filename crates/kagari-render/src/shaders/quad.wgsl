@@ -40,6 +40,9 @@ struct VsOut {
     @location(6) @interpolate(flat) bg_grad: vec4<f32>,   // gradient stop 1
     @location(7) @interpolate(flat) grad_dir: vec4<f32>,  // start.xy, end.xy in [0,1] quad space
     @location(8) @interpolate(flat) flags: u32,           // bit0: gradient bg
+    @location(9) @interpolate(flat) mask_offset: vec2<f32>, // quad_center - mask_center (logical px)
+    @location(10) @interpolate(flat) mask_half: vec2<f32>,  // content-mask half-extent
+    @location(11) @interpolate(flat) mask_radii: vec4<f32>, // content-mask corner radii (tl,tr,br,bl)
 };
 
 @vertex
@@ -62,6 +65,12 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceQuad) -> VsOut {
     out.bg_grad = inst.bg_grad_color;
     out.grad_dir = inst.bg_grad_dir;
     out.flags = inst.flags;
+    // Content mask is in absolute scene px (like bounds). Carry the constant offset
+    // from the quad center to the mask center so fs can reuse the quad-centered `p`.
+    out.mask_offset = (inst.bounds.xy + inst.bounds.zw * 0.5)
+        - (inst.mask_bounds.xy + inst.mask_bounds.zw * 0.5);
+    out.mask_half = inst.mask_bounds.zw * 0.5;
+    out.mask_radii = inst.mask_radii;
     return out;
 }
 
@@ -104,9 +113,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(dot(uv - in.grad_dir.xy, axis) / max(dot(axis, axis), 1.0e-6), 0.0, 1.0);
     let bg = mix(in.bg, in.bg_grad, t * f32(in.flags & 1u));
 
+    // Content-mask clip: a rounded-rect SDF at the mask rect, mapped into the
+    // fragment's quad-centered frame via mask_offset. Multiply the final coverage by
+    // the mask coverage (no discard) so the clip edge stays anti-aliased (gpu.md §4).
+    // A no-op (huge) mask leaves mask_cov ~= 1, so unclipped quads are unaffected.
+    let mask_p = p + in.mask_offset;
+    let mask_rad = min(corner_radius(mask_p, in.mask_radii), min(in.mask_half.x, in.mask_half.y));
+    let mask_cov = coverage(sd_rounded_box(mask_p, in.mask_half, mask_rad));
+
     // Border where outside the inner edge, background where inside; both blended by
     // SDF coverage so every edge stays anti-aliased. Premultiplied, so scaling the
     // whole RGBA by the outer coverage is the correct shape mask.
     let body = mix(in.border_color, bg, coverage(d_inner));
-    return body * coverage(d_outer);
+    return body * coverage(d_outer) * mask_cov;
 }
