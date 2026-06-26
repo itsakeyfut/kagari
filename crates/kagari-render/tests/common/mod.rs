@@ -14,6 +14,10 @@
 //!
 //! `expect`/`unwrap` are intentional here — this is test-only code.
 
+// Shared test-support module: each integration-test binary uses a different subset of
+// these helpers, so unused-in-one-binary items are expected (not dead code).
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -214,6 +218,24 @@ pub fn compare_golden(name: &str, img: &RgbaImage) {
             "golden {name}: max per-channel delta {max_delta} > 2 (actual written to {actual_path})"
         );
     }
+}
+
+/// Render `scene` headlessly and assert it matches the committed golden `name`,
+/// bundling the two skip-guards used by every golden test: no software adapter →
+/// skip; non-canonical rasterizer (e.g. local DX12 WARP) → render-only/skip-compare
+/// (see [`Rendered::canonical`]). The pixel comparison runs only on lavapipe (CI).
+pub fn assert_scene_golden(name: &str, scene: &mut Scene, size: (u32, u32), scale: f32) {
+    let Some(rendered) = headless_render(scene, size, scale) else {
+        eprintln!("skipping golden '{name}': no software adapter available");
+        return;
+    };
+    if !rendered.canonical {
+        eprintln!(
+            "skipping golden compare '{name}': non-canonical rasterizer (goldens are lavapipe-canonical)"
+        );
+        return;
+    }
+    compare_golden(name, &rendered.image);
 }
 
 /// Assert a rendered image matches the committed golden `name` (per-channel `≤ 2`).
