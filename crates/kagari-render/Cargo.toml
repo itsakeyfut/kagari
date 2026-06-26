@@ -12,5 +12,10 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Golden-image harness: readback decode/encode + blocking the async wgpu calls.
+image = { workspace = true }
+pollster = { workspace = true }
+
 [lints]
 workspace = true
