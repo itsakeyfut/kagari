@@ -70,8 +70,9 @@ impl InstanceSprite {
 
 /// Frame globals (uniform): physical viewport size + logical→physical scale. Mirrors
 /// `quad.rs`'s `Globals` (a future refactor could share one group-0 resource).
+/// `PartialEq` lets `prepare` skip the upload when the viewport/scale are unchanged.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Globals {
     viewport: [f32; 2],
     scale: f32,
@@ -91,6 +92,10 @@ pub(crate) struct SpriteRenderer {
     instances: Vec<InstanceSprite>,
     instance_buffer: wgpu::Buffer,
     instance_cap: u32,
+    /// Last-uploaded globals; the uniform is re-written only when it changes
+    /// (viewport/scale change on resize, not every frame). `None` until the first
+    /// upload and after device-loss recreation (forces a fresh write).
+    last_globals: Option<Globals>,
 }
 
 impl SpriteRenderer {
@@ -236,6 +241,7 @@ impl SpriteRenderer {
             instances: Vec::new(),
             instance_buffer,
             instance_cap: INITIAL_INSTANCE_CAP,
+            last_globals: None,
         }
     }
 
@@ -293,7 +299,11 @@ impl SpriteRenderer {
             scale,
             _pad: 0.0,
         };
-        queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        // Re-upload globals only when viewport/scale changed (typically just on resize).
+        if self.last_globals != Some(globals) {
+            queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+            self.last_globals = Some(globals);
+        }
         if !self.instances.is_empty() {
             queue.write_buffer(
                 &self.instance_buffer,
@@ -322,6 +332,45 @@ impl SpriteRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atlas::AtlasCoord;
+    use crate::scene::RoundedRect;
+    use kagari_base::Corners;
+
+    #[test]
+    fn sprite_should_pack_into_instance() {
+        // `from_sprite` is not a plain copy: uv is packed (min.xy, max.xy), `page` is
+        // copied, and `mask_offset = sprite_center - mask_center`. These match the
+        // `sprite.wgsl` instance layout, so a regression (uv min/max swap, sign flip)
+        // must fail here — the golden only runs on the canonical CI rasterizer.
+        let s = MonochromeSprite {
+            bounds: Rect::from_xywh(10.0, 20.0, 40.0, 16.0),
+            tex: AtlasCoord {
+                page: 3,
+                min: [0.1, 0.2],
+                max: [0.7, 0.9],
+            },
+            color: Color::new(0.2, 0.4, 0.6, 1.0),
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                radii: Corners {
+                    tl: 5.0,
+                    tr: 6.0,
+                    br: 7.0,
+                    bl: 8.0,
+                },
+            },
+            order: 0,
+        };
+        let inst = InstanceSprite::from_sprite(&s);
+        assert_eq!(inst.bounds, [10.0, 20.0, 40.0, 16.0]);
+        assert_eq!(inst.uv, [0.1, 0.2, 0.7, 0.9]); // min.xy, max.xy
+        assert_eq!(inst.color, [0.2, 0.4, 0.6, 1.0]);
+        assert_eq!(inst.page, 3);
+        // sprite_center (30, 28) - mask_center (50, 50).
+        assert_eq!(inst.mask_offset, [-20.0, -22.0]);
+        assert_eq!(inst.mask_half, [50.0, 50.0]);
+        assert_eq!(inst.mask_radii, [5.0, 6.0, 7.0, 8.0]);
+    }
 
     #[test]
     fn sprite_shader_should_pass_naga_validation() {

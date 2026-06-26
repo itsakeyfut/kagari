@@ -1,7 +1,9 @@
 //! kagari-render — instanced primitive renderer (wgpu).
 //!
-//! Phase 1 provides the offscreen linear target + output-transform pass; the Quad
-//! pipeline, atlas, and assets follow in later issues.
+//! Composites resolved primitives (`Quad`, `MonochromeSprite`) into an offscreen
+//! linear target via per-kind instanced pipelines and the multi-page R8 coverage
+//! atlas, then runs the output-transform pass to the swapchain. Further primitives
+//! and assets follow in later issues.
 
 mod atlas;
 mod color;
