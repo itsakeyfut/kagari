@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger for the `golden-update` job (regenerate references on lavapipe).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,3 +50,60 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo test --workspace --all-features
+
+  # Runs the golden-image tests on Mesa lavapipe (software Vulkan), the canonical
+  # rasterizer for kagari's goldens. The default `test` job has no software adapter,
+  # so the harness skips there; here it must execute (KAGARI_GOLDEN_REQUIRE_ADAPTER).
+  golden:
+    name: golden (lavapipe)
+    runs-on: ubuntu-latest
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      KAGARI_GOLDEN_REQUIRE_ADAPTER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Mesa lavapipe (software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - name: Vulkan adapter summary (diagnostic)
+        run: vulkaninfo --summary || true
+      - name: Run golden tests
+        run: cargo test -p kagari-render
+      - name: Upload mismatch images
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-actuals
+          path: crates/kagari-render/target/*-actual.png
+          if-no-files-found: ignore
+
+  # Manual: regenerate the golden references on lavapipe and upload them as an
+  # artifact. Download it and commit the PNGs to re-baseline (the dev machines have
+  # no lavapipe, so references are canonical to this job). Trigger via the Actions
+  # tab -> "CI" -> "Run workflow".
+  golden-update:
+    name: regenerate goldens (lavapipe, manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      KAGARI_GOLDEN_REQUIRE_ADAPTER: "1"
+      UPDATE_GOLDEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Mesa lavapipe (software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - name: Regenerate golden references
+        run: cargo test -p kagari-render
+      - name: Upload regenerated references
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-references
+          path: crates/kagari-render/tests/golden/*.png

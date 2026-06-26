@@ -186,7 +186,13 @@ pub fn compare_golden(name: &str, img: &RgbaImage) {
         .max()
         .unwrap_or(0);
     if max_delta > 2 {
+        // Write under the crate's `target/` (gitignored via `**/target/`) for CI to
+        // upload. The dir is created first: a workspace build emits to the root
+        // `/target`, so `crates/kagari-render/target/` does not otherwise exist.
         let actual_path = format!("{}/target/{name}-actual.png", env!("CARGO_MANIFEST_DIR"));
+        if let Some(parent) = std::path::Path::new(&actual_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = img.save(&actual_path);
         panic!(
             "golden {name}: max per-channel delta {max_delta} > 2 (actual written to {actual_path})"
