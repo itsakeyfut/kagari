@@ -10,7 +10,10 @@ kagari-base = { workspace = true }
 wgpu = { workspace = true }
 # `derive` brings in the Pod/Zeroable derive macros for the GPU instance structs.
 bytemuck = { workspace = true, features = ["derive"] }
+# Shelf packing for the monochrome glyph/coverage atlas.
+etagere = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Golden-image harness: readback decode/encode + blocking the async wgpu calls.

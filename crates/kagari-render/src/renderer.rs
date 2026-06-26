@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::atlas::Atlas;
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
 use crate::quad::QuadRenderer;
@@ -20,7 +21,13 @@ pub struct Renderer {
     output: OutputTransform,
     output_bind: wgpu::BindGroup,
     quad: QuadRenderer,
+    atlas: Atlas,
 }
+
+/// Monochrome atlas geometry: 4 pre-allocated 1024² R8 layers (4 MiB). Dynamic layer
+/// growth is post-MVP; see `atlas.rs`.
+const ATLAS_LAYER_SIZE: u32 = 1024;
+const ATLAS_MAX_LAYERS: u32 = 4;
 
 impl Renderer {
     /// `target_format` is the swapchain format (an sRGB format in MVP); the output
@@ -35,6 +42,12 @@ impl Renderer {
         let output = OutputTransform::new(&device, target_format);
         let output_bind = output.bind(&device, &offscreen.view);
         let quad = QuadRenderer::new(&device, OFFSCREEN_FORMAT);
+        let atlas = Atlas::new(
+            device.clone(),
+            queue.clone(),
+            ATLAS_LAYER_SIZE,
+            ATLAS_MAX_LAYERS,
+        );
         Self {
             device,
             queue,
@@ -44,7 +57,14 @@ impl Renderer {
             output,
             output_bind,
             quad,
+            atlas,
         }
+    }
+
+    /// The monochrome glyph/coverage atlas — `kagari-text` inserts rasterized glyphs
+    /// here (#22) and the sprite pipeline samples it (#19).
+    pub fn atlas_mut(&mut self) -> &mut Atlas {
+        &mut self.atlas
     }
 
     /// Render one frame: draw the scene's quads into the offscreen linear target,
@@ -138,5 +158,7 @@ impl Renderer {
         self.output = OutputTransform::new(&self.device, self.target_format);
         self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
+        // Re-create the atlas texture and re-upload every cached tile from its CPU cache.
+        self.atlas.recreate(self.device.clone(), self.queue.clone());
     }
 }
