@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
-use crate::color::{OffscreenTarget, OutputTransform};
+use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
+use crate::quad::QuadRenderer;
+use crate::scene::{PrimitiveKind, Scene};
 
 /// Owns the GPU resources for one window's rendering. The device/queue are shared
 /// from the app shell (gpu.md §1). All resources are reconstructable from
@@ -17,6 +19,7 @@ pub struct Renderer {
     offscreen: OffscreenTarget,
     output: OutputTransform,
     output_bind: wgpu::BindGroup,
+    quad: QuadRenderer,
 }
 
 impl Renderer {
@@ -31,6 +34,7 @@ impl Renderer {
         let offscreen = OffscreenTarget::new(&device, size);
         let output = OutputTransform::new(&device, target_format);
         let output_bind = output.bind(&device, &offscreen.view);
+        let quad = QuadRenderer::new(&device, OFFSCREEN_FORMAT);
         Self {
             device,
             queue,
@@ -39,15 +43,19 @@ impl Renderer {
             offscreen,
             output,
             output_bind,
+            quad,
         }
     }
 
-    /// Render one frame: clear the offscreen linear target (scene draws land here
-    /// from #11), then output-transform it into `target_view`.
+    /// Render one frame: draw the scene's quads into the offscreen linear target,
+    /// then output-transform it into `target_view`. `scale` is the logical→physical
+    /// pixel ratio (px coordinates in the scene are logical).
     pub fn render(
         &mut self,
+        scene: &mut Scene,
         target_view: &wgpu::TextureView,
         size: (u32, u32),
+        scale: f32,
     ) -> Result<(), RenderError> {
         if size != self.size {
             self.size = size;
@@ -55,16 +63,20 @@ impl Renderer {
             self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         }
 
+        let batches = self
+            .quad
+            .prepare(&self.device, &self.queue, scene, size, scale);
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("kagari.frame.encoder"),
             });
 
-        // Pass 1: clear the offscreen linear target. The clear color is a linear
-        // value; scene primitives will be drawn here in #11+.
+        // Pass 1: clear the offscreen linear target, then draw the primitive batches
+        // (painter's order). The clear color is a linear value.
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("kagari.offscreen.pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.offscreen.view,
@@ -85,6 +97,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            for batch in &batches {
+                match batch.kind {
+                    PrimitiveKind::Quad => self.quad.draw(&mut pass, batch),
+                }
+            }
         }
 
         // Pass 2: output transform — sample offscreen (linear) into the swapchain
@@ -120,5 +137,6 @@ impl Renderer {
         self.offscreen = OffscreenTarget::new(&self.device, self.size);
         self.output = OutputTransform::new(&self.device, self.target_format);
         self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
+        self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
     }
 }
