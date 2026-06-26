@@ -172,6 +172,27 @@ fn demo_scene() -> kagari_render::Scene {
         content_mask: no_clip,
         order: 3,
     });
+    // A square solid quad clipped to a smaller rounded-rect content mask (#15): only
+    // the part inside the rounded mask is visible, with an anti-aliased clip edge.
+    scene.quads.push(Quad {
+        bounds: Rect::from_xywh(380.0, 280.0, 200.0, 120.0),
+        corner_radii: Corners::default(),
+        bg: Background::Solid(Color::from_srgb([0.95, 0.65, 0.10, 1.0])),
+        border: Border {
+            widths: Edges::default(),
+            color: Color::TRANSPARENT,
+        },
+        content_mask: RoundedRect {
+            rect: Rect::from_xywh(410.0, 295.0, 140.0, 90.0),
+            radii: Corners {
+                tl: 30.0,
+                tr: 30.0,
+                br: 30.0,
+                bl: 30.0,
+            },
+        },
+        order: 4,
+    });
     scene
 }
 
