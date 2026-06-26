@@ -10,8 +10,14 @@ kagari-base = { workspace = true }
 kagari-render = { workspace = true }
 cosmic-text = { workspace = true }
 sys-locale = { workspace = true }
+swash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+wgpu = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
 
 [lints]
 workspace = true

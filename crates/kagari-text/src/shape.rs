@@ -95,10 +95,14 @@ impl ShapeKey {
     }
 }
 
-/// Owns the cosmic-text `FontSystem` and a shape-result cache.
+/// Owns the cosmic-text `FontSystem`, a shape-result cache, and the swash
+/// rasterization state (#22). `scale_context` and `glyph_cache` are used by
+/// `raster.rs`; the atlas itself (the glyph pixels + LRU) lives in the renderer.
 pub struct TextSystem {
-    font_system: FontSystem,
+    pub(crate) font_system: FontSystem,
     cache: HashMap<ShapeKey, ShapedText>,
+    pub(crate) scale_context: swash::scale::ScaleContext,
+    pub(crate) glyph_cache: HashMap<u64, crate::raster::GlyphMetrics>,
 }
 
 impl TextSystem {
@@ -114,6 +118,8 @@ impl TextSystem {
         Self {
             font_system: FontSystem::new_with_locale_and_db(locale, font_db.into_database()),
             cache: HashMap::new(),
+            scale_context: swash::scale::ScaleContext::new(),
+            glyph_cache: HashMap::new(),
         }
     }
 
