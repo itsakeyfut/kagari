@@ -57,8 +57,10 @@ jobs:
   golden:
     name: golden (lavapipe)
     runs-on: ubuntu-latest
+    # Do NOT pin VK_ICD_FILENAMES: the loader auto-discovers the ICD manifests in
+    # /usr/share/vulkan/icd.d/ (mesa-vulkan-drivers installs lavapipe there). Pinning
+    # a wrong path silently disables discovery → "found no drivers".
     env:
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       KAGARI_GOLDEN_REQUIRE_ADAPTER: "1"
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +69,9 @@ jobs:
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+          echo "--- Vulkan ICD manifests (loader auto-discovers these) ---"
+          ls -la /usr/share/vulkan/icd.d/ || true
       - name: Vulkan adapter summary (diagnostic)
         run: vulkaninfo --summary || true
       - name: Run golden tests
@@ -89,7 +93,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       KAGARI_GOLDEN_REQUIRE_ADAPTER: "1"
       UPDATE_GOLDEN: "1"
     steps:
@@ -99,7 +102,9 @@ jobs:
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+          echo "--- Vulkan ICD manifests (loader auto-discovers these) ---"
+          ls -la /usr/share/vulkan/icd.d/ || true
       - name: Regenerate golden references
         run: cargo test -p kagari-render
       - name: Upload regenerated references
