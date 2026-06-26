@@ -8,6 +8,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
+# Workspace-wide unsafe policy (docs/rules/unsafe.md). Each crate inherits via
+# `[lints] workspace = true`; safe crates additionally `#![forbid(unsafe_code)]`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "warn"
+
 [workspace.dependencies]
 # Internal crates (path + version centralized; each crate references via { workspace = true }).
 kagari-base    = { path = "crates/kagari-base",    version = "0.0.0" }

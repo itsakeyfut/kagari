@@ -9,3 +9,6 @@ rust-version.workspace = true
 kagari-base = { workspace = true }
 kagari-core = { workspace = true }
 kagari-style = { workspace = true }
+
+[lints]
+workspace = true

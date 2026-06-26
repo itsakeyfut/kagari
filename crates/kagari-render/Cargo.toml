@@ -11,3 +11,6 @@ wgpu = { workspace = true }
 # `derive` brings in the Pod/Zeroable derive macros for the GPU instance structs.
 bytemuck = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

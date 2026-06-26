@@ -18,3 +18,6 @@ default = ["widgets"]
 widgets = ["dep:kagari-widgets"]
 # Dev/test tracing subscriber init (examples and tests only); never enabled by apps.
 dev = ["dep:tracing-subscriber"]
+
+[lints]
+workspace = true

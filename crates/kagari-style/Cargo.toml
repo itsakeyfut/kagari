@@ -7,3 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 kagari-base = { workspace = true }
+
+[lints]
+workspace = true
