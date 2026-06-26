@@ -6,6 +6,8 @@
 mod color;
 pub mod error;
 pub mod renderer;
+pub mod scene;
 
 pub use error::RenderError;
 pub use renderer::Renderer;
+pub use scene::{Background, Batch, Border, PrimitiveKind, Quad, RoundedRect, Scene};
