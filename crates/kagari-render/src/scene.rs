@@ -67,12 +67,35 @@ pub struct MonochromeSprite {
     pub order: u32,
 }
 
+/// How an underline band is filled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnderlineStyle {
+    /// A continuous filled band.
+    Solid,
+    /// Periodic rectangular segments along the band's long axis (IME preedit, etc).
+    Dotted,
+}
+
+/// A resolved underline band (used for text underlines and IME preedit segments).
+/// `rect` is the band to fill; `thickness` derives the dotted segment period.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Underline {
+    pub rect: Rect,
+    pub color: Color,
+    pub style: UnderlineStyle,
+    pub thickness: f32,
+    pub content_mask: RoundedRect,
+    /// Painter's-order key (CPU-side only — not uploaded to the GPU).
+    pub order: u32,
+}
+
 /// The kind of primitive a batch draws (one pipeline per kind). More kinds are
-/// added alongside their primitives (Shadow, paths, underlines).
+/// added alongside their primitives (Shadow, paths).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrimitiveKind {
     Quad,
     Sprite,
+    Underline,
 }
 
 /// A contiguous run of one primitive kind: an instance range drawn in one call.
@@ -88,6 +111,7 @@ pub struct Batch {
 pub struct Scene {
     pub quads: Vec<Quad>,
     pub glyphs: Vec<MonochromeSprite>,
+    pub underlines: Vec<Underline>,
 }
 
 impl Scene {
@@ -99,6 +123,7 @@ impl Scene {
     pub fn clear(&mut self) {
         self.quads.clear();
         self.glyphs.clear();
+        self.underlines.clear();
     }
 
     /// Sort each primitive vector into painter's order, then **merge** them into one
@@ -111,31 +136,52 @@ impl Scene {
     /// (perf.md), mirroring how the instance `Vec`s are reused.
     ///
     /// The per-vector sort is stable (equal `order` keeps insertion order); ties
-    /// across kinds draw by kind priority (Quad before Sprite), per the painter's
-    /// order in the renderer design. Consecutive same-kind picks coalesce into one
-    /// batch (contiguous indices within a kind).
+    /// across kinds draw by kind priority (Quad before Sprite before Underline),
+    /// per the painter's order in the renderer design. Consecutive same-kind picks
+    /// coalesce into one batch (contiguous indices within a kind).
     pub fn batches_into(&mut self, out: &mut Vec<Batch>) {
         self.quads.sort_by_key(|q| q.order);
         self.glyphs.sort_by_key(|g| g.order);
+        self.underlines.sort_by_key(|u| u.order);
 
         out.clear();
-        let (mut qi, mut gi) = (0usize, 0usize);
+        let (mut qi, mut gi, mut ui) = (0usize, 0usize, 0usize);
         loop {
-            // Pick the next kind by (order, kind priority); a tie draws Quad first.
-            let take_quad = match (self.quads.get(qi), self.glyphs.get(gi)) {
-                (Some(q), Some(g)) => q.order <= g.order,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => break,
+            // Each kind's next head as (order, kind-priority); pick the minimum. The
+            // priorities are distinct, so the minimum is unique — equal `order` falls
+            // back to priority (Quad < Sprite < Underline).
+            let heads = [
+                self.quads.get(qi).map(|q| (q.order, PrimitiveKind::Quad)),
+                self.glyphs
+                    .get(gi)
+                    .map(|g| (g.order, PrimitiveKind::Sprite)),
+                self.underlines
+                    .get(ui)
+                    .map(|u| (u.order, PrimitiveKind::Underline)),
+            ];
+            let Some((_, kind)) = heads
+                .into_iter()
+                .flatten()
+                .min_by_key(|(order, kind)| (*order, kind_priority(*kind)))
+            else {
+                break;
             };
-            let (kind, idx) = if take_quad {
-                let i = qi as u32;
-                qi += 1;
-                (PrimitiveKind::Quad, i)
-            } else {
-                let i = gi as u32;
-                gi += 1;
-                (PrimitiveKind::Sprite, i)
+            let idx = match kind {
+                PrimitiveKind::Quad => {
+                    let i = qi as u32;
+                    qi += 1;
+                    i
+                }
+                PrimitiveKind::Sprite => {
+                    let i = gi as u32;
+                    gi += 1;
+                    i
+                }
+                PrimitiveKind::Underline => {
+                    let i = ui as u32;
+                    ui += 1;
+                    i
+                }
             };
             // Extend the previous batch if it is the same kind and contiguous,
             // otherwise start a new run.
@@ -147,6 +193,16 @@ impl Scene {
                 }),
             }
         }
+    }
+}
+
+/// Painter's-order priority for an equal-`order` tie: Quad first, then Sprite, then
+/// Underline (drawn last), per the renderer's frame flow.
+fn kind_priority(kind: PrimitiveKind) -> u8 {
+    match kind {
+        PrimitiveKind::Quad => 0,
+        PrimitiveKind::Sprite => 1,
+        PrimitiveKind::Underline => 2,
     }
 }
 
@@ -313,5 +369,52 @@ mod tests {
         let batches = collect_batches(&mut scene);
         assert_eq!(batches[0].kind, PrimitiveKind::Quad);
         assert_eq!(batches[1].kind, PrimitiveKind::Sprite);
+    }
+
+    fn test_underline(order: u32) -> Underline {
+        Underline {
+            rect: Rect::from_xywh(0.0, 0.0, 20.0, 2.0),
+            color: Color::new(1.0, 1.0, 1.0, 1.0),
+            style: UnderlineStyle::Solid,
+            thickness: 2.0,
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                radii: Corners::default(),
+            },
+            order,
+        }
+    }
+
+    #[test]
+    fn batches_should_sort_underlines_into_painter_order() {
+        let mut scene = Scene::new();
+        scene.underlines.push(test_underline(3));
+        scene.underlines.push(test_underline(1));
+        scene.underlines.push(test_underline(2));
+        let batches = collect_batches(&mut scene);
+        let orders: Vec<u32> = scene.underlines.iter().map(|u| u.order).collect();
+        assert_eq!(orders, vec![1, 2, 3]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].range, 0..3);
+        assert_eq!(batches[0].kind, PrimitiveKind::Underline);
+    }
+
+    #[test]
+    fn batches_should_draw_underline_last_on_tie() {
+        // Equal order across all three kinds → Quad, then Sprite, then Underline.
+        let mut scene = Scene::new();
+        scene.underlines.push(test_underline(7));
+        scene.glyphs.push(test_sprite(7));
+        scene.quads.push(test_quad(7));
+        let batches = collect_batches(&mut scene);
+        let kinds: Vec<PrimitiveKind> = batches.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PrimitiveKind::Quad,
+                PrimitiveKind::Sprite,
+                PrimitiveKind::Underline
+            ]
+        );
     }
 }
