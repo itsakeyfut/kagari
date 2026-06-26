@@ -5,6 +5,7 @@
 
 mod color;
 pub mod error;
+mod quad;
 pub mod renderer;
 pub mod scene;
 

@@ -5,6 +5,10 @@
 //! linear→sRGB encode. This is the architectural backbone for HDR/wide-gamut
 //! output later (§2.4 post-MVP), added non-destructively.
 
+/// The linear compositing format. Quads and the offscreen target share it so the
+/// quad pipeline's color target matches what the output pass samples.
+pub(crate) const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 /// The offscreen linear compositing target.
 pub(crate) struct OffscreenTarget {
     pub(crate) view: wgpu::TextureView,
@@ -22,7 +26,7 @@ impl OffscreenTarget {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
+            format: OFFSCREEN_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });

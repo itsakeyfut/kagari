@@ -28,6 +28,9 @@ struct WindowState {
     device: Arc<wgpu::Device>,
     config: wgpu::SurfaceConfiguration,
     renderer: kagari_render::Renderer,
+    // TEMP: a hand-built demo scene so the window shows quads. Replaced by the
+    // core paint walk (which builds the scene from the element tree) in M3.
+    scene: kagari_render::Scene,
 }
 
 impl App {
@@ -84,8 +87,47 @@ impl App {
             device,
             config,
             renderer,
+            scene: demo_scene(),
         })
     }
+}
+
+/// TEMP: a two-quad demo scene (overlapping, different colors/order) so #12's Quad
+/// pipeline is visible in the window. Replaced by the core paint walk in M3.
+fn demo_scene() -> kagari_render::Scene {
+    use kagari_base::{Color, Corners, Edges, Rect};
+    use kagari_render::{Background, Border, Quad, RoundedRect, Scene};
+
+    // #12 ignores the content mask (solid fill); a large mask is a no-op clip.
+    let no_clip = RoundedRect {
+        rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
+        radii: Corners::default(),
+    };
+    let solid = |bounds: Rect, color: Color, order: u32| Quad {
+        bounds,
+        corner_radii: Corners::default(),
+        bg: Background::Solid(color),
+        border: Border {
+            widths: Edges::default(),
+            color: Color::TRANSPARENT,
+        },
+        content_mask: no_clip,
+        order,
+    };
+
+    let mut scene = Scene::new();
+    scene.quads.push(solid(
+        Rect::from_xywh(40.0, 40.0, 240.0, 160.0),
+        Color::from_srgb([0.20, 0.50, 0.90, 1.0]),
+        0,
+    ));
+    // Semi-transparent red on top — exercises painter's order + premultiplied blend.
+    scene.quads.push(solid(
+        Rect::from_xywh(140.0, 120.0, 200.0, 140.0),
+        Color::from_srgb([0.90, 0.30, 0.30, 0.8]),
+        1,
+    ));
+    scene
 }
 
 impl WindowState {
@@ -106,12 +148,15 @@ impl WindowState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        // The renderer composites into its offscreen linear target and runs the
-        // output-transform pass into this swapchain frame.
-        if let Err(e) = self
-            .renderer
-            .render(&view, (self.config.width, self.config.height))
-        {
+        // The renderer composites the scene into its offscreen linear target and
+        // runs the output-transform pass into this swapchain frame.
+        let scale = self.window.scale_factor() as f32;
+        if let Err(e) = self.renderer.render(
+            &mut self.scene,
+            &view,
+            (self.config.width, self.config.height),
+            scale,
+        ) {
             tracing::error!(error = %e, "render failed");
         }
         frame.present();

@@ -8,4 +8,6 @@ rust-version.workspace = true
 [dependencies]
 kagari-base = { workspace = true }
 wgpu = { workspace = true }
+# `derive` brings in the Pod/Zeroable derive macros for the GPU instance structs.
+bytemuck = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
