@@ -78,6 +78,13 @@ impl FontDb {
     pub fn database(&self) -> &fontdb::Database {
         &self.db
     }
+
+    /// Consume `self` and yield the database (cosmic-text's `FontSystem` takes
+    /// ownership of it). The fallback chain is dropped — cosmic-text derives its
+    /// own coverage-based fallback from the database.
+    pub fn into_database(self) -> fontdb::Database {
+        self.db
+    }
 }
 
 impl Default for FontDb {

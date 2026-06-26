@@ -9,6 +9,7 @@ rust-version.workspace = true
 kagari-base = { workspace = true }
 kagari-render = { workspace = true }
 cosmic-text = { workspace = true }
+sys-locale = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
