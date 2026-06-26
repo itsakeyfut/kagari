@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 kagari-base = { workspace = true }
 kagari-render = { workspace = true }
+cosmic-text = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
