@@ -33,3 +33,13 @@ fn coverage(d: f32) -> f32 {
     let aa = fwidth(d);
     return 1.0 - smoothstep(-aa, aa, d);
 }
+
+// Content-mask clip coverage, shared by every primitive (quad/sprite/...). `p` is the
+// fragment in the shape's centered local space; `mask_offset = shape_center - mask_center`
+// maps it into the mask's frame. Returns ~1 inside the rounded-rect mask, 0 outside,
+// AA on the edge. A no-op (huge) mask yields ~1. Branch-free.
+fn mask_coverage(p: vec2<f32>, mask_offset: vec2<f32>, mask_half: vec2<f32>, mask_radii: vec4<f32>) -> f32 {
+    let mp = p + mask_offset;
+    let r = min(corner_radius(mp, mask_radii), min(mask_half.x, mask_half.y));
+    return coverage(sd_rounded_box(mp, mask_half, r));
+}

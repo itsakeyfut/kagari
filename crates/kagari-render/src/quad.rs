@@ -222,18 +222,17 @@ impl QuadRenderer {
         }
     }
 
-    /// Pack the scene's quads (sorted into painter's order), grow the instance
-    /// buffer if needed, upload globals + instances, and return the batches.
+    /// Pack the scene's quads (already order-sorted by `Scene::batches`, which the
+    /// renderer calls once across all kinds), grow the instance buffer if needed, and
+    /// upload globals + instances.
     pub(crate) fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        scene: &mut Scene,
+        scene: &Scene,
         viewport: (u32, u32),
         scale: f32,
-    ) -> Vec<Batch> {
-        let batches = scene.batches();
-
+    ) {
         self.instances.clear();
         self.instances
             .extend(scene.quads.iter().map(InstanceQuad::from_quad));
@@ -263,8 +262,6 @@ impl QuadRenderer {
                 bytemuck::cast_slice(&self.instances),
             );
         }
-
-        batches
     }
 
     /// Draw one quad batch (a `range` of instances) as `range.len()` instanced

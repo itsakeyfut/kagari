@@ -113,13 +113,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(dot(uv - in.grad_dir.xy, axis) / max(dot(axis, axis), 1.0e-6), 0.0, 1.0);
     let bg = mix(in.bg, in.bg_grad, t * f32(in.flags & 1u));
 
-    // Content-mask clip: a rounded-rect SDF at the mask rect, mapped into the
-    // fragment's quad-centered frame via mask_offset. Multiply the final coverage by
-    // the mask coverage (no discard) so the clip edge stays anti-aliased (gpu.md §4).
-    // A no-op (huge) mask leaves mask_cov ~= 1, so unclipped quads are unaffected.
-    let mask_p = p + in.mask_offset;
-    let mask_rad = min(corner_radius(mask_p, in.mask_radii), min(in.mask_half.x, in.mask_half.y));
-    let mask_cov = coverage(sd_rounded_box(mask_p, in.mask_half, mask_rad));
+    // Content-mask clip (shared prelude): multiply the final coverage by the mask
+    // coverage (no discard) so the clip edge stays anti-aliased (gpu.md §4). A no-op
+    // (huge) mask leaves mask_cov ~= 1, so unclipped quads are unaffected.
+    let mask_cov = mask_coverage(p, in.mask_offset, in.mask_half, in.mask_radii);
 
     // Border where outside the inner edge, background where inside; both blended by
     // SDF coverage so every edge stays anti-aliased. Premultiplied, so scaling the
