@@ -127,6 +127,29 @@ fn demo_scene() -> kagari_render::Scene {
         Color::from_srgb([0.90, 0.30, 0.30, 0.8]),
         1,
     ));
+    // A rounded, per-edge-bordered quad to exercise #13's SDF + border band + AA.
+    // Asymmetric radii and border widths make a corner/edge mix-up visually obvious.
+    scene.quads.push(Quad {
+        bounds: Rect::from_xywh(360.0, 60.0, 220.0, 180.0),
+        corner_radii: Corners {
+            tl: 24.0,
+            tr: 8.0,
+            br: 24.0,
+            bl: 8.0,
+        },
+        bg: Background::Solid(Color::from_srgb([0.15, 0.70, 0.45, 1.0])),
+        border: Border {
+            widths: Edges {
+                top: 6.0,
+                right: 2.0,
+                bottom: 6.0,
+                left: 12.0,
+            },
+            color: Color::from_srgb([0.95, 0.85, 0.20, 1.0]),
+        },
+        content_mask: no_clip,
+        order: 2,
+    });
     scene
 }
 

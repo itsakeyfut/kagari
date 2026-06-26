@@ -90,6 +90,15 @@ struct Globals {
     _pad: f32,
 }
 
+/// The Quad shader: the shared SDF/AA prelude composed ahead of the quad shader
+/// (wgsl.md §1). `concat!` keeps the composed source available to the build/dev
+/// Naga validation test so it validates the exact bytes shipped to the GPU.
+const QUAD_SHADER_SRC: &str = concat!(
+    include_str!("shaders/sdf.wgsl"),
+    "\n",
+    include_str!("shaders/quad.wgsl"),
+);
+
 const INITIAL_INSTANCE_CAP: u32 = 64;
 
 /// The Quad pipeline plus its globals + growable instance buffer.
@@ -106,7 +115,7 @@ impl QuadRenderer {
     pub(crate) fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kagari.quad.shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/quad.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(QUAD_SHADER_SRC.into()),
         });
 
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -306,6 +315,21 @@ mod tests {
             },
             order: 0,
         }
+    }
+
+    #[test]
+    fn quad_shader_should_pass_naga_validation() {
+        // Parse + validate the composed shader (prelude + quad) without a GPU, so
+        // WGSL errors fail `cargo test` in CI rather than surfacing at device init.
+        // `wgpu::naga` is re-exported, so its version always matches wgpu's.
+        let module =
+            wgpu::naga::front::wgsl::parse_str(QUAD_SHADER_SRC).expect("quad WGSL should parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("quad WGSL should validate");
     }
 
     #[test]
