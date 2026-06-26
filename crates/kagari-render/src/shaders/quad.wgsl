@@ -36,7 +36,10 @@ struct VsOut {
     @location(2) @interpolate(flat) corner_radii: vec4<f32>,
     @location(3) @interpolate(flat) border_widths: vec4<f32>,
     @location(4) @interpolate(flat) border_color: vec4<f32>,
-    @location(5) @interpolate(flat) bg: vec4<f32>,
+    @location(5) @interpolate(flat) bg: vec4<f32>,        // solid / gradient stop 0
+    @location(6) @interpolate(flat) bg_grad: vec4<f32>,   // gradient stop 1
+    @location(7) @interpolate(flat) grad_dir: vec4<f32>,  // start.xy, end.xy in [0,1] quad space
+    @location(8) @interpolate(flat) flags: u32,           // bit0: gradient bg
 };
 
 @vertex
@@ -56,6 +59,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: InstanceQuad) -> VsOut {
     out.border_widths = inst.border_widths;
     out.border_color = inst.border_color;
     out.bg = inst.bg_color;
+    out.bg_grad = inst.bg_grad_color;
+    out.grad_dir = inst.bg_grad_dir;
+    out.flags = inst.flags;
     return out;
 }
 
@@ -88,9 +94,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r_inner = clamp(rad - adj, 0.0, min(inner_half.x, inner_half.y));
     let d_inner = sd_rounded_box(pi, inner_half, r_inner);
 
+    // Background fill: solid stop-0, or a 2-stop linear gradient. The gradient axis
+    // (start->end) and the fragment are both in [0,1] quad-local UV, so `t` projects
+    // the fragment onto the axis. Mixing premultiplied linear keeps it from going
+    // muddy (wgsl.md §7). Branch-free: solid quads have grad_dir = 0 and the flag
+    // clear, so the factor is 0 and `bg` stays exactly stop-0.
+    let uv = in.local / max(in.half * 2.0, vec2<f32>(1.0e-6));
+    let axis = in.grad_dir.zw - in.grad_dir.xy;
+    let t = clamp(dot(uv - in.grad_dir.xy, axis) / max(dot(axis, axis), 1.0e-6), 0.0, 1.0);
+    let bg = mix(in.bg, in.bg_grad, t * f32(in.flags & 1u));
+
     // Border where outside the inner edge, background where inside; both blended by
     // SDF coverage so every edge stays anti-aliased. Premultiplied, so scaling the
     // whole RGBA by the outer coverage is the correct shape mask.
-    let body = mix(in.border_color, in.bg, coverage(d_inner));
+    let body = mix(in.border_color, bg, coverage(d_inner));
     return body * coverage(d_outer);
 }

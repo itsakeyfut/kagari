@@ -92,10 +92,10 @@ impl App {
     }
 }
 
-/// TEMP: a two-quad demo scene (overlapping, different colors/order) so #12's Quad
-/// pipeline is visible in the window. Replaced by the core paint walk in M3.
+/// TEMP: a demo scene (solid, semi-transparent, rounded-bordered, and gradient quads)
+/// so the Quad pipeline is visible in the window. Replaced by the core paint walk in M3.
 fn demo_scene() -> kagari_render::Scene {
-    use kagari_base::{Color, Corners, Edges, Rect};
+    use kagari_base::{Color, Corners, Edges, Point, Rect};
     use kagari_render::{Background, Border, Quad, RoundedRect, Scene};
 
     // #12 ignores the content mask (solid fill); a large mask is a no-op clip.
@@ -149,6 +149,28 @@ fn demo_scene() -> kagari_render::Scene {
         },
         content_mask: no_clip,
         order: 2,
+    });
+    // A rounded quad with a diagonal 2-stop linear gradient to exercise #14.
+    scene.quads.push(Quad {
+        bounds: Rect::from_xywh(60.0, 280.0, 260.0, 120.0),
+        corner_radii: Corners {
+            tl: 16.0,
+            tr: 16.0,
+            br: 16.0,
+            bl: 16.0,
+        },
+        bg: Background::LinearGradient {
+            start: Color::from_srgb([0.10, 0.20, 0.80, 1.0]),
+            end: Color::from_srgb([0.90, 0.20, 0.50, 1.0]),
+            start_point: Point::new(0.0, 0.0),
+            end_point: Point::new(1.0, 1.0),
+        },
+        border: Border {
+            widths: Edges::default(),
+            color: Color::TRANSPARENT,
+        },
+        content_mask: no_clip,
+        order: 3,
     });
     scene
 }
