@@ -23,10 +23,21 @@ use kagari_render::{Renderer, Scene};
 /// wgpu requires `bytes_per_row` of a texture→buffer copy to be 256-byte aligned.
 const ROW_ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
+/// A headless render result: the read-back image plus whether it was produced on the
+/// canonical golden rasterizer (Mesa lavapipe / "llvmpipe").
+pub struct Rendered {
+    pub image: RgbaImage,
+    /// `true` only on Mesa lavapipe. Goldens are committed from lavapipe, and the
+    /// f16-offscreen + sRGB-encode path is not bit-identical across software
+    /// rasterizers (DX12 WARP differs by ~15/255 even for a flat fill), so a pixel
+    /// comparison is only meaningful here — callers render-only on other adapters.
+    pub canonical: bool,
+}
+
 /// Render `scene` headlessly into an `Rgba8UnormSrgb` offscreen target and read it
-/// back into an RGBA8 image. Returns `None` when no software adapter is available
-/// (e.g. a GPU-less CI without lavapipe), so callers can skip rather than fail.
-pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Option<RgbaImage> {
+/// back. Returns `None` when no software adapter is available (e.g. a GPU-less CI
+/// without lavapipe), so callers can skip rather than fail.
+pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Option<Rendered> {
     let (width, height) = size;
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -55,6 +66,9 @@ pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Optio
             return None;
         }
     };
+
+    // Goldens are canonical to Mesa lavapipe ("llvmpipe"); see `Rendered::canonical`.
+    let canonical = adapter.get_info().name.to_lowercase().contains("llvmpipe");
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("kagari.headless.device"),
@@ -149,7 +163,9 @@ pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Optio
     drop(mapped);
     buffer.unmap();
 
-    Some(RgbaImage::from_raw(width, height, pixels).expect("readback pixels should fill the image"))
+    let image =
+        RgbaImage::from_raw(width, height, pixels).expect("readback pixels should fill the image");
+    Some(Rendered { image, canonical })
 }
 
 /// Compare `img` to the committed reference `tests/golden/{name}.png` within a
@@ -186,7 +202,13 @@ pub fn compare_golden(name: &str, img: &RgbaImage) {
         .max()
         .unwrap_or(0);
     if max_delta > 2 {
+        // Write under the crate's `target/` (gitignored via `**/target/`) for CI to
+        // upload. The dir is created first: a workspace build emits to the root
+        // `/target`, so `crates/kagari-render/target/` does not otherwise exist.
         let actual_path = format!("{}/target/{name}-actual.png", env!("CARGO_MANIFEST_DIR"));
+        if let Some(parent) = std::path::Path::new(&actual_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = img.save(&actual_path);
         panic!(
             "golden {name}: max per-channel delta {max_delta} > 2 (actual written to {actual_path})"
