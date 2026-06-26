@@ -9,6 +9,7 @@ use crate::error::RenderError;
 use crate::quad::QuadRenderer;
 use crate::scene::{Batch, PrimitiveKind, Scene};
 use crate::sprite::SpriteRenderer;
+use crate::underline::UnderlineRenderer;
 
 /// Owns the GPU resources for one window's rendering. The device/queue are shared
 /// from the app shell (gpu.md §1). All resources are reconstructable from
@@ -23,6 +24,7 @@ pub struct Renderer {
     output_bind: wgpu::BindGroup,
     quad: QuadRenderer,
     sprite: SpriteRenderer,
+    underline: UnderlineRenderer,
     atlas: Atlas,
     /// Group-1 bind group for the sprite pipeline (atlas array + sampler). Rebuilt
     /// when the atlas texture is re-created (device loss).
@@ -57,6 +59,7 @@ impl Renderer {
             ATLAS_MAX_LAYERS,
         );
         let sprite = SpriteRenderer::new(&device, OFFSCREEN_FORMAT);
+        let underline = UnderlineRenderer::new(&device, OFFSCREEN_FORMAT);
         let atlas_bind = sprite.make_atlas_bind(&device, atlas.texture_view());
         Self {
             device,
@@ -68,6 +71,7 @@ impl Renderer {
             output_bind,
             quad,
             sprite,
+            underline,
             atlas,
             atlas_bind,
             batches: Vec::new(),
@@ -104,6 +108,8 @@ impl Renderer {
             .prepare(&self.device, &self.queue, scene, size, scale);
         self.sprite
             .prepare(&self.device, &self.queue, scene, size, scale);
+        self.underline
+            .prepare(&self.device, &self.queue, scene, size, scale);
 
         let mut encoder = self
             .device
@@ -139,6 +145,7 @@ impl Renderer {
                 match batch.kind {
                     PrimitiveKind::Quad => self.quad.draw(&mut pass, batch),
                     PrimitiveKind::Sprite => self.sprite.draw(&mut pass, batch, &self.atlas_bind),
+                    PrimitiveKind::Underline => self.underline.draw(&mut pass, batch),
                 }
             }
         }
@@ -178,6 +185,7 @@ impl Renderer {
         self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.sprite = SpriteRenderer::new(&self.device, OFFSCREEN_FORMAT);
+        self.underline = UnderlineRenderer::new(&self.device, OFFSCREEN_FORMAT);
         // Re-create the atlas texture and re-upload every cached tile from its CPU cache,
         // then rebuild the sprite's atlas bind group against the new texture view.
         self.atlas.recreate(self.device.clone(), self.queue.clone());
