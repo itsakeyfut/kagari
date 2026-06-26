@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Shared base value types and their operations for kagari.
 
 pub mod color;

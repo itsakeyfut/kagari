@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! kagari — facade crate.
 //!
 //! Re-exports the public API of the kagari crates from one entry point (added as
