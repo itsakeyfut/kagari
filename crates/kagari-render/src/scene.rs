@@ -10,6 +10,8 @@ use std::ops::Range;
 
 use kagari_base::{Color, Corners, Edges, Point, Rect};
 
+use crate::atlas::AtlasCoord;
+
 /// A rounded rectangle, used as a content-mask clip region.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RoundedRect {
@@ -53,11 +55,24 @@ pub struct Quad {
     pub order: u32,
 }
 
+/// A monochrome sprite: an alpha-coverage tile from the R8 atlas (#18) multiplied by
+/// a color (glyphs, coverage masks). `bounds` is integer-snapped by the producer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MonochromeSprite {
+    pub bounds: Rect,
+    pub tex: AtlasCoord,
+    pub color: Color,
+    pub content_mask: RoundedRect,
+    /// Painter's-order key (CPU-side only — not uploaded to the GPU).
+    pub order: u32,
+}
+
 /// The kind of primitive a batch draws (one pipeline per kind). More kinds are
-/// added alongside their primitives (Shadow, sprites, paths, underlines).
+/// added alongside their primitives (Shadow, paths, underlines).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrimitiveKind {
     Quad,
+    Sprite,
 }
 
 /// A contiguous run of one primitive kind: an instance range drawn in one call.
@@ -72,6 +87,7 @@ pub struct Batch {
 #[derive(Default)]
 pub struct Scene {
     pub quads: Vec<Quad>,
+    pub glyphs: Vec<MonochromeSprite>,
 }
 
 impl Scene {
@@ -82,23 +98,54 @@ impl Scene {
     /// Clear all primitives, retaining allocated capacity for next frame.
     pub fn clear(&mut self) {
         self.quads.clear();
+        self.glyphs.clear();
     }
 
-    /// Sort primitives into painter's order and return the per-kind batches.
+    /// Sort each primitive vector into painter's order, then **merge** them into one
+    /// painter's-order sequence of batches written into `out`. Each `Batch { kind,
+    /// range }`'s `range` indexes that kind's instance buffer, which the per-kind
+    /// renderer packs in the same (now order-sorted) order — so the ranges line up.
     ///
-    /// The sort is stable, so primitives with equal `order` keep insertion order.
-    /// With a single primitive kind this yields one `Quad` batch covering the
-    /// order-sorted quads; merging multiple per-type vectors and splitting them
-    /// into contiguous same-kind runs is the extension once more kinds exist.
-    pub fn batches(&mut self) -> Vec<Batch> {
+    /// `out` is cleared first and its capacity is retained, so the caller (the
+    /// renderer) reuses one buffer across frames rather than allocating per frame
+    /// (perf.md), mirroring how the instance `Vec`s are reused.
+    ///
+    /// The per-vector sort is stable (equal `order` keeps insertion order); ties
+    /// across kinds draw by kind priority (Quad before Sprite), per the painter's
+    /// order in the renderer design. Consecutive same-kind picks coalesce into one
+    /// batch (contiguous indices within a kind).
+    pub fn batches_into(&mut self, out: &mut Vec<Batch>) {
         self.quads.sort_by_key(|q| q.order);
-        if self.quads.is_empty() {
-            Vec::new()
-        } else {
-            vec![Batch {
-                kind: PrimitiveKind::Quad,
-                range: 0..self.quads.len() as u32,
-            }]
+        self.glyphs.sort_by_key(|g| g.order);
+
+        out.clear();
+        let (mut qi, mut gi) = (0usize, 0usize);
+        loop {
+            // Pick the next kind by (order, kind priority); a tie draws Quad first.
+            let take_quad = match (self.quads.get(qi), self.glyphs.get(gi)) {
+                (Some(q), Some(g)) => q.order <= g.order,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (kind, idx) = if take_quad {
+                let i = qi as u32;
+                qi += 1;
+                (PrimitiveKind::Quad, i)
+            } else {
+                let i = gi as u32;
+                gi += 1;
+                (PrimitiveKind::Sprite, i)
+            };
+            // Extend the previous batch if it is the same kind and contiguous,
+            // otherwise start a new run.
+            match out.last_mut() {
+                Some(b) if b.kind == kind && b.range.end == idx => b.range.end = idx + 1,
+                _ => out.push(Batch {
+                    kind,
+                    range: idx..idx + 1,
+                }),
+            }
         }
     }
 }
@@ -135,13 +182,21 @@ mod tests {
         assert!(scene.quads.capacity() >= cap);
     }
 
+    /// Collect a scene's batches into a fresh buffer (the test-side mirror of how the
+    /// renderer reuses one across frames).
+    fn collect_batches(scene: &mut Scene) -> Vec<Batch> {
+        let mut out = Vec::new();
+        scene.batches_into(&mut out);
+        out
+    }
+
     #[test]
     fn batches_should_sort_quads_into_painter_order() {
         let mut scene = Scene::new();
         scene.quads.push(test_quad(3));
         scene.quads.push(test_quad(1));
         scene.quads.push(test_quad(2));
-        let batches = scene.batches();
+        let batches = collect_batches(&mut scene);
         let orders: Vec<u32> = scene.quads.iter().map(|q| q.order).collect();
         assert_eq!(orders, vec![1, 2, 3]);
         assert_eq!(batches.len(), 1);
@@ -159,7 +214,7 @@ mod tests {
         b.bounds = Rect::from_xywh(2.0, 0.0, 10.0, 10.0);
         scene.quads.push(a);
         scene.quads.push(b);
-        scene.batches();
+        collect_batches(&mut scene);
         assert_eq!(scene.quads[0].bounds.origin.x, 1.0);
         assert_eq!(scene.quads[1].bounds.origin.x, 2.0);
     }
@@ -167,6 +222,96 @@ mod tests {
     #[test]
     fn batches_should_be_empty_for_empty_scene() {
         let mut scene = Scene::new();
-        assert!(scene.batches().is_empty());
+        assert!(collect_batches(&mut scene).is_empty());
+    }
+
+    #[test]
+    fn batches_into_should_reuse_buffer_capacity() {
+        // The renderer reuses one batch buffer across frames: a second fill into the
+        // same `out` clears it (no stale batches) and keeps the allocated capacity.
+        let mut scene = Scene::new();
+        scene.quads.push(test_quad(0));
+        scene.quads.push(test_quad(1));
+        let mut out = Vec::new();
+        scene.batches_into(&mut out);
+        let cap = out.capacity();
+        scene.clear();
+        scene.quads.push(test_quad(0));
+        scene.batches_into(&mut out);
+        assert_eq!(out.len(), 1, "no stale batches from the previous fill");
+        assert!(out.capacity() >= cap, "capacity retained for reuse");
+    }
+
+    fn test_sprite(order: u32) -> MonochromeSprite {
+        MonochromeSprite {
+            bounds: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            tex: AtlasCoord {
+                page: 0,
+                min: [0.0, 0.0],
+                max: [1.0, 1.0],
+            },
+            color: Color::new(1.0, 1.0, 1.0, 1.0),
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+                radii: Corners::default(),
+            },
+            order,
+        }
+    }
+
+    #[test]
+    fn batches_should_sort_sprites_into_painter_order() {
+        // Sprites-only: exercises the `(None, Some(_))` pick branch and the coalescing
+        // of a consecutive same-kind run into one Sprite batch (range 0..3) — the
+        // interleave/tie tests only ever produce single-element Sprite batches.
+        let mut scene = Scene::new();
+        scene.glyphs.push(test_sprite(3));
+        scene.glyphs.push(test_sprite(1));
+        scene.glyphs.push(test_sprite(2));
+        let batches = collect_batches(&mut scene);
+        let orders: Vec<u32> = scene.glyphs.iter().map(|g| g.order).collect();
+        assert_eq!(orders, vec![1, 2, 3]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].range, 0..3);
+        assert_eq!(batches[0].kind, PrimitiveKind::Sprite);
+    }
+
+    #[test]
+    fn batches_should_interleave_quads_and_sprites_by_order() {
+        // quads at orders 0 and 2, a sprite at order 1 → Quad, Sprite, Quad. The quad
+        // buffer is packed [order 0, order 2] so the two Quad batches index 0..1 / 1..2.
+        let mut scene = Scene::new();
+        scene.quads.push(test_quad(0));
+        scene.quads.push(test_quad(2));
+        scene.glyphs.push(test_sprite(1));
+        let batches = collect_batches(&mut scene);
+        assert_eq!(
+            batches,
+            vec![
+                Batch {
+                    kind: PrimitiveKind::Quad,
+                    range: 0..1
+                },
+                Batch {
+                    kind: PrimitiveKind::Sprite,
+                    range: 0..1
+                },
+                Batch {
+                    kind: PrimitiveKind::Quad,
+                    range: 1..2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn batches_should_draw_quad_before_sprite_on_tie() {
+        // Equal order → Quad batch precedes the Sprite batch (kind priority).
+        let mut scene = Scene::new();
+        scene.glyphs.push(test_sprite(5));
+        scene.quads.push(test_quad(5));
+        let batches = collect_batches(&mut scene);
+        assert_eq!(batches[0].kind, PrimitiveKind::Quad);
+        assert_eq!(batches[1].kind, PrimitiveKind::Sprite);
     }
 }

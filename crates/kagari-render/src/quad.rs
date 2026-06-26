@@ -82,8 +82,9 @@ impl InstanceQuad {
 }
 
 /// Frame globals (uniform): physical viewport size + logical→physical scale.
+/// `PartialEq` lets `prepare` skip the upload when the viewport/scale are unchanged.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Globals {
     viewport: [f32; 2],
     scale: f32,
@@ -109,6 +110,10 @@ pub(crate) struct QuadRenderer {
     instances: Vec<InstanceQuad>,
     instance_buffer: wgpu::Buffer,
     instance_cap: u32,
+    /// Last-uploaded globals; the uniform is re-written only when it changes
+    /// (viewport/scale change on resize, not every frame). `None` until the first
+    /// upload and after device-loss recreation (forces a fresh write).
+    last_globals: Option<Globals>,
 }
 
 impl QuadRenderer {
@@ -219,21 +224,21 @@ impl QuadRenderer {
             instances: Vec::new(),
             instance_buffer,
             instance_cap: INITIAL_INSTANCE_CAP,
+            last_globals: None,
         }
     }
 
-    /// Pack the scene's quads (sorted into painter's order), grow the instance
-    /// buffer if needed, upload globals + instances, and return the batches.
+    /// Pack the scene's quads (already order-sorted by `Scene::batches`, which the
+    /// renderer calls once across all kinds), grow the instance buffer if needed, and
+    /// upload globals + instances.
     pub(crate) fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        scene: &mut Scene,
+        scene: &Scene,
         viewport: (u32, u32),
         scale: f32,
-    ) -> Vec<Batch> {
-        let batches = scene.batches();
-
+    ) {
         self.instances.clear();
         self.instances
             .extend(scene.quads.iter().map(InstanceQuad::from_quad));
@@ -255,7 +260,11 @@ impl QuadRenderer {
             scale,
             _pad: 0.0,
         };
-        queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        // Re-upload globals only when viewport/scale changed (typically just on resize).
+        if self.last_globals != Some(globals) {
+            queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+            self.last_globals = Some(globals);
+        }
         if !self.instances.is_empty() {
             queue.write_buffer(
                 &self.instance_buffer,
@@ -263,8 +272,6 @@ impl QuadRenderer {
                 bytemuck::cast_slice(&self.instances),
             );
         }
-
-        batches
     }
 
     /// Draw one quad batch (a `range` of instances) as `range.len()` instanced

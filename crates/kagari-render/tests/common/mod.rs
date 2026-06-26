@@ -38,10 +38,21 @@ pub struct Rendered {
     pub canonical: bool,
 }
 
-/// Render `scene` headlessly into an `Rgba8UnormSrgb` offscreen target and read it
-/// back. Returns `None` when no software adapter is available (e.g. a GPU-less CI
-/// without lavapipe), so callers can skip rather than fail.
+/// Render a pre-built `scene` headlessly (see [`headless_render_with`]).
 pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Option<Rendered> {
+    headless_render_with(size, scale, |_| std::mem::take(scene))
+}
+
+/// Render headlessly into an `Rgba8UnormSrgb` offscreen target and read it back.
+/// `build` receives the `Renderer` so a caller can seed GPU state (e.g. insert atlas
+/// tiles via `renderer.atlas_mut()`) before constructing the `Scene` it returns.
+/// Returns `None` when no software adapter is available (e.g. a GPU-less CI without
+/// lavapipe), so callers can skip rather than fail.
+pub fn headless_render_with(
+    size: (u32, u32),
+    scale: f32,
+    build: impl FnOnce(&mut Renderer) -> Scene,
+) -> Option<Rendered> {
     let (width, height) = size;
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -91,6 +102,9 @@ pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Optio
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(device.clone(), queue.clone(), size, format);
 
+    // The caller seeds GPU state (e.g. atlas tiles) and returns the scene to render.
+    let mut scene = build(&mut renderer);
+
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("kagari.headless.target"),
         size: wgpu::Extent3d {
@@ -107,7 +121,7 @@ pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Optio
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     renderer
-        .render(scene, &view, size, scale)
+        .render(&mut scene, &view, size, scale)
         .expect("headless render should succeed");
 
     // Texture → buffer copy with a 256-byte-aligned row stride, then de-pad on read.

@@ -7,7 +7,8 @@ use crate::atlas::Atlas;
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
 use crate::quad::QuadRenderer;
-use crate::scene::{PrimitiveKind, Scene};
+use crate::scene::{Batch, PrimitiveKind, Scene};
+use crate::sprite::SpriteRenderer;
 
 /// Owns the GPU resources for one window's rendering. The device/queue are shared
 /// from the app shell (gpu.md §1). All resources are reconstructable from
@@ -21,7 +22,14 @@ pub struct Renderer {
     output: OutputTransform,
     output_bind: wgpu::BindGroup,
     quad: QuadRenderer,
+    sprite: SpriteRenderer,
     atlas: Atlas,
+    /// Group-1 bind group for the sprite pipeline (atlas array + sampler). Rebuilt
+    /// when the atlas texture is re-created (device loss).
+    atlas_bind: wgpu::BindGroup,
+    /// Reused across frames so the per-frame painter's-order merge does not allocate
+    /// (filled by `Scene::batches_into`; perf.md).
+    batches: Vec<Batch>,
 }
 
 /// Monochrome atlas geometry: 4 pre-allocated 1024² R8 layers (4 MiB). Dynamic layer
@@ -48,6 +56,8 @@ impl Renderer {
             ATLAS_LAYER_SIZE,
             ATLAS_MAX_LAYERS,
         );
+        let sprite = SpriteRenderer::new(&device, OFFSCREEN_FORMAT);
+        let atlas_bind = sprite.make_atlas_bind(&device, atlas.texture_view());
         Self {
             device,
             queue,
@@ -57,7 +67,10 @@ impl Renderer {
             output,
             output_bind,
             quad,
+            sprite,
             atlas,
+            atlas_bind,
+            batches: Vec::new(),
         }
     }
 
@@ -83,8 +96,13 @@ impl Renderer {
             self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         }
 
-        let batches = self
-            .quad
+        // Sort + merge all primitive kinds into one painter's-order batch list (into
+        // the reused buffer), then pack each kind's instances (in that order) so the
+        // batch ranges line up.
+        scene.batches_into(&mut self.batches);
+        self.quad
+            .prepare(&self.device, &self.queue, scene, size, scale);
+        self.sprite
             .prepare(&self.device, &self.queue, scene, size, scale);
 
         let mut encoder = self
@@ -117,9 +135,10 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            for batch in &batches {
+            for batch in &self.batches {
                 match batch.kind {
                     PrimitiveKind::Quad => self.quad.draw(&mut pass, batch),
+                    PrimitiveKind::Sprite => self.sprite.draw(&mut pass, batch, &self.atlas_bind),
                 }
             }
         }
@@ -158,7 +177,12 @@ impl Renderer {
         self.output = OutputTransform::new(&self.device, self.target_format);
         self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
-        // Re-create the atlas texture and re-upload every cached tile from its CPU cache.
+        self.sprite = SpriteRenderer::new(&self.device, OFFSCREEN_FORMAT);
+        // Re-create the atlas texture and re-upload every cached tile from its CPU cache,
+        // then rebuild the sprite's atlas bind group against the new texture view.
         self.atlas.recreate(self.device.clone(), self.queue.clone());
+        self.atlas_bind = self
+            .sprite
+            .make_atlas_bind(&self.device, self.atlas.texture_view());
     }
 }
