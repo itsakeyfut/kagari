@@ -9,7 +9,7 @@
 //! downstream crates must not match them exhaustively (a new variant is then a non-breaking change).
 
 /// Spacing scale (Tailwind-faithful, incl. fractional). Resolved to logical px by the theme.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum SpacingStep {
     S0,
@@ -50,7 +50,7 @@ pub enum SpacingStep {
 }
 
 /// Corner-radius scale.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum RadiusStep {
     None,
@@ -64,7 +64,7 @@ pub enum RadiusStep {
 }
 
 /// Font-size scale.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum FontSizeStep {
     Xs,
@@ -196,7 +196,7 @@ pub enum BlurStep {
 
 /// Semantic color role (upper token layer, §3.4/§3.5). Public components reference roles, not raw
 /// palette colors, so a theme swap reskins everything by remapping the role table.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ColorRole {
     Surface,

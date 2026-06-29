@@ -5,6 +5,10 @@
 /// Physical pixels = logical × scale factor; the scale is applied at paint time
 /// (see [`Px::to_physical`]), so layout and styling stay resolution-independent.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Transparent so a logical-px value (de)serializes as a bare number in theme RON
+// (`16.0`, not `Px(16.0)`) — cleaner authoring.
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Px(pub f32);
 
 impl Px {

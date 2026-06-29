@@ -10,6 +10,7 @@ use std::ops::{Add, Mul, Sub};
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -19,6 +20,7 @@ pub struct Point {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Size {
     pub w: f32,
     pub h: f32,
@@ -28,6 +30,7 @@ pub struct Size {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rect {
     pub origin: Point,
     pub size: Size,
@@ -37,6 +40,7 @@ pub struct Rect {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Edges {
     pub top: f32,
     pub right: f32,
@@ -48,6 +52,7 @@ pub struct Edges {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Corners {
     pub tl: f32,
     pub tr: f32,

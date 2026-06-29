@@ -12,6 +12,7 @@
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Color {
     pub r: f32,
     pub g: f32,
@@ -22,6 +23,7 @@ pub struct Color {
 /// RGB primaries of a color space. All MVP spaces share the D65 white point,
 /// so conversions between them need no chromatic adaptation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColorSpace {
     Srgb,
     Rec709,
@@ -31,6 +33,7 @@ pub enum ColorSpace {
 
 /// Transfer function relating encoded values to linear light.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Transfer {
     Srgb,
     Linear,
@@ -42,6 +45,7 @@ pub enum Transfer {
 /// A color tagged with its source space + transfer, prior to conversion into the
 /// working space. `value` is straight-alpha RGBA in the tagged encoding.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TaggedColor {
     pub value: [f32; 4],
     pub space: ColorSpace,
