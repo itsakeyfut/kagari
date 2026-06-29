@@ -23,6 +23,7 @@ kagari-layout  = { path = "crates/kagari-layout",  version = "0.0.0" }
 kagari-text    = { path = "crates/kagari-text",    version = "0.0.0" }
 kagari-core    = { path = "crates/kagari-core",    version = "0.0.0" }
 kagari-widgets = { path = "crates/kagari-widgets", version = "0.0.0" }
+kagari-macros  = { path = "crates/kagari-macros",  version = "0.0.0" }   # internal proc-macro (ident concat)
 
 # External deps (versions centralized only; actually wired per-crate in implementation tasks M0-M9).
 # Pinned to the latest stable minor at scaffold time (caret allows latest patch).

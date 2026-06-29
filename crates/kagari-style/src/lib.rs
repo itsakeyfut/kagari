@@ -11,11 +11,13 @@ pub mod error;
 // Inherent `impl Theme` resolution/validation methods only — no new public type to re-export.
 mod resolve;
 pub mod style;
+pub mod styled;
 pub mod theme;
 pub mod token;
 
 pub use error::StyleError;
 pub use style::{LayoutTokens, PaintTokens, Style};
+pub use styled::Styled;
 pub use theme::{HexColor, Primitives, SemanticRoles, Theme};
 pub use token::{
     BlurStep, BorderWidthStep, ColorRole, FontSizeStep, FontWeightStep, LetterSpacingStep,
