@@ -14,9 +14,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kagari_base::{NodeId, Rect};
+use kagari_base::{NodeId, Point, Rect};
+use kagari_layout::LayoutStyle;
 
-use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 // `Owner` via the reactive seam (not `reactive_graph` directly) so the runtime stays an
 // implementation detail behind `crate::reactive`.
@@ -83,7 +84,7 @@ where
     /// Applies the staged items: a keyed diff against the current children. New keys are built
     /// under a fresh child [`Owner`]; gone keys have their owner cleaned up (disposing their
     /// effects) and their node removed; existing keys keep their node, owner, and element.
-    pub fn reconcile(&mut self, arena: &mut crate::arena::Arena, damage: &Arc<dyn DamageSink>) {
+    pub fn reconcile(&mut self, cx: &mut LayoutCx) {
         let items = match self.pending.lock() {
             Ok(mut pending) => pending.take(),
             Err(_) => return,
@@ -110,14 +111,10 @@ where
                 let child_owner = owner.child();
                 let (node_id, element) = child_owner.with(|| {
                     let mut element = (self.view_fn)(item);
-                    let mut cx = LayoutCx {
-                        arena: &mut *arena,
-                        damage: Arc::clone(damage),
-                    };
-                    let node_id = element.request_layout(&mut cx);
+                    let node_id = element.request_layout(cx);
                     (node_id, element)
                 });
-                if let Some(node) = arena.get_mut(node_id) {
+                if let Some(node) = cx.arena.get_mut(node_id) {
                     node.parent = self.id;
                 }
                 next.push((key, node_id, child_owner, element));
@@ -129,14 +126,15 @@ where
         // descendants' slots otherwise.
         for (_, node_id, child_owner, _element) in old {
             child_owner.cleanup();
-            arena.remove_subtree(node_id);
+            cx.arena.remove_subtree(node_id);
         }
 
         let ids: Vec<NodeId> = next.iter().map(|(_, node_id, ..)| *node_id).collect();
         if let Some(parent_id) = self.id {
-            if let Some(node) = arena.get_mut(parent_id) {
-                node.children = ids;
+            if let Some(node) = cx.arena.get_mut(parent_id) {
+                node.children = ids.clone();
             }
+            cx.layout.set_children(parent_id, &ids);
         }
         self.children = next;
     }
@@ -153,6 +151,8 @@ where
         }
         let id = cx.arena.insert(Node::default());
         self.id = Some(id);
+        cx.layout.insert(id, None);
+        cx.layout.set_style(id, &LayoutStyle::default());
         // Scope child owners under the ambient owner so an ancestor's removal disposes this whole
         // dyn node. Callers build under an owner (App root #36 / tests); the detached-owner
         // fallback is only the no-ambient-owner degenerate case.
@@ -171,14 +171,22 @@ where
         });
 
         // Build the initial children from what the effect just staged.
-        self.reconcile(cx.arena, &cx.damage);
+        self.reconcile(cx);
         id
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
-        // Per-child bounds come from layout (#33) / the paint pass (#34); placeholder for now.
-        for (_, _, _, element) in &mut self.children {
-            element.paint(bounds, cx);
+        // Paint each child at its absolute bounds (layout coords are parent-relative).
+        for (_, node_id, _, element) in &mut self.children {
+            let local = cx.layout.layout(*node_id);
+            let child_bounds = Rect {
+                origin: Point {
+                    x: bounds.origin.x + local.origin.x,
+                    y: bounds.origin.y + local.origin.y,
+                },
+                size: local.size,
+            };
+            element.paint(child_bounds, cx);
         }
     }
 
@@ -233,7 +241,7 @@ impl DynIf {
 
     /// Mounts the child when the staged condition is true and it is absent; unmounts (disposing
     /// its owner scope and removing its node) when false and present.
-    pub fn reconcile(&mut self, arena: &mut crate::arena::Arena, damage: &Arc<dyn DamageSink>) {
+    pub fn reconcile(&mut self, cx: &mut LayoutCx) {
         let cond = match self.pending.lock() {
             Ok(mut pending) => pending.take(),
             Err(_) => return,
@@ -249,21 +257,17 @@ impl DynIf {
                 let child_owner = owner.child();
                 let (node_id, element) = child_owner.with(|| {
                     let mut element = (self.view_fn)();
-                    let mut cx = LayoutCx {
-                        arena: &mut *arena,
-                        damage: Arc::clone(damage),
-                    };
-                    let node_id = element.request_layout(&mut cx);
+                    let node_id = element.request_layout(cx);
                     (node_id, element)
                 });
-                if let Some(node) = arena.get_mut(node_id) {
+                if let Some(node) = cx.arena.get_mut(node_id) {
                     node.parent = self.id;
                 }
                 self.child = Some((node_id, child_owner, element));
             }
             (false, Some((node_id, child_owner, _element))) => {
                 child_owner.cleanup();
-                arena.remove_subtree(node_id);
+                cx.arena.remove_subtree(node_id);
             }
             // Already mounted (true) or already absent (false): keep state.
             (true, existing @ Some(_)) => self.child = existing,
@@ -272,9 +276,10 @@ impl DynIf {
 
         let ids: Vec<NodeId> = self.child.iter().map(|(node_id, ..)| *node_id).collect();
         if let Some(parent_id) = self.id {
-            if let Some(node) = arena.get_mut(parent_id) {
-                node.children = ids;
+            if let Some(node) = cx.arena.get_mut(parent_id) {
+                node.children = ids.clone();
             }
+            cx.layout.set_children(parent_id, &ids);
         }
     }
 }
@@ -286,6 +291,8 @@ impl Element for DynIf {
         }
         let id = cx.arena.insert(Node::default());
         self.id = Some(id);
+        cx.layout.insert(id, None);
+        cx.layout.set_style(id, &LayoutStyle::default());
         // Scope child owners under the ambient owner so an ancestor's removal disposes this whole
         // dyn node. Callers build under an owner (App root #36 / tests); the detached-owner
         // fallback is only the no-ambient-owner degenerate case.
@@ -301,13 +308,21 @@ impl Element for DynIf {
             dirty.store(true, Ordering::SeqCst);
         });
 
-        self.reconcile(cx.arena, &cx.damage);
+        self.reconcile(cx);
         id
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
-        if let Some((_, _, element)) = &mut self.child {
-            element.paint(bounds, cx);
+        if let Some((node_id, _, element)) = &mut self.child {
+            let local = cx.layout.layout(*node_id);
+            let child_bounds = Rect {
+                origin: Point {
+                    x: bounds.origin.x + local.origin.x,
+                    y: bounds.origin.y + local.origin.y,
+                },
+                size: local.size,
+            };
+            element.paint(child_bounds, cx);
         }
     }
 
@@ -324,10 +339,12 @@ impl IntoElement for DynIf {
 mod tests {
     use super::*;
     use crate::arena::Arena;
-    use crate::element::div;
+    use crate::element::{DamageSink, div};
     use crate::reactive::rx;
     use kagari_base::Color;
+    use kagari_layout::LayoutTree;
     use kagari_render::Background;
+    use kagari_text::{FontDb, TextSystem};
     use reactive_graph::owner::Owner;
     use reactive_graph::prelude::*;
     use reactive_graph::signal::signal;
@@ -354,25 +371,44 @@ mod tests {
         }
     }
 
-    /// Builds the list and returns (list, arena, list node id) with three children `[1, 2, 3]`.
+    /// A reusable build environment so tests can construct a `LayoutCx` for `reconcile`.
+    struct Env {
+        arena: Arena,
+        layout: LayoutTree,
+        text: TextSystem,
+        damage: Arc<dyn DamageSink>,
+    }
+    impl Env {
+        fn new(damage: Arc<dyn DamageSink>) -> Self {
+            Self {
+                arena: Arena::new(),
+                layout: LayoutTree::new(),
+                text: TextSystem::new(FontDb::new()),
+                damage,
+            }
+        }
+        fn cx(&mut self) -> LayoutCx<'_> {
+            LayoutCx {
+                arena: &mut self.arena,
+                layout: &mut self.layout,
+                text: &mut self.text,
+                damage: Arc::clone(&self.damage),
+            }
+        }
+    }
+
+    /// Builds a `[1, 2, 3]` list and returns it with the build environment + the list node id.
     fn build_list() -> (
         DynList<u32, u32>,
-        Arena,
+        Env,
         NodeId,
         reactive_graph::signal::WriteSignal<Vec<u32>>,
     ) {
         let (items, set_items) = signal(vec![1u32, 2, 3]);
-        let mut arena = Arena::new();
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut env = Env::new(Arc::new(NoopDamage));
         let mut list = dyn_list(move || items.get(), |k: &u32| *k, |_k: &u32| div());
-        let id = {
-            let mut cx = LayoutCx {
-                arena: &mut arena,
-                damage: Arc::clone(&damage),
-            };
-            list.request_layout(&mut cx)
-        };
-        (list, arena, id, set_items)
+        let id = list.request_layout(&mut env.cx());
+        (list, env, id, set_items)
     }
 
     #[test]
@@ -380,18 +416,17 @@ mod tests {
         let owner = Owner::new();
         owner.set();
 
-        let (mut list, mut arena, id, set_items) = build_list();
-        let v1 = arena.get(id).unwrap().children.clone();
+        let (mut list, mut env, id, set_items) = build_list();
+        let v1 = env.arena.get(id).unwrap().children.clone();
         assert_eq!(v1.len(), 3);
 
         // [1, 2, 3] -> [1, 3, 4]: remove key 2, add key 4, keep 1 and 3.
         set_items.set(vec![1, 3, 4]);
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
-        list.reconcile(&mut arena, &damage);
-        let v2 = arena.get(id).unwrap().children.clone();
+        list.reconcile(&mut env.cx());
+        let v2 = env.arena.get(id).unwrap().children.clone();
 
         assert_eq!(v2.len(), 3);
-        assert!(!arena.contains(v1[1]), "key 2's node is removed");
+        assert!(!env.arena.contains(v1[1]), "key 2's node is removed");
         assert!(!v1.contains(&v2[2]), "key 4 is a freshly minted node");
 
         drop(owner);
@@ -402,13 +437,12 @@ mod tests {
         let owner = Owner::new();
         owner.set();
 
-        let (mut list, mut arena, id, set_items) = build_list();
-        let v1 = arena.get(id).unwrap().children.clone();
+        let (mut list, mut env, id, set_items) = build_list();
+        let v1 = env.arena.get(id).unwrap().children.clone();
 
         set_items.set(vec![1, 3, 4]);
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
-        list.reconcile(&mut arena, &damage);
-        let v2 = arena.get(id).unwrap().children.clone();
+        list.reconcile(&mut env.cx());
+        let v2 = env.arena.get(id).unwrap().children.clone();
 
         assert_eq!(v2[0], v1[0], "key 1 keeps its node");
         assert_eq!(v2[1], v1[2], "key 3 keeps its node (moved index 2 -> 1)");
@@ -428,22 +462,16 @@ mod tests {
         let (bg, set_bg) = signal(red);
         let (items, set_items) = signal(vec![1u32]);
 
-        let mut arena = Arena::new();
         let damage = Arc::new(RecordingDamage::default());
-        let sink: Arc<dyn DamageSink> = damage.clone();
+        let mut env = Env::new(damage.clone());
 
         let mut list = dyn_list(
             move || items.get(),
             |k: &u32| *k,
             move |_k: &u32| div().bg(rx(move || bg.get())),
         );
-        {
-            let mut cx = LayoutCx {
-                arena: &mut arena,
-                damage: Arc::clone(&sink),
-            };
-            list.request_layout(&mut cx);
-        }
+        list.request_layout(&mut env.cx());
+
         let flags_after_build = damage.count();
         assert!(
             flags_after_build >= 1,
@@ -460,7 +488,7 @@ mod tests {
 
         // Remove the only item; its child owner is cleaned up, disposing the bg effect.
         set_items.set(vec![]);
-        list.reconcile(&mut arena, &sink);
+        list.reconcile(&mut env.cx());
 
         // The now-disposed effect must not react to further writes.
         set_bg.set(red);
@@ -474,18 +502,50 @@ mod tests {
     }
 
     #[test]
+    fn keyed_list_remove_should_free_multi_node_child_subtree() {
+        // RK-006: removing a list child whose view is a multi-node subtree must free the whole
+        // subtree (reconcile uses `arena.remove_subtree`), not just the child's root node.
+        let owner = Owner::new();
+        owner.set();
+
+        let (items, set_items) = signal(vec![1u32]);
+        let mut env = Env::new(Arc::new(NoopDamage));
+        // Each item is a div with a (grand)child div — a two-node subtree.
+        let mut list = dyn_list(
+            move || items.get(),
+            |k: &u32| *k,
+            |_k: &u32| div().child(div()),
+        );
+        let list_id = list.request_layout(&mut env.cx());
+
+        let child_root = env.arena.get(list_id).unwrap().children[0];
+        let grandchild = env.arena.get(child_root).unwrap().children[0];
+        assert!(env.arena.contains(grandchild), "grandchild built");
+
+        // Remove the item; both the child root and its grandchild must be freed.
+        set_items.set(vec![]);
+        list.reconcile(&mut env.cx());
+        assert!(!env.arena.contains(child_root), "child root freed");
+        assert!(
+            !env.arena.contains(grandchild),
+            "grandchild subtree freed, not leaked (remove_subtree)"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
     fn keyed_list_should_preserve_nodes_on_reorder() {
         let owner = Owner::new();
         owner.set();
 
-        let (mut list, mut arena, id, set_items) = build_list();
-        let v1 = arena.get(id).unwrap().children.clone();
+        let (mut list, mut env, id, set_items) = build_list();
+        let v1 = env.arena.get(id).unwrap().children.clone();
 
         // Pure reorder [1, 2, 3] -> [3, 2, 1]: every node is kept, only the order changes.
         set_items.set(vec![3, 2, 1]);
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
-        list.reconcile(&mut arena, &damage);
-        let v2 = arena.get(id).unwrap().children.clone();
+        list.reconcile(&mut env.cx());
+        let v2 = env.arena.get(id).unwrap().children.clone();
 
         assert_eq!(
             v2,
@@ -493,7 +553,7 @@ mod tests {
             "nodes are reordered, not rebuilt"
         );
         for nid in &v1 {
-            assert!(arena.contains(*nid), "no node was dropped on reorder");
+            assert!(env.arena.contains(*nid), "no node was dropped on reorder");
         }
 
         drop(owner);
@@ -505,40 +565,33 @@ mod tests {
         owner.set();
 
         let (cond, set_cond) = signal(true);
-        let mut arena = Arena::new();
-        let sink: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut env = Env::new(Arc::new(NoopDamage));
 
         let mut node = dyn_if(move || cond.get(), div);
-        let id = {
-            let mut cx = LayoutCx {
-                arena: &mut arena,
-                damage: Arc::clone(&sink),
-            };
-            node.request_layout(&mut cx)
-        };
+        let id = node.request_layout(&mut env.cx());
 
         // Condition is true: the child is mounted.
-        let mounted = arena.get(id).unwrap().children.clone();
+        let mounted = env.arena.get(id).unwrap().children.clone();
         assert_eq!(mounted.len(), 1);
         let child = mounted[0];
-        assert!(arena.contains(child));
+        assert!(env.arena.contains(child));
 
         // Flip to false: the child is unmounted and its node removed.
         set_cond.set(false);
-        node.reconcile(&mut arena, &sink);
-        assert_eq!(arena.get(id).unwrap().children.len(), 0);
+        node.reconcile(&mut env.cx());
+        assert_eq!(env.arena.get(id).unwrap().children.len(), 0);
         assert!(
-            !arena.contains(child),
+            !env.arena.contains(child),
             "the child node is removed on unmount"
         );
 
         // Flip back to true: a fresh child is remounted (a new node, not the stale one).
         set_cond.set(true);
-        node.reconcile(&mut arena, &sink);
-        let remounted = arena.get(id).unwrap().children.clone();
+        node.reconcile(&mut env.cx());
+        let remounted = env.arena.get(id).unwrap().children.clone();
         assert_eq!(remounted.len(), 1, "the child is remounted");
         assert_ne!(remounted[0], child, "remount mints a fresh node");
-        assert!(arena.contains(remounted[0]));
+        assert!(env.arena.contains(remounted[0]));
 
         drop(owner);
     }

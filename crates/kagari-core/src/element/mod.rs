@@ -10,10 +10,12 @@
 mod cx;
 mod div;
 mod dynamic;
+mod text;
 
 pub use cx::{DamageSink, Event, EventCx, LayoutCx, PaintCx};
 pub use div::{Div, div};
 pub use dynamic::{DynIf, DynList, dyn_if, dyn_list};
+pub use text::{Text, text};
 
 use kagari_base::{NodeId, Rect};
 
