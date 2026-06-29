@@ -231,7 +231,13 @@ impl WindowState {
         if let Some(ev) = map_ime_event(ime) {
             if self.ime_enabled {
                 // #25 routes this to the focused TextBuffer (preedit render / commit).
-                tracing::debug!(?ev, "ime event");
+                // Log only the event shape, never the composed text: IME content is
+                // user input (may include passwords) and must not land in logs.
+                let (kind, text_len) = match &ev {
+                    ImeEvent::Preedit { text, .. } => ("preedit", text.len()),
+                    ImeEvent::Commit(text) => ("commit", text.len()),
+                };
+                tracing::debug!(kind, text_len, "ime event");
             }
         }
     }
