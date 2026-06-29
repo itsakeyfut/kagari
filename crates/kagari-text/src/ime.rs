@@ -139,8 +139,9 @@ impl ImeState {
 /// Logical x (preedit-relative) of byte offset `byte`: the x of the first glyph whose
 /// cluster is at or past `byte`, or the laid-out width if `byte` is past the end.
 /// Assumes LTR, single-line preedit (cluster ascending ⇒ x ascending), which holds for
-/// Japanese IME composition (MVP; RTL/multi-line is post-MVP).
-fn x_at_byte(shaped: &ShapedText, byte: usize) -> f32 {
+/// Japanese IME composition (MVP; RTL/multi-line is post-MVP). Shared with
+/// `TextBuffer::caret_rect` (#26).
+pub(crate) fn x_at_byte(shaped: &ShapedText, byte: usize) -> f32 {
     shaped
         .glyphs
         .iter()
