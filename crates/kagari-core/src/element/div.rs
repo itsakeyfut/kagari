@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kagari_base::{Color, Corners, Edges, NodeId, Px, Rect, Size};
+use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, Size};
 use kagari_layout::{FlexDirection, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect};
 
@@ -21,6 +21,9 @@ pub struct Div {
     bg: Option<Prop<Background>>,
     /// Assigned on the first `request_layout`; the build-once rebuild lifecycle is #32.
     id: Option<NodeId>,
+    /// Child node ids in `children` order, assigned at build; `paint` reads each child's bounds
+    /// from the layout tree by id.
+    child_ids: Vec<NodeId>,
     /// Resolved background: written by the bound reactive effect (or once, for a static prop),
     /// read by `paint`. Shared + `'static` so the effect can own a handle to it.
     resolved_bg: Arc<Mutex<Option<Background>>>,
@@ -33,6 +36,7 @@ pub fn div() -> Div {
         layout: LayoutStyle::default(),
         bg: None,
         id: None,
+        child_ids: Vec::new(),
         resolved_bg: Arc::new(Mutex::new(None)),
     }
 }
@@ -136,12 +140,14 @@ impl Element for Div {
             None => {
                 let id = cx.arena.insert(Node::default());
                 self.id = Some(id);
+                cx.layout.insert(id, None);
+                cx.layout.set_style(id, &self.layout);
                 self.bind_background(&cx.damage, id);
                 id
             }
         };
 
-        // Recurse children and link parent/children in the arena.
+        // Recurse children and link parent/children in both the arena and the layout tree.
         let mut child_ids = Vec::with_capacity(self.children.len());
         for child in &mut self.children {
             let child_id = child.request_layout(cx);
@@ -151,30 +157,46 @@ impl Element for Div {
             child_ids.push(child_id);
         }
         if let Some(node) = cx.arena.get_mut(id) {
-            node.children = child_ids;
+            node.children = child_ids.clone();
         }
+        cx.layout.set_children(id, &child_ids);
+        self.child_ids = child_ids;
         id
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
-        let Some(bg) = self.current_bg() else {
-            return;
-        };
-        cx.scene.quads.push(Quad {
-            bounds,
-            corner_radii: Corners::default(),
-            bg,
-            border: Border {
-                widths: Edges::default(),
-                color: Color::TRANSPARENT,
-            },
-            content_mask: RoundedRect {
-                rect: bounds,
-                radii: Corners::default(),
-            },
-            // Painter's-order assignment is the paint pass's job (#34); single layer for now.
-            order: 0,
-        });
+        if let Some(bg) = self.current_bg() {
+            let order = cx.next_order();
+            cx.scene.quads.push(Quad {
+                bounds,
+                corner_radii: Corners::default(),
+                bg,
+                border: Border {
+                    widths: Edges::default(),
+                    color: Color::TRANSPARENT,
+                },
+                content_mask: RoundedRect {
+                    rect: bounds,
+                    radii: Corners::default(),
+                },
+                // Painter's order from traversal order: the parent's quad takes a lower order than
+                // its children's primitives, so children draw on top.
+                order,
+            });
+        }
+        // Paint each child at its absolute bounds. `LayoutTree::layout` returns parent-relative
+        // coordinates (taffy), so offset by this node's origin to get the child's absolute rect.
+        for (child, &child_id) in self.children.iter_mut().zip(&self.child_ids) {
+            let local = cx.layout.layout(child_id);
+            let child_bounds = Rect {
+                origin: Point {
+                    x: bounds.origin.x + local.origin.x,
+                    y: bounds.origin.y + local.origin.y,
+                },
+                size: local.size,
+            };
+            child.paint(child_bounds, cx);
+        }
     }
 
     fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
@@ -191,7 +213,9 @@ mod tests {
     use super::*;
     use crate::arena::Arena;
     use crate::reactive::rx;
+    use kagari_layout::LayoutTree;
     use kagari_render::Scene;
+    use kagari_text::{FontDb, TextSystem};
     use reactive_graph::owner::Owner;
     use reactive_graph::prelude::*;
     use reactive_graph::signal::signal;
@@ -216,9 +240,13 @@ mod tests {
     #[test]
     fn div_child_should_build_tree() {
         let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
         let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
         let mut cx = LayoutCx {
             arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
             damage,
         };
 
@@ -246,19 +274,24 @@ mod tests {
     #[test]
     fn div_static_bg_should_paint_quad() {
         let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
         let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
-        let mut cx = LayoutCx {
-            arena: &mut arena,
-            damage,
-        };
 
         let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
         let mut d = div().bg(green);
-        d.request_layout(&mut cx);
+        d.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+        });
 
         let mut scene = Scene::new();
-        let mut pcx = PaintCx { scene: &mut scene };
-        d.paint(Rect::default(), &mut pcx);
+        d.paint(
+            Rect::default(),
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None),
+        );
 
         assert_eq!(scene.quads.len(), 1);
         assert_eq!(scene.quads[0].bg, green);
@@ -276,18 +309,28 @@ mod tests {
         let (read, write) = signal(red);
 
         let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
         let damage = Arc::new(RecordingDamage::default());
-        let mut cx = LayoutCx {
-            arena: &mut arena,
-            damage: damage.clone(),
-        };
 
         let mut d = div().bg(rx(move || read.get()));
-        let id = d.request_layout(&mut cx);
+        let id = d.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage: damage.clone(),
+        });
+
+        let paint = |d: &mut Div, scene: &mut Scene, text: &mut TextSystem| {
+            d.paint(
+                Rect::default(),
+                &mut PaintCx::new(scene, &layout, text, None),
+            );
+        };
 
         // The effect runs once on creation: resolved bg = red, damage flagged for `id`.
         let mut scene = Scene::new();
-        d.paint(Rect::default(), &mut PaintCx { scene: &mut scene });
+        paint(&mut d, &mut scene, &mut text);
         assert_eq!(scene.quads[0].bg, red);
         assert!(damage.dirtied.lock().unwrap().contains(&id));
         let flags_after_build = damage.dirtied.lock().unwrap().len();
@@ -295,7 +338,7 @@ mod tests {
         // A signal write re-runs the effect synchronously: resolved bg = blue, re-flagged.
         write.set(blue);
         let mut scene = Scene::new();
-        d.paint(Rect::default(), &mut PaintCx { scene: &mut scene });
+        paint(&mut d, &mut scene, &mut text);
         assert_eq!(scene.quads[0].bg, blue);
         let dirtied = damage.dirtied.lock().unwrap();
         assert!(

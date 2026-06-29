@@ -59,6 +59,19 @@ impl LayoutTree {
         self.measures.insert(node, measure);
     }
 
+    /// Sets `parent`'s children to `children` (replacing any existing list), in order. Nodes
+    /// must already be `insert`ed; unknown nodes are skipped. Used to link a built subtree.
+    pub fn set_children(&mut self, parent: NodeId, children: &[NodeId]) {
+        let Some(&parent_id) = self.fwd.get(&parent) else {
+            return;
+        };
+        let child_ids: Vec<taffy::NodeId> = children
+            .iter()
+            .filter_map(|c| self.fwd.get(c).copied())
+            .collect();
+        let _ = self.taffy.set_children(parent_id, &child_ids);
+    }
+
     /// Recomputes layout for the `root` subtree against `viewport`. Leaves with a measure
     /// function report their intrinsic size.
     pub fn compute(&mut self, root: NodeId, viewport: Size) -> Result<(), LayoutError> {

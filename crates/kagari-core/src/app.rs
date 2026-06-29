@@ -5,14 +5,19 @@
 
 use std::sync::Arc;
 
-use kagari_text::ImeEvent;
+use kagari_base::{NodeId, Size};
+use kagari_layout::LayoutTree;
+use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
 use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::arena::Arena;
+use crate::element::{AnyElement, DamageSink, IntoElement, div, text};
 use crate::error::AppError;
+use crate::paint::render_tree;
 
 /// The application shell. Owns the shared wgpu instance and, once resumed, the
 /// single window's GPU state.
@@ -30,12 +35,35 @@ struct WindowState {
     device: Arc<wgpu::Device>,
     config: wgpu::SurfaceConfiguration,
     renderer: kagari_render::Renderer,
-    // TEMP: a hand-built demo scene so the window shows quads. Replaced by the
-    // core paint walk (which builds the scene from the element tree) in M3.
+    // The render scene, rebuilt each frame by the paint walk; its buffers are reused.
     scene: kagari_render::Scene,
+    // Element-tree paint-pass state (#34): the retained arena, the layout tree, the text
+    // system (shaping + glyph rasterization), the root element, and the damage sink (#35).
+    arena: Arena,
+    layout: LayoutTree,
+    text: TextSystem,
+    root: AnyElement,
+    damage: Arc<dyn DamageSink>,
     // Whether the OS IME is currently composing into this window (set by
     // `Ime::Enabled`/`Disabled`). Gates preedit/commit forwarding.
     ime_enabled: bool,
+}
+
+/// A no-op damage sink: paint rebuilds the whole scene each frame for now. Real layout/paint
+/// damage tracking lands in #35.
+struct NoopDamage;
+impl DamageSink for NoopDamage {
+    fn mark_paint_dirty(&self, _id: NodeId) {}
+}
+
+/// The demo root element: a colored panel containing a line of text.
+fn demo_root() -> AnyElement {
+    use kagari_base::Color;
+    use kagari_render::Background;
+    div()
+        .bg(Background::Solid(Color::from_srgb([0.12, 0.13, 0.16, 1.0])))
+        .child(text("Hello, kagari"))
+        .into_element()
 }
 
 impl App {
@@ -96,114 +124,15 @@ impl App {
             device,
             config,
             renderer,
-            scene: demo_scene(),
+            scene: kagari_render::Scene::new(),
+            arena: Arena::new(),
+            layout: LayoutTree::new(),
+            text: TextSystem::new(FontDb::new()),
+            root: demo_root(),
+            damage: Arc::new(NoopDamage),
             ime_enabled: false,
         })
     }
-}
-
-/// TEMP: a demo scene (solid, semi-transparent, rounded-bordered, and gradient quads)
-/// so the Quad pipeline is visible in the window. Replaced by the core paint walk in M3.
-fn demo_scene() -> kagari_render::Scene {
-    use kagari_base::{Color, Corners, Edges, Point, Rect};
-    use kagari_render::{Background, Border, Quad, RoundedRect, Scene};
-
-    // #12 ignores the content mask (solid fill); a large mask is a no-op clip.
-    let no_clip = RoundedRect {
-        rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
-        radii: Corners::default(),
-    };
-    let solid = |bounds: Rect, color: Color, order: u32| Quad {
-        bounds,
-        corner_radii: Corners::default(),
-        bg: Background::Solid(color),
-        border: Border {
-            widths: Edges::default(),
-            color: Color::TRANSPARENT,
-        },
-        content_mask: no_clip,
-        order,
-    };
-
-    let mut scene = Scene::new();
-    scene.quads.push(solid(
-        Rect::from_xywh(40.0, 40.0, 240.0, 160.0),
-        Color::from_srgb([0.20, 0.50, 0.90, 1.0]),
-        0,
-    ));
-    // Semi-transparent red on top — exercises painter's order + premultiplied blend.
-    scene.quads.push(solid(
-        Rect::from_xywh(140.0, 120.0, 200.0, 140.0),
-        Color::from_srgb([0.90, 0.30, 0.30, 0.8]),
-        1,
-    ));
-    // A rounded, per-edge-bordered quad to exercise #13's SDF + border band + AA.
-    // Asymmetric radii and border widths make a corner/edge mix-up visually obvious.
-    scene.quads.push(Quad {
-        bounds: Rect::from_xywh(360.0, 60.0, 220.0, 180.0),
-        corner_radii: Corners {
-            tl: 24.0,
-            tr: 8.0,
-            br: 24.0,
-            bl: 8.0,
-        },
-        bg: Background::Solid(Color::from_srgb([0.15, 0.70, 0.45, 1.0])),
-        border: Border {
-            widths: Edges {
-                top: 6.0,
-                right: 2.0,
-                bottom: 6.0,
-                left: 12.0,
-            },
-            color: Color::from_srgb([0.95, 0.85, 0.20, 1.0]),
-        },
-        content_mask: no_clip,
-        order: 2,
-    });
-    // A rounded quad with a diagonal 2-stop linear gradient to exercise #14.
-    scene.quads.push(Quad {
-        bounds: Rect::from_xywh(60.0, 280.0, 260.0, 120.0),
-        corner_radii: Corners {
-            tl: 16.0,
-            tr: 16.0,
-            br: 16.0,
-            bl: 16.0,
-        },
-        bg: Background::LinearGradient {
-            start: Color::from_srgb([0.10, 0.20, 0.80, 1.0]),
-            end: Color::from_srgb([0.90, 0.20, 0.50, 1.0]),
-            start_point: Point::new(0.0, 0.0),
-            end_point: Point::new(1.0, 1.0),
-        },
-        border: Border {
-            widths: Edges::default(),
-            color: Color::TRANSPARENT,
-        },
-        content_mask: no_clip,
-        order: 3,
-    });
-    // A square solid quad clipped to a smaller rounded-rect content mask (#15): only
-    // the part inside the rounded mask is visible, with an anti-aliased clip edge.
-    scene.quads.push(Quad {
-        bounds: Rect::from_xywh(380.0, 280.0, 200.0, 120.0),
-        corner_radii: Corners::default(),
-        bg: Background::Solid(Color::from_srgb([0.95, 0.65, 0.10, 1.0])),
-        border: Border {
-            widths: Edges::default(),
-            color: Color::TRANSPARENT,
-        },
-        content_mask: RoundedRect {
-            rect: Rect::from_xywh(410.0, 295.0, 140.0, 90.0),
-            radii: Corners {
-                tl: 30.0,
-                tr: 30.0,
-                br: 30.0,
-                bl: 30.0,
-            },
-        },
-        order: 4,
-    });
-    scene
 }
 
 /// Map a winit IME event to kagari-text's abstract `ImeEvent`. `Enabled`/`Disabled`
@@ -309,9 +238,30 @@ impl WindowState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let scale = self.window.scale_factor() as f32;
+
+        // Build the scene from the element tree: build-once + layout + paint (#34). Scene
+        // coordinates are logical, so the layout viewport is the physical size over `scale`.
+        let viewport = Size {
+            w: self.config.width as f32 / scale,
+            h: self.config.height as f32 / scale,
+        };
+        if let Err(e) = render_tree(
+            &mut self.root,
+            &mut self.arena,
+            &mut self.layout,
+            &mut self.text,
+            Some(self.renderer.atlas_mut()),
+            &mut self.scene,
+            viewport,
+            &self.damage,
+        ) {
+            tracing::error!(error = %e, "layout/paint failed");
+            return;
+        }
+
         // The renderer composites the scene into its offscreen linear target and
         // runs the output-transform pass into this swapchain frame.
-        let scale = self.window.scale_factor() as f32;
         if let Err(e) = self.renderer.render(
             &mut self.scene,
             &view,
