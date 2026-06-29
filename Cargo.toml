@@ -27,7 +27,10 @@ kagari-widgets = { path = "crates/kagari-widgets", version = "0.0.0" }
 # External deps (versions centralized only; actually wired per-crate in implementation tasks M0-M9).
 # Pinned to the latest stable minor at scaffold time (caret allows latest patch).
 # winit stays on the 0.30 stable line; 0.31 is pre-release (beta) only.
-# The reactive runtime crate is TBD (added in #31 / Phase 3).
+# reactive_graph: kagari's fine-grained reactive runtime (adopted in #28; leptos lineage).
+# `effects` is mandatory — without it `ImmediateEffect::new` is a no-op and effects never run.
+# Pinned to the latest stable; 0.3.0 is alpha, excluded.
+reactive_graph = { version = "0.2.14", features = ["effects"] }
 wgpu = "29.0.3"
 winit = "0.30.13"
 taffy = "0.11"
