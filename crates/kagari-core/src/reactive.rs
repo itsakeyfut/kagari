@@ -102,6 +102,12 @@ impl<T: Clone> Prop<T> {
 
 #[cfg(test)]
 mod tests {
+    //! These reactive tests use the synchronous `ImmediateEffect`, so they are hang-free under the
+    //! default multi-threaded test harness — including on Windows — and need no `#[ignore]` or
+    //! `--test-threads=1`. (A multi-threaded harness can deadlock only with *async*,
+    //! executor-driven effects, which this crate does not use.) Each test keeps its `Owner` alive
+    //! for its whole body, since `Owner::set` stores only a `Weak`.
+
     use super::*;
     use reactive_graph::owner::Owner;
     use reactive_graph::prelude::*;

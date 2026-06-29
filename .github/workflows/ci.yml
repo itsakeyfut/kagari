@@ -48,6 +48,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # kagari-core's reactive tests use the synchronous `ImmediateEffect`, so they are hang-free
+      # under the default multi-threaded harness and need no `--test-threads=1` (only async,
+      # executor-driven effects could deadlock there, and this workspace does not use them).
       - run: cargo test --workspace
       - run: cargo test --workspace --all-features
 
