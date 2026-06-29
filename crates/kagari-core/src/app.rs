@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use kagari_text::ImeEvent;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -31,6 +32,9 @@ struct WindowState {
     // TEMP: a hand-built demo scene so the window shows quads. Replaced by the
     // core paint walk (which builds the scene from the element tree) in M3.
     scene: kagari_render::Scene,
+    // Whether the OS IME is currently composing into this window (set by
+    // `Ime::Enabled`/`Disabled`). Gates preedit/commit forwarding.
+    ime_enabled: bool,
 }
 
 impl App {
@@ -73,6 +77,10 @@ impl App {
         let queue = Arc::new(queue);
         surface.configure(&device, &config);
 
+        // Allow the OS IME for this window. No focus system yet, so the window is the
+        // sole focus target; focus-driven enable/disable arrives with the focus layer.
+        window.set_ime_allowed(true);
+
         // The queue is moved into the renderer; the app shell keeps only `device`.
         let renderer = kagari_render::Renderer::new(
             device.clone(),
@@ -88,6 +96,7 @@ impl App {
             config,
             renderer,
             scene: demo_scene(),
+            ime_enabled: false,
         })
     }
 }
@@ -196,7 +205,51 @@ fn demo_scene() -> kagari_render::Scene {
     scene
 }
 
+/// Map a winit IME event to kagari-text's abstract `ImeEvent`. `Enabled`/`Disabled`
+/// are state transitions (handled by the caller), so they produce no `ImeEvent`. This
+/// is the seam that keeps winit types out of kagari-text (design.md).
+fn map_ime_event(ime: Ime) -> Option<ImeEvent> {
+    match ime {
+        Ime::Preedit(text, cursor) => Some(ImeEvent::Preedit { text, cursor }),
+        Ime::Commit(text) => Some(ImeEvent::Commit(text)),
+        Ime::Enabled | Ime::Disabled => None,
+    }
+}
+
 impl WindowState {
+    /// Handle a winit IME event: track enable state, report the caret area on enable,
+    /// and forward preedit/commit (as `ImeEvent`) to the text layer when enabled.
+    fn on_ime(&mut self, ime: Ime) {
+        match &ime {
+            Ime::Enabled => {
+                self.ime_enabled = true;
+                self.report_ime_caret_area();
+            }
+            Ime::Disabled => self.ime_enabled = false,
+            _ => {}
+        }
+        if let Some(ev) = map_ime_event(ime) {
+            if self.ime_enabled {
+                // #25 routes this to the focused TextBuffer (preedit render / commit).
+                // Log only the event shape, never the composed text: IME content is
+                // user input (may include passwords) and must not land in logs.
+                let (kind, text_len) = match &ev {
+                    ImeEvent::Preedit { text, .. } => ("preedit", text.len()),
+                    ImeEvent::Commit(text) => ("commit", text.len()),
+                };
+                tracing::debug!(kind, text_len, "ime event");
+            }
+        }
+    }
+
+    /// Report the IME candidate-window area to the OS. A default until #25 drives it
+    /// from the real caret rect (the text/caret state does not exist yet).
+    fn report_ime_caret_area(&self) {
+        use winit::dpi::{LogicalPosition, LogicalSize};
+        self.window
+            .set_ime_cursor_area(LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 16.0));
+    }
+
     fn redraw(&mut self) {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -316,7 +369,31 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => state.redraw(),
+            WindowEvent::Ime(ime) => state.on_ime(ime),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winit_ime_should_map_to_ime_event() {
+        // Preedit/Commit carry through; Enabled/Disabled are state-only (no ImeEvent).
+        assert_eq!(
+            map_ime_event(Ime::Preedit("あ".to_string(), Some((0, 3)))),
+            Some(ImeEvent::Preedit {
+                text: "あ".to_string(),
+                cursor: Some((0, 3)),
+            })
+        );
+        assert_eq!(
+            map_ime_event(Ime::Commit("日本".to_string())),
+            Some(ImeEvent::Commit("日本".to_string()))
+        );
+        assert_eq!(map_ime_event(Ime::Enabled), None);
+        assert_eq!(map_ime_event(Ime::Disabled), None);
     }
 }
