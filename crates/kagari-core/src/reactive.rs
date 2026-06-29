@@ -14,7 +14,7 @@
 
 pub use reactive_graph::computed::Memo;
 pub use reactive_graph::owner::Owner;
-pub use reactive_graph::signal::{ReadSignal, WriteSignal};
+pub use reactive_graph::signal::{ReadSignal, RwSignal, WriteSignal};
 
 /// Reactive traits (`Get`/`Set`/…) needed to read and write the signals/memos this module
 /// returns. Re-exported from `reactive_graph` so callers do not depend on it directly.

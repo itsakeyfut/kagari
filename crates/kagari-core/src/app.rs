@@ -21,6 +21,8 @@ use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement, div, text};
 use crate::error::AppError;
 use crate::paint::render_tree;
+use crate::reactive::prelude::*;
+use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
 
 /// The application shell. Owns the shared wgpu instance and, once resumed, the
@@ -48,9 +50,13 @@ struct WindowState {
     text: TextSystem,
     root: AnyElement,
     damage: Arc<DamageState>,
-    // The current theme, resolved against during paint (#42). Empty default for now; the reactive
-    // theme context (#43) and built-in light/dark themes (#45) replace it.
-    theme: Theme,
+    // The root reactive owner (#43, RK-008): established before the element tree is built so
+    // context/effects (theme, reactive props) bind to a stable scope that lives for the window's
+    // lifetime. Held only to keep them alive — `set()` stores a Weak (RK-003).
+    _owner: Owner,
+    // The current theme, held in the root reactive context (#43, specs §1.8). Read each frame to
+    // resolve tokens; writing the signal reskins every token and flags full damage (swap API: #44).
+    theme: RwSignal<Arc<Theme>>,
     // Hybrid frame scheduler (#36): tracks active sources for continuous driving; `about_to_wait`
     // gates `request_redraw` on damage/active state so the app is idle when nothing changes.
     scheduler: Scheduler,
@@ -67,6 +73,22 @@ fn demo_root() -> AnyElement {
         .background(Background::Solid(Color::from_srgb([0.12, 0.13, 0.16, 1.0])))
         .child(text("Hello, kagari"))
         .into_element()
+}
+
+/// Wires `theme` into the root reactive context and turns every swap into a full repaint.
+///
+/// Descendants receive a read-only handle via `provide_context`, so token resolution can read the
+/// current theme (specs §1.8). The effect subscribes to the theme: any swap re-runs it (synchronous
+/// `ImmediateEffect`, ADR 0001) and flags full paint-damage, so the scheduler wakes and the next
+/// frame re-resolves every token. Must be called with the root `Owner` current (RK-008).
+fn provide_root_theme(theme: RwSignal<Arc<Theme>>, damage: Arc<DamageState>) {
+    provide_context(theme.read_only());
+    create_effect(move || {
+        // Read to subscribe; the App reads the resolved value each frame, so the only job here is
+        // to turn a swap into damage.
+        let _ = theme.get();
+        damage.mark_all_dirty();
+    });
 }
 
 impl App {
@@ -121,6 +143,18 @@ impl App {
             config.format,
         );
 
+        // Establish the root reactive owner before building the element tree so context/effects
+        // (theme, reactive props) bind to a stable scope that lives with the window (RK-008).
+        let owner = Owner::new();
+        owner.set();
+
+        let damage = Arc::new(DamageState::default());
+        // The theme lives in the root reactive context (#43, specs §1.8); start on the built-in
+        // light theme (#45). Writing this signal reskins every token; the swap trigger is #44.
+        let theme = RwSignal::new(Arc::new(Theme::light()));
+        provide_root_theme(theme, Arc::clone(&damage));
+        let root = demo_root();
+
         Ok(WindowState {
             window,
             surface,
@@ -131,9 +165,10 @@ impl App {
             arena: Arena::new(),
             layout: LayoutTree::new(),
             text: TextSystem::new(FontDb::new()),
-            root: demo_root(),
-            damage: Arc::new(DamageState::default()),
-            theme: Theme::default(),
+            root,
+            damage,
+            _owner: owner,
+            theme,
             scheduler: Scheduler::new(),
             ime_enabled: false,
         })
@@ -251,6 +286,10 @@ impl WindowState {
             w: self.config.width as f32 / scale,
             h: self.config.height as f32 / scale,
         };
+        // Read the current theme from the reactive context for this frame (#43). Untracked: the
+        // dedicated swap effect (`provide_root_theme`) is the sole subscriber that turns a swap
+        // into damage, so the render path must not subscribe.
+        let theme = self.theme.get_untracked();
         if let Err(e) = render_tree(
             &mut self.root,
             &mut self.arena,
@@ -260,7 +299,7 @@ impl WindowState {
             &mut self.scene,
             viewport,
             &self.damage,
-            &self.theme,
+            &theme,
         ) {
             tracing::error!(error = %e, "layout/paint failed");
             return;
@@ -432,5 +471,41 @@ mod tests {
         // Ordinary keys are not IME-owned, so the app keymap may bind them.
         assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::KeyA)));
         assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn root_theme_swap_should_flag_full_damage_and_update_context() {
+        use crate::reactive::{ReadSignal, use_context};
+
+        // Synchronous `ImmediateEffect`, so this is hang-free under the default harness; keep the
+        // owner alive for the whole test since `set` stores only a Weak (RK-003/005).
+        let owner = Owner::new();
+        owner.set();
+
+        let damage = Arc::new(DamageState::default());
+        let theme = RwSignal::new(Arc::new(Theme::light()));
+        provide_root_theme(theme, Arc::clone(&damage));
+
+        // The effect runs once on creation → an initial full repaint is flagged.
+        assert!(
+            damage.is_dirty(),
+            "wiring the theme flags an initial full repaint"
+        );
+        damage.clear();
+        assert!(!damage.is_dirty(), "clear resets the full-damage flag");
+
+        // A swap re-runs the effect synchronously → full damage again (reskin trigger).
+        theme.set(Arc::new(Theme::dark()));
+        assert!(damage.is_dirty(), "a theme swap flags full damage");
+
+        // Descendants resolve the swapped theme through the read-only context handle.
+        let ctx = use_context::<ReadSignal<Arc<Theme>>>().expect("theme provided in context");
+        assert_eq!(
+            ctx.get_untracked(),
+            Arc::new(Theme::dark()),
+            "the context reflects the swapped theme"
+        );
+
+        drop(owner);
     }
 }

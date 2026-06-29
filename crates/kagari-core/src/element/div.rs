@@ -32,6 +32,10 @@ pub struct Div {
     /// Resolved background: written by the bound reactive effect (or once, for a static prop),
     /// read by `paint`. Shared + `'static` so the effect can own a handle to it.
     resolved_bg: Arc<Mutex<Option<Background>>>,
+    /// The layout style last applied to taffy (resolved against the theme). Compared each build so
+    /// `set_style` re-runs only when the resolved value changes — on first build and after a theme
+    /// swap (#43), but not on idle frames (no per-frame taffy churn).
+    applied_layout: Option<LayoutStyle>,
 }
 
 /// Creates an empty [`Div`].
@@ -44,6 +48,7 @@ pub fn div() -> Div {
         id: None,
         child_ids: Vec::new(),
         resolved_bg: Arc::new(Mutex::new(None)),
+        applied_layout: None,
     }
 }
 
@@ -197,12 +202,21 @@ impl Element for Div {
                 let id = cx.arena.insert(Node::default());
                 self.id = Some(id);
                 cx.layout.insert(id, None);
-                let layout = self.effective_layout(cx.theme);
-                cx.layout.set_style(id, &layout);
                 self.bind_background(&cx.damage, id);
                 id
             }
         };
+
+        // Resolve layout tokens (gap/padding) against the *current* theme every build, but re-apply
+        // to taffy only when the result changed. First build applies it; a theme swap (#43) yields a
+        // different `LayoutStyle`, so `set_style` re-runs and the node relays out — without this,
+        // layout tokens would stay stale after a reskin (paint tokens already re-resolve per frame).
+        // The dedup keeps idle frames from re-marking taffy dirty.
+        let resolved = self.effective_layout(cx.theme);
+        if self.applied_layout != Some(resolved) {
+            cx.layout.set_style(id, &resolved);
+            self.applied_layout = Some(resolved);
+        }
 
         // Recurse children and link parent/children in both the arena and the layout tree.
         let mut child_ids = Vec::with_capacity(self.children.len());
@@ -511,5 +525,108 @@ mod tests {
         // radius Lg → 8px, applied to all four corners.
         assert_eq!(scene.quads[0].corner_radii.tl, 8.0);
         assert_eq!(scene.quads[0].corner_radii.br, 8.0);
+    }
+
+    /// Renders the *same retained* `root` against `theme` into a fresh `Scene`, reusing the given
+    /// arena/layout/text so a second call exercises the build-once + re-resolve path (a theme swap).
+    fn render_retained(
+        root: &mut AnyElement,
+        arena: &mut Arena,
+        layout: &mut LayoutTree,
+        text: &mut TextSystem,
+        theme: &Theme,
+    ) -> Scene {
+        let mut scene = Scene::new();
+        let damage = Arc::new(DamageState::default());
+        render_tree(
+            root,
+            arena,
+            layout,
+            text,
+            None,
+            &mut scene,
+            Size { w: 200.0, h: 200.0 },
+            &damage,
+            theme,
+        )
+        .unwrap();
+        scene
+    }
+
+    #[test]
+    fn theme_swap_should_reresolve_layout_token() {
+        // A column with a `gap_2` token between two 10px-tall children. The gap resolves from the
+        // theme, so swapping the theme must move the second child — the layout-token reskin (#43).
+        // Without re-applying the resolved style, the gap would stay baked from the first build.
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let mut root = div()
+            .flex_col()
+            .gap_2()
+            .child(div().size(Size { w: 10.0, h: 10.0 }).background(green))
+            .child(div().size(Size { w: 10.0, h: 10.0 }).background(green))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+
+        let theme_a = Theme::from_ron(
+            r##"( primitives: ( colors: {}, spacing: { S2: 8.0 } ), roles: ( colors: {} ) )"##,
+        )
+        .unwrap();
+        let theme_b = Theme::from_ron(
+            r##"( primitives: ( colors: {}, spacing: { S2: 16.0 } ), roles: ( colors: {} ) )"##,
+        )
+        .unwrap();
+
+        // quads[0] = first child (y0), quads[1] = second child (y = 10 + gap).
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme_a);
+        assert_eq!(
+            scene.quads[1].bounds.origin.y, 18.0,
+            "second child sits below the first (10) plus the resolved gap S2=8"
+        );
+
+        // Swap the theme and re-render the SAME retained tree: the gap token re-resolves to 16.
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme_b);
+        assert_eq!(
+            scene.quads[1].bounds.origin.y, 26.0,
+            "after the swap the gap re-resolves to S2=16 → reskin without a rebuild"
+        );
+    }
+
+    #[test]
+    fn theme_swap_should_reresolve_paint_token() {
+        // `bg(Accent)` resolves per frame, so a retained div reskins its background on a swap (#43).
+        let mut root = div().bg(ColorRole::Accent).into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+
+        let theme_a = Theme::from_ron(
+            r##"( primitives: ( colors: { "blue-500": "#3b82f6" } ), roles: ( colors: { Accent: "blue-500" } ) )"##,
+        )
+        .unwrap();
+        let theme_b = Theme::from_ron(
+            r##"( primitives: ( colors: { "red-500": "#ef4444" } ), roles: ( colors: { Accent: "red-500" } ) )"##,
+        )
+        .unwrap();
+
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme_a);
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(theme_a.resolve_color(ColorRole::Accent))
+        );
+
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme_b);
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(theme_b.resolve_color(ColorRole::Accent)),
+            "the background re-resolves to the swapped theme's Accent"
+        );
+        assert_ne!(
+            theme_a.resolve_color(ColorRole::Accent),
+            theme_b.resolve_color(ColorRole::Accent),
+            "the two themes' Accent differ, so the swap is observable"
+        );
     }
 }
