@@ -9,7 +9,7 @@ pub mod shape;
 
 pub use error::TextError;
 pub use font::FontDb;
-pub use ime::ImeEvent;
+pub use ime::{ImeEvent, ImeState};
 pub use shape::{LineInfo, PlacedGlyph, ShapedText, TextStyle, TextSystem};
 
 /// Re-exported so consumers can name the font id/weight types that appear in
