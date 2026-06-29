@@ -19,6 +19,7 @@ use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement, div, text};
 use crate::error::AppError;
 use crate::paint::render_tree;
+use crate::scheduler::{Scheduler, should_redraw};
 
 /// The application shell. Owns the shared wgpu instance and, once resumed, the
 /// single window's GPU state.
@@ -45,6 +46,9 @@ struct WindowState {
     text: TextSystem,
     root: AnyElement,
     damage: Arc<DamageState>,
+    // Hybrid frame scheduler (#36): tracks active sources for continuous driving; `about_to_wait`
+    // gates `request_redraw` on damage/active state so the app is idle when nothing changes.
+    scheduler: Scheduler,
     // Whether the OS IME is currently composing into this window (set by
     // `Ime::Enabled`/`Disabled`). Gates preedit/commit forwarding.
     ime_enabled: bool,
@@ -124,6 +128,7 @@ impl App {
             text: TextSystem::new(FontDb::new()),
             root: demo_root(),
             damage: Arc::new(DamageState::default()),
+            scheduler: Scheduler::new(),
             ime_enabled: false,
         })
     }
@@ -358,6 +363,22 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime) => state.on_ime(ime),
             WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(state) = self.window.as_ref() else {
+            return;
+        };
+        // Hybrid driving (#36, §1.6): request a redraw only when something changed (#35 damage)
+        // or an active source is animating; otherwise the loop stays in `ControlFlow::Wait` and
+        // the app is idle (no redraw, no GPU work). `request_redraw` is the gate — `redraw()`
+        // itself always paints, so OS-expose / first-frame / resize repaints are unaffected.
+        if should_redraw(
+            state.damage.is_dirty(),
+            state.scheduler.has_active_sources(),
+        ) {
+            state.window.request_redraw();
         }
     }
 }
