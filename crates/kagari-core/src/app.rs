@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use kagari_text::ImeEvent;
 use winit::application::ApplicationHandler;
-use winit::event::{Ime, WindowEvent};
+use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::error::AppError;
@@ -216,6 +217,47 @@ fn map_ime_event(ime: Ime) -> Option<ImeEvent> {
     }
 }
 
+/// Whether `key` is an IME-owned toggle/conversion key (henkan/muhenkan, hankaku/
+/// zenkaku, kana, …). Such keys must never be consumed as an app shortcut — the OS IME
+/// owns them — so the (future) keymap dispatches only when this is `false`. Gating is
+/// unconditional (not on `ime_enabled`) because the on/off toggle keys are pressed
+/// while the IME is *off* to turn it on; gating would re-introduce the Zed defects in
+/// specs §5.2 (#40321 / #40592 / #40638 / #40300). Classified on the physical key,
+/// which is independent of the current IME state.
+fn ime_owns_key(key: PhysicalKey) -> bool {
+    // winit's physical `KeyCode` (W3C UI Events `code`) names the Japanese IME keys as
+    // Convert(変換) / NonConvert(無変換) / KanaMode, plus Lang1..Lang5
+    // (kana / eisu / katakana / hiragana / **zenkaku-hankaku toggle**) and Hiragana/Katakana.
+    use KeyCode::{
+        Convert, Hiragana, KanaMode, Katakana, Lang1, Lang2, Lang3, Lang4, Lang5, NonConvert,
+    };
+    matches!(
+        key,
+        PhysicalKey::Code(
+            Convert
+                | NonConvert
+                | KanaMode
+                | Hiragana
+                | Katakana
+                | Lang1
+                | Lang2
+                | Lang3
+                | Lang4
+                | Lang5
+        )
+    )
+}
+
+/// Route a key event. IME-owned toggle/conversion keys are passed through to the OS IME
+/// and never consumed as an app shortcut (Zed §5.2: #40321/#40592/#40638/#40300); other
+/// keys are where the app keymap will dispatch actions (none yet — Phase 3).
+fn route_key_event(event: &KeyEvent) {
+    if ime_owns_key(event.physical_key) {
+        tracing::trace!(key = ?event.physical_key, "ime-owned key passed through");
+    }
+    // TODO(keymap): dispatch app actions for non-IME keys here once the keymap lands.
+}
+
 impl WindowState {
     /// Handle a winit IME event: track enable state, report the caret area on enable,
     /// and forward preedit/commit (as `ImeEvent`) to the text layer when enabled.
@@ -370,6 +412,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => state.redraw(),
             WindowEvent::Ime(ime) => state.on_ime(ime),
+            WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
             _ => {}
         }
     }
@@ -395,5 +438,27 @@ mod tests {
         );
         assert_eq!(map_ime_event(Ime::Enabled), None);
         assert_eq!(map_ime_event(Ime::Disabled), None);
+    }
+
+    #[test]
+    fn ime_owned_key_should_not_be_handled() {
+        // IME toggle/conversion keys are owned by the OS IME — the app must not consume
+        // them as shortcuts. These cover the Zed-defect scenarios (§5.2).
+        for code in [
+            KeyCode::Lang5,      // zenkaku/hankaku toggle (#40592/#40638/#40300)
+            KeyCode::Convert,    // henkan
+            KeyCode::NonConvert, // muhenkan (#40321)
+            KeyCode::KanaMode,
+            KeyCode::Katakana,
+            KeyCode::Lang1, // kana
+        ] {
+            assert!(
+                ime_owns_key(PhysicalKey::Code(code)),
+                "{code:?} should be IME-owned"
+            );
+        }
+        // Ordinary keys are not IME-owned, so the app keymap may bind them.
+        assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::KeyA)));
+        assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::Enter)));
     }
 }

@@ -17,5 +17,10 @@ pollster = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# Example-only: surfaces IME event flow + key pass-through logs for the manual IME
+# test (docs/dev/ime-manual-test.md, #27). `env-filter` scopes RUST_LOG to our targets.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
 [lints]
 workspace = true
