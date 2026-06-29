@@ -1,0 +1,22 @@
+// Built-in LIGHT theme role table (#45): every `ColorRole` → a palette key in primitives.ron.
+// Light = dark-text on light surfaces. All 16 roles mapped (resolution is total — see Theme::validate).
+(
+    colors: {
+        Surface: "white",
+        SurfaceRaised: "white",
+        SurfaceOverlay: "white",
+        Bg: "slate-50",
+        Text: "slate-900",
+        TextMuted: "slate-600",
+        TextSubtle: "slate-400",
+        Border: "slate-200",
+        BorderStrong: "slate-300",
+        Accent: "blue-600",
+        AccentFg: "white",
+        Danger: "red-600",
+        Warning: "amber-500",
+        Success: "green-600",
+        Info: "sky-500",
+        FocusRing: "blue-500",
+    },
+)

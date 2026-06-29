@@ -12,7 +12,9 @@ use kagari_base::{ColorSpace, Px, TaggedColor, Transfer};
 use serde::Deserialize;
 
 use crate::error::StyleError;
-use crate::token::{ColorRole, FontSizeStep, RadiusStep, SpacingStep};
+use crate::token::{
+    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, SpacingStep,
+};
 
 /// A two-layer theme: primitive palette + scales, plus the semantic role table.
 ///
@@ -39,6 +41,12 @@ pub struct Primitives {
     /// Font-size scale → logical px.
     #[serde(default)]
     pub font_size: HashMap<FontSizeStep, Px>,
+    /// Opacity scale → fraction in `0.0..=1.0`.
+    #[serde(default)]
+    pub opacity: HashMap<OpacityStep, f32>,
+    /// Border-width scale → logical px.
+    #[serde(default)]
+    pub border_width: HashMap<BorderWidthStep, Px>,
 }
 
 /// The upper layer: each semantic [`ColorRole`] points at a palette key (e.g. `Accent → "blue-500"`).
@@ -100,6 +108,30 @@ impl Theme {
     /// [`StyleError::ThemeParse`].
     pub fn from_ron(ron: &str) -> Result<Theme, StyleError> {
         ron::from_str(ron).map_err(|e| StyleError::ThemeParse(e.to_string()))
+    }
+
+    /// The built-in **light** theme (#45). Shares the bundled primitive palette + scales; the role
+    /// table maps semantics onto light values (text-on-white). Complete (every [`ColorRole`] is
+    /// mapped — see [`validate`](Self::validate)).
+    pub fn light() -> Theme {
+        Self::built_in(include_str!("../themes/light-roles.ron"))
+    }
+
+    /// The built-in **dark** theme (#45) — the same palette/scales, role table mapped to dark values.
+    pub fn dark() -> Theme {
+        Self::built_in(include_str!("../themes/dark-roles.ron"))
+    }
+
+    /// Builds a theme from the shared bundled primitives + a role table. The bundled RON is a
+    /// compile-time constant, so a parse failure is a build/programming error, not a runtime case.
+    fn built_in(roles_ron: &str) -> Theme {
+        // INVARIANT: the bundled RON assets are valid and self-consistent — guaranteed by the
+        // `theme_{light,dark}_should_validate` tests (a malformed asset fails the build's tests).
+        let primitives = ron::from_str::<Primitives>(include_str!("../themes/primitives.ron"))
+            .expect("INVARIANT: bundled primitives.ron is valid RON");
+        let roles = ron::from_str::<SemanticRoles>(roles_ron)
+            .expect("INVARIANT: bundled theme role table is valid RON");
+        Theme { primitives, roles }
     }
 
     /// Two-layer color lookup: semantic role → palette key → palette entry (sRGB, pre-linear). The
@@ -189,5 +221,46 @@ mod tests {
         assert_eq!(parse_hex("3b82f6"), None); // no '#'
         assert_eq!(parse_hex("#abc"), None); // wrong length
         assert_eq!(parse_hex("#gggggg"), None); // non-hex
+    }
+
+    #[test]
+    fn theme_light_should_validate() {
+        // The bundled light theme parses and defines every ColorRole (total resolution).
+        Theme::light().validate().expect("light theme is complete");
+    }
+
+    #[test]
+    fn theme_dark_should_validate() {
+        Theme::dark().validate().expect("dark theme is complete");
+    }
+
+    #[test]
+    fn theme_light_should_resolve_scales() {
+        let light = Theme::light();
+        assert_eq!(light.spacing(SpacingStep::S4), Some(Px(16.0)));
+        assert_eq!(light.radius(RadiusStep::Lg), Some(Px(8.0)));
+        assert_eq!(light.font_size(FontSizeStep::Base), Some(Px(16.0)));
+    }
+
+    #[test]
+    fn theme_light_and_dark_should_differ() {
+        // Surface is white in light, slate-900 in dark — reskinning by role swap works.
+        assert_ne!(
+            Theme::light().role_color(ColorRole::Surface),
+            Theme::dark().role_color(ColorRole::Surface)
+        );
+    }
+
+    #[test]
+    fn theme_light_focus_ring_should_resolve_to_blue_500_linear() {
+        // Spot-check a known palette hex survives the pipeline: light FocusRing → blue-500
+        // (#3b82f6) → linear premultiplied. sRGB (0x3b,0x82,0xf6)/255 = (0.2314, 0.5098, 0.9647)
+        // decodes to ~(0.044, 0.223, 0.921) linear. Guards against a typo in the bundled palette.
+        let c = Theme::light().resolve_color(ColorRole::FocusRing);
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        assert!(close(c.r, 0.044), "r {}", c.r);
+        assert!(close(c.g, 0.223), "g {}", c.g);
+        assert!(close(c.b, 0.921), "b {}", c.b);
+        assert_eq!(c.a, 1.0);
     }
 }

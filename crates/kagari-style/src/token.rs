@@ -136,7 +136,7 @@ pub enum ShadowStep {
 }
 
 /// Border-width scale (logical px steps).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum BorderWidthStep {
     B0,
@@ -147,7 +147,7 @@ pub enum BorderWidthStep {
 }
 
 /// Opacity scale (percent steps).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum OpacityStep {
     O0,

@@ -1,0 +1,71 @@
+// Shared primitive layer for the built-in themes (#45): the raw color palette + numeric scales.
+// Light/dark differ only in the role table (light-roles.ron / dark-roles.ron); this file is the
+// single source for both (parsed once by `Theme::built_in`).
+//
+// Shipped palette subset: hues `slate`, `gray`, `blue`, `red`, `green`, `amber`, `sky` at shades
+// `50,100,200,300,400,500,600,700,800,900,950` (Tailwind v3 hex), plus `white`/`black`. Expandable.
+// Scales: spacing (Tailwind ×4px), radius, font-size, opacity, border-width. Shadow is not yet a
+// primitive in the renderer — its scale is deferred to the shadow-rendering feature.
+(
+    colors: {
+        "white": "#ffffff",
+        "black": "#000000",
+
+        "slate-50": "#f8fafc", "slate-100": "#f1f5f9", "slate-200": "#e2e8f0",
+        "slate-300": "#cbd5e1", "slate-400": "#94a3b8", "slate-500": "#64748b",
+        "slate-600": "#475569", "slate-700": "#334155", "slate-800": "#1e293b",
+        "slate-900": "#0f172a", "slate-950": "#020617",
+
+        "gray-50": "#f9fafb", "gray-100": "#f3f4f6", "gray-200": "#e5e7eb",
+        "gray-300": "#d1d5db", "gray-400": "#9ca3af", "gray-500": "#6b7280",
+        "gray-600": "#4b5563", "gray-700": "#374151", "gray-800": "#1f2937",
+        "gray-900": "#111827", "gray-950": "#030712",
+
+        "blue-50": "#eff6ff", "blue-100": "#dbeafe", "blue-200": "#bfdbfe",
+        "blue-300": "#93c5fd", "blue-400": "#60a5fa", "blue-500": "#3b82f6",
+        "blue-600": "#2563eb", "blue-700": "#1d4ed8", "blue-800": "#1e40af",
+        "blue-900": "#1e3a8a", "blue-950": "#172554",
+
+        "red-50": "#fef2f2", "red-100": "#fee2e2", "red-200": "#fecaca",
+        "red-300": "#fca5a5", "red-400": "#f87171", "red-500": "#ef4444",
+        "red-600": "#dc2626", "red-700": "#b91c1c", "red-800": "#991b1b",
+        "red-900": "#7f1d1d", "red-950": "#450a0a",
+
+        "green-50": "#f0fdf4", "green-100": "#dcfce7", "green-200": "#bbf7d0",
+        "green-300": "#86efac", "green-400": "#4ade80", "green-500": "#22c55e",
+        "green-600": "#16a34a", "green-700": "#15803d", "green-800": "#166534",
+        "green-900": "#14532d", "green-950": "#052e16",
+
+        "amber-50": "#fffbeb", "amber-100": "#fef3c7", "amber-200": "#fde68a",
+        "amber-300": "#fcd34d", "amber-400": "#fbbf24", "amber-500": "#f59e0b",
+        "amber-600": "#d97706", "amber-700": "#b45309", "amber-800": "#92400e",
+        "amber-900": "#78350f", "amber-950": "#451a03",
+
+        "sky-50": "#f0f9ff", "sky-100": "#e0f2fe", "sky-200": "#bae6fd",
+        "sky-300": "#7dd3fc", "sky-400": "#38bdf8", "sky-500": "#0ea5e9",
+        "sky-600": "#0284c7", "sky-700": "#0369a1", "sky-800": "#075985",
+        "sky-900": "#0c4a6e", "sky-950": "#082f49",
+    },
+    // Tailwind spacing scale, logical px (1 unit = 4px).
+    spacing: {
+        S0: 0.0, SPx: 1.0, S0p5: 2.0, S1: 4.0, S1p5: 6.0, S2: 8.0, S2p5: 10.0, S3: 12.0,
+        S3p5: 14.0, S4: 16.0, S5: 20.0, S6: 24.0, S7: 28.0, S8: 32.0, S9: 36.0, S10: 40.0,
+        S11: 44.0, S12: 48.0, S14: 56.0, S16: 64.0, S20: 80.0, S24: 96.0, S28: 112.0, S32: 128.0,
+        S36: 144.0, S40: 160.0, S44: 176.0, S48: 192.0, S52: 208.0, S56: 224.0, S60: 240.0,
+        S64: 256.0, S72: 288.0, S80: 320.0, S96: 384.0,
+    },
+    radius: {
+        None: 0.0, Sm: 2.0, Md: 6.0, Lg: 8.0, Xl: 12.0, Xl2: 16.0, Xl3: 24.0, Full: 9999.0,
+    },
+    font_size: {
+        Xs: 12.0, Sm: 14.0, Base: 16.0, Lg: 18.0, Xl: 20.0, Xl2: 24.0, Xl3: 30.0, Xl4: 36.0,
+        Xl5: 48.0, Xl6: 60.0, Xl7: 72.0, Xl8: 96.0, Xl9: 128.0,
+    },
+    opacity: {
+        O0: 0.0, O5: 0.05, O10: 0.1, O20: 0.2, O25: 0.25, O30: 0.3, O40: 0.4, O50: 0.5,
+        O60: 0.6, O70: 0.7, O75: 0.75, O80: 0.8, O90: 0.9, O95: 0.95, O100: 1.0,
+    },
+    border_width: {
+        B0: 0.0, B1: 1.0, B2: 2.0, B4: 4.0, B8: 8.0,
+    },
+)

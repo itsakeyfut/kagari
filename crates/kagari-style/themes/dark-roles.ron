@@ -1,0 +1,22 @@
+// Built-in DARK theme role table (#45): every `ColorRole` → a palette key in primitives.ron.
+// Dark = light-text on dark (slate-900) surfaces. All 16 roles mapped (resolution is total).
+(
+    colors: {
+        Surface: "slate-900",
+        SurfaceRaised: "slate-800",
+        SurfaceOverlay: "slate-800",
+        Bg: "slate-950",
+        Text: "slate-50",
+        TextMuted: "slate-400",
+        TextSubtle: "slate-500",
+        Border: "slate-700",
+        BorderStrong: "slate-600",
+        Accent: "blue-400",
+        AccentFg: "slate-950",
+        Danger: "red-400",
+        Warning: "amber-400",
+        Success: "green-400",
+        Info: "sky-400",
+        FocusRing: "blue-400",
+    },
+)

@@ -11,7 +11,9 @@ use kagari_base::{Color, ColorSpace, Px};
 
 use crate::error::StyleError;
 use crate::theme::Theme;
-use crate::token::{ColorRole, FontSizeStep, RadiusStep, SpacingStep};
+use crate::token::{
+    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, SpacingStep,
+};
 
 /// kagari's MVP working space (linear-Rec709, kagari-base §6.1). Colors resolve into it.
 const WORKING_SPACE: ColorSpace = ColorSpace::Rec709;
@@ -51,6 +53,21 @@ impl Theme {
     /// Resolves a font-size step to logical px (`Px(0.0)` if omitted).
     pub fn resolve_font_size(&self, step: FontSizeStep) -> Px {
         self.font_size(step).unwrap_or(Px(0.0))
+    }
+
+    /// Resolves an opacity step to a fraction in `0.0..=1.0`. Fallback **1.0** (fully opaque) — a
+    /// `0.0` fallback would silently hide content.
+    pub fn resolve_opacity(&self, step: OpacityStep) -> f32 {
+        self.primitives.opacity.get(&step).copied().unwrap_or(1.0)
+    }
+
+    /// Resolves a border-width step to logical px (`Px(0.0)` = no border if omitted).
+    pub fn resolve_border_width(&self, step: BorderWidthStep) -> Px {
+        self.primitives
+            .border_width
+            .get(&step)
+            .copied()
+            .unwrap_or(Px(0.0))
     }
 
     /// Validates that every [`ColorRole`] resolves to a palette color (mapped, and its palette key
@@ -102,6 +119,7 @@ mod tests {
                 spacing,
                 radius,
                 font_size,
+                ..Primitives::default()
             },
             roles: SemanticRoles { colors: roles },
         }
@@ -158,5 +176,25 @@ mod tests {
             theme.validate(),
             Err(StyleError::UnknownRole(ColorRole::Accent))
         ));
+    }
+
+    #[test]
+    fn resolve_opacity_should_return_fraction_or_opaque() {
+        let light = Theme::light();
+        assert_eq!(light.resolve_opacity(OpacityStep::O50), 0.5);
+        // An undefined step (empty theme) falls back to fully opaque, not invisible.
+        assert_eq!(Theme::default().resolve_opacity(OpacityStep::O50), 1.0);
+    }
+
+    #[test]
+    fn resolve_border_width_should_return_px_or_zero() {
+        assert_eq!(
+            Theme::light().resolve_border_width(BorderWidthStep::B2),
+            Px(2.0)
+        );
+        assert_eq!(
+            Theme::default().resolve_border_width(BorderWidthStep::B2),
+            Px(0.0)
+        );
     }
 }
