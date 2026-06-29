@@ -8,6 +8,8 @@
 //! resolution (#40) reads. This crate does not depend on kagari-render (compile isolation, design.md).
 
 pub mod error;
+// Inherent `impl Theme` resolution/validation methods only — no new public type to re-export.
+mod resolve;
 pub mod style;
 pub mod theme;
 pub mod token;
