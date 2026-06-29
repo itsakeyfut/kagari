@@ -5,6 +5,7 @@ use std::sync::Arc;
 use kagari_base::NodeId;
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
+use kagari_style::Theme;
 use kagari_text::TextSystem;
 
 use crate::arena::Arena;
@@ -31,6 +32,8 @@ pub struct LayoutCx<'a> {
     pub layout: &'a mut LayoutTree,
     pub text: &'a mut TextSystem,
     pub damage: Arc<dyn DamageSink>,
+    /// The current theme, for resolving layout tokens (gap/padding) into concrete px (#42).
+    pub theme: &'a Theme,
 }
 
 /// Context for [`Element::paint`](super::Element::paint): the scene to emit primitives into, the
@@ -43,6 +46,8 @@ pub struct PaintCx<'a> {
     pub layout: &'a LayoutTree,
     pub text: &'a mut TextSystem,
     pub atlas: Option<&'a mut Atlas>,
+    /// The current theme, for resolving paint tokens (bg/rounded/border) into concrete values (#42).
+    pub theme: &'a Theme,
     /// Monotonic painter's-order counter: each emitted primitive group takes the next value, so
     /// primitives draw back-to-front in tree-traversal order (parent before its children).
     next_order: u32,
@@ -55,12 +60,14 @@ impl<'a> PaintCx<'a> {
         layout: &'a LayoutTree,
         text: &'a mut TextSystem,
         atlas: Option<&'a mut Atlas>,
+        theme: &'a Theme,
     ) -> Self {
         Self {
             scene,
             layout,
             text,
             atlas,
+            theme,
             next_order: 0,
         }
     }

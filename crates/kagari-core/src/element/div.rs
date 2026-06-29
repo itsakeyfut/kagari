@@ -5,19 +5,24 @@ use std::sync::{Arc, Mutex};
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, Size};
 use kagari_layout::{FlexDirection, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect};
+use kagari_style::{SpacingStep, Style, Styled, Theme};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 use crate::reactive::{Prop, create_effect};
 
-/// A flex container element: children plus raw layout/paint props.
+/// A flex container element: children plus style props.
 ///
-/// Style props are raw `kagari-render`/`kagari-base` values via [`Prop`] (the Tailwind token
-/// API is deferred to the styling milestone, /spec Q4). A static prop is resolved once; a
-/// reactive prop is bound at build to a synchronous effect that re-resolves it and flags damage.
+/// Styling is via the [`Styled`] token API (`gap_2`/`p_4`/`rounded_lg`/`bg(role)`, #41), recorded
+/// into `style` and resolved against the theme at layout/paint (#42). The `background` escape hatch
+/// keeps the raw/reactive [`Background`] path (#31/#35): a static value resolves once; a reactive
+/// closure binds a synchronous effect that re-resolves it and flags damage (reactive token props
+/// are #146).
 pub struct Div {
     children: Vec<AnyElement>,
     layout: LayoutStyle,
+    /// Recorded Tailwind-style tokens (resolved against the theme at layout/paint).
+    style: Style,
     bg: Option<Prop<Background>>,
     /// Assigned on the first `request_layout`; the build-once rebuild lifecycle is #32.
     id: Option<NodeId>,
@@ -34,10 +39,17 @@ pub fn div() -> Div {
     Div {
         children: Vec::new(),
         layout: LayoutStyle::default(),
+        style: Style::default(),
         bg: None,
         id: None,
         child_ids: Vec::new(),
         resolved_bg: Arc::new(Mutex::new(None)),
+    }
+}
+
+impl Styled for Div {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
     }
 }
 
@@ -59,8 +71,10 @@ impl Div {
         self
     }
 
-    /// Sets the background (static value or reactive closure via [`Prop`]).
-    pub fn bg(mut self, bg: impl Into<Prop<Background>>) -> Self {
+    /// Sets a raw/reactive [`Background`] (static value or reactive closure via [`Prop`]) — the
+    /// escape hatch beside the semantic [`Styled::bg`](Styled::bg) token setter. Use this for a
+    /// literal color/gradient or a signal-driven background; use `.bg(role)` for theme tokens.
+    pub fn background(mut self, bg: impl Into<Prop<Background>>) -> Self {
         self.bg = Some(bg.into());
         self
     }
@@ -129,6 +143,48 @@ impl Div {
     fn current_bg(&self) -> Option<Background> {
         self.resolved_bg.lock().ok().and_then(|slot| *slot)
     }
+
+    /// The raw [`LayoutStyle`] overlaid with the resolved layout tokens (gap + padding) from the
+    /// theme. size/margin tokens are not applied yet (LayoutStyle's `size` is a paired value and
+    /// `margin` is not mapped to taffy — a follow-up).
+    fn effective_layout(&self, theme: &Theme) -> LayoutStyle {
+        let mut ls = self.layout;
+        let lt = &self.style.layout;
+        if let Some(step) = lt.gap {
+            ls.gap = theme.resolve_spacing(step);
+        }
+        // Padding: `p` sets all sides, then axis (`px`/`py`) and per-side tokens override it.
+        let px = |step: Option<SpacingStep>| step.map(|s| theme.resolve_spacing(s).0);
+        if let Some(v) = px(lt.p) {
+            ls.padding = Edges {
+                top: v,
+                right: v,
+                bottom: v,
+                left: v,
+            };
+        }
+        if let Some(v) = px(lt.px) {
+            ls.padding.left = v;
+            ls.padding.right = v;
+        }
+        if let Some(v) = px(lt.py) {
+            ls.padding.top = v;
+            ls.padding.bottom = v;
+        }
+        if let Some(v) = px(lt.pt) {
+            ls.padding.top = v;
+        }
+        if let Some(v) = px(lt.pr) {
+            ls.padding.right = v;
+        }
+        if let Some(v) = px(lt.pb) {
+            ls.padding.bottom = v;
+        }
+        if let Some(v) = px(lt.pl) {
+            ls.padding.left = v;
+        }
+        ls
+    }
 }
 
 impl Element for Div {
@@ -141,7 +197,8 @@ impl Element for Div {
                 let id = cx.arena.insert(Node::default());
                 self.id = Some(id);
                 cx.layout.insert(id, None);
-                cx.layout.set_style(id, &self.layout);
+                let layout = self.effective_layout(cx.theme);
+                cx.layout.set_style(id, &layout);
                 self.bind_background(&cx.damage, id);
                 id
             }
@@ -165,11 +222,33 @@ impl Element for Div {
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
-        if let Some(bg) = self.current_bg() {
+        // Background: the semantic token (`bg(role)` → resolved theme color) takes precedence; the
+        // raw/reactive `.background()` value is the fallback. border emit is deferred (the theme has
+        // no border-width resolution yet — a follow-up).
+        let bg = self
+            .style
+            .paint
+            .bg
+            .map(|role| Background::Solid(cx.theme.resolve_color(role)))
+            .or_else(|| self.current_bg());
+        if let Some(bg) = bg {
+            // Corner radius from the `rounded` token (all corners equal); 0 when unset.
+            let radius = self
+                .style
+                .paint
+                .rounded
+                .map(|step| cx.theme.resolve_radius(step).0)
+                .unwrap_or(0.0);
+            let corner_radii = Corners {
+                tl: radius,
+                tr: radius,
+                br: radius,
+                bl: radius,
+            };
             let order = cx.next_order();
             cx.scene.quads.push(Quad {
                 bounds,
-                corner_radii: Corners::default(),
+                corner_radii,
                 bg,
                 border: Border {
                     widths: Edges::default(),
@@ -177,7 +256,7 @@ impl Element for Div {
                 },
                 content_mask: RoundedRect {
                     rect: bounds,
-                    radii: Corners::default(),
+                    radii: corner_radii,
                 },
                 // Painter's order from traversal order: the parent's quad takes a lower order than
                 // its children's primitives, so children draw on top.
@@ -212,13 +291,27 @@ impl IntoElement for Div {
 mod tests {
     use super::*;
     use crate::arena::Arena;
+    use crate::damage::DamageState;
+    use crate::paint::render_tree;
     use crate::reactive::rx;
     use kagari_layout::LayoutTree;
     use kagari_render::Scene;
+    use kagari_style::ColorRole;
     use kagari_text::{FontDb, TextSystem};
     use reactive_graph::owner::Owner;
     use reactive_graph::prelude::*;
     use reactive_graph::signal::signal;
+
+    /// A small populated theme for the token-resolution tests: `Accent → #3b82f6`, `S4 → 16`,
+    /// radius `Lg → 8`.
+    const TEST_THEME_RON: &str = r##"(
+        primitives: (
+            colors: { "blue-500": "#3b82f6" },
+            spacing: { S4: 16.0 },
+            radius: { Lg: 8.0 },
+        ),
+        roles: ( colors: { Accent: "blue-500" } ),
+    )"##;
 
     struct NoopDamage;
     impl DamageSink for NoopDamage {
@@ -243,11 +336,13 @@ mod tests {
         let mut layout = LayoutTree::new();
         let mut text = TextSystem::new(FontDb::new());
         let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let theme = Theme::default();
         let mut cx = LayoutCx {
             arena: &mut arena,
             layout: &mut layout,
             text: &mut text,
             damage,
+            theme: &theme,
         };
 
         let mut root = div().child(div()).child(div());
@@ -278,19 +373,21 @@ mod tests {
         let mut text = TextSystem::new(FontDb::new());
         let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
 
+        let theme = Theme::default();
         let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
-        let mut d = div().bg(green);
+        let mut d = div().background(green);
         d.request_layout(&mut LayoutCx {
             arena: &mut arena,
             layout: &mut layout,
             text: &mut text,
             damage,
+            theme: &theme,
         });
 
         let mut scene = Scene::new();
         d.paint(
             Rect::default(),
-            &mut PaintCx::new(&mut scene, &layout, &mut text, None),
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, &theme),
         );
 
         assert_eq!(scene.quads.len(), 1);
@@ -312,19 +409,21 @@ mod tests {
         let mut layout = LayoutTree::new();
         let mut text = TextSystem::new(FontDb::new());
         let damage = Arc::new(RecordingDamage::default());
+        let theme = Theme::default();
 
-        let mut d = div().bg(rx(move || read.get()));
+        let mut d = div().background(rx(move || read.get()));
         let id = d.request_layout(&mut LayoutCx {
             arena: &mut arena,
             layout: &mut layout,
             text: &mut text,
             damage: damage.clone(),
+            theme: &theme,
         });
 
         let paint = |d: &mut Div, scene: &mut Scene, text: &mut TextSystem| {
             d.paint(
                 Rect::default(),
-                &mut PaintCx::new(scene, &layout, text, None),
+                &mut PaintCx::new(scene, &layout, text, None, &theme),
             );
         };
 
@@ -352,5 +451,65 @@ mod tests {
         drop(dirtied);
 
         drop(owner);
+    }
+
+    /// Renders `root` against `theme` into a fresh `Scene` (GPU-free: no atlas).
+    fn render(mut root: AnyElement, theme: &Theme) -> Scene {
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let damage = Arc::new(DamageState::default());
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            &mut scene,
+            Size { w: 200.0, h: 200.0 },
+            &damage,
+            theme,
+        )
+        .unwrap();
+        scene
+    }
+
+    #[test]
+    fn div_styled_bg_token_should_resolve_to_color() {
+        let theme = Theme::from_ron(TEST_THEME_RON).unwrap();
+        let scene = render(div().bg(ColorRole::Accent).into_element(), &theme);
+        // `bg(Accent)` resolves through the theme (Accent → blue-500 → linear) into the quad.
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(theme.resolve_color(ColorRole::Accent))
+        );
+    }
+
+    #[test]
+    fn div_styled_padding_should_offset_child() {
+        let theme = Theme::from_ron(TEST_THEME_RON).unwrap();
+        // Parent has padding p_4 (→16px) and no bg; the green child is inset by the padding.
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let scene = render(
+            div().p_4().child(div().background(green)).into_element(),
+            &theme,
+        );
+        assert_eq!(scene.quads.len(), 1, "only the child has a bg");
+        assert_eq!(scene.quads[0].bounds.origin.x, 16.0);
+        assert_eq!(scene.quads[0].bounds.origin.y, 16.0);
+    }
+
+    #[test]
+    fn div_styled_rounded_should_set_corner_radii() {
+        let theme = Theme::from_ron(TEST_THEME_RON).unwrap();
+        let scene = render(
+            div().rounded_lg().bg(ColorRole::Accent).into_element(),
+            &theme,
+        );
+        // radius Lg → 8px, applied to all four corners.
+        assert_eq!(scene.quads[0].corner_radii.tl, 8.0);
+        assert_eq!(scene.quads[0].corner_radii.br, 8.0);
     }
 }
