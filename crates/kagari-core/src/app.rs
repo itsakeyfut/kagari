@@ -14,7 +14,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use kagari_style::Theme;
+use kagari_style::{ColorRole, Styled, Theme};
 
 use crate::arena::Arena;
 use crate::damage::DamageState;
@@ -25,11 +25,28 @@ use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
 
+/// The winit user event carrying a hot-reloaded theme to the UI thread (#44). The theme watcher
+/// runs on a background thread and posts this via the `EventLoopProxy`; [`App::user_event`] writes
+/// it into the reactive theme signal on the UI thread. Without `hot-reload` there is no user event.
+#[cfg(feature = "hot-reload")]
+struct ThemeReload(Theme);
+
+#[cfg(feature = "hot-reload")]
+type UserEvent = ThemeReload;
+#[cfg(not(feature = "hot-reload"))]
+type UserEvent = ();
+
 /// The application shell. Owns the shared wgpu instance and, once resumed, the
 /// single window's GPU state.
 pub struct App {
     instance: wgpu::Instance,
     window: Option<WindowState>,
+    /// The theme RON file to watch for dev hot-reload (#44), set via [`App::watch_theme`].
+    #[cfg(feature = "hot-reload")]
+    theme_path: Option<std::path::PathBuf>,
+    /// The live theme watcher, kept alive for the app's lifetime once spawned.
+    #[cfg(feature = "hot-reload")]
+    theme_watcher: Option<kagari_style::ThemeWatcher>,
 }
 
 struct WindowState {
@@ -67,10 +84,10 @@ struct WindowState {
 
 /// The demo root element: a colored panel containing a line of text.
 fn demo_root() -> AnyElement {
-    use kagari_base::Color;
-    use kagari_render::Background;
+    // Use a semantic token (not a static color) so a theme swap / hot-reload (#43/#44) visibly
+    // reskins the panel as the theme's `Surface` role changes.
     div()
-        .background(Background::Solid(Color::from_srgb([0.12, 0.13, 0.16, 1.0])))
+        .bg(ColorRole::Surface)
         .child(text("Hello, kagari"))
         .into_element()
 }
@@ -103,16 +120,65 @@ impl App {
         Ok(Self {
             instance,
             window: None,
+            #[cfg(feature = "hot-reload")]
+            theme_path: None,
+            #[cfg(feature = "hot-reload")]
+            theme_watcher: None,
         })
+    }
+
+    /// Watches a theme RON file for dev hot-reload (#44): editing the file while the app runs
+    /// reloads the theme and reskins the UI with no recompile. Requires the `hot-reload` feature.
+    #[cfg(feature = "hot-reload")]
+    pub fn watch_theme(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.theme_path = Some(path.into());
+        self
     }
 
     /// Run the winit event loop until the window closes.
     pub fn run(mut self) -> Result<(), AppError> {
-        let event_loop = EventLoop::new().map_err(|e| AppError::WindowCreate(e.to_string()))?;
+        let event_loop = EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .map_err(|e| AppError::WindowCreate(e.to_string()))?;
         event_loop.set_control_flow(ControlFlow::Wait);
+        #[cfg(feature = "hot-reload")]
+        self.spawn_theme_watcher(&event_loop);
         event_loop
             .run_app(&mut self)
             .map_err(|e| AppError::WindowCreate(e.to_string()))
+    }
+
+    /// Spawns the theme-file watcher (if [`watch_theme`](Self::watch_theme) set a path), wired to
+    /// post each reload to the UI thread via the winit `EventLoopProxy`. The watcher handle is kept
+    /// on `self` for the app's lifetime; a setup error degrades to a warning (no hot-reload).
+    #[cfg(feature = "hot-reload")]
+    fn spawn_theme_watcher(&mut self, event_loop: &EventLoop<UserEvent>) {
+        let Some(path) = self.theme_path.clone() else {
+            return;
+        };
+        let proxy = event_loop.create_proxy();
+        match kagari_style::ThemeWatcher::new(path, move |theme| {
+            // Off-thread: only post to the UI thread. The signal write happens in `user_event`.
+            let _ = proxy.send_event(ThemeReload(theme));
+        }) {
+            Ok(watcher) => self.theme_watcher = Some(watcher),
+            Err(e) => tracing::warn!(error = %e, "failed to start theme hot-reload watcher"),
+        }
+    }
+
+    /// The theme to start with: the watched file loaded once (if set), else the built-in light
+    /// theme (#45). A read/parse failure keeps light and warns — the watcher retries on the next edit.
+    fn initial_theme(&self) -> Theme {
+        #[cfg(feature = "hot-reload")]
+        if let Some(path) = &self.theme_path {
+            match kagari_style::load_theme_file(path) {
+                Ok(theme) => return theme,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load initial theme file; using light theme")
+                }
+            }
+        }
+        Theme::light()
     }
 
     fn create_window_state(&self, event_loop: &ActiveEventLoop) -> Result<WindowState, AppError> {
@@ -149,9 +215,10 @@ impl App {
         owner.set();
 
         let damage = Arc::new(DamageState::default());
-        // The theme lives in the root reactive context (#43, specs §1.8); start on the built-in
-        // light theme (#45). Writing this signal reskins every token; the swap trigger is #44.
-        let theme = RwSignal::new(Arc::new(Theme::light()));
+        // The theme lives in the root reactive context (#43, specs §1.8). Start on the watched file
+        // (#44) if one was set, else the built-in light theme (#45). Writing this signal reskins
+        // every token; the hot-reload watcher writes it on each file change.
+        let theme = RwSignal::new(Arc::new(self.initial_theme()));
         provide_root_theme(theme, Arc::clone(&damage));
         let root = demo_root();
 
@@ -374,7 +441,7 @@ async fn init_gpu(
     Ok((device, queue, config))
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -409,6 +476,19 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime) => state.on_ime(ime),
             WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // A theme hot-reload posted from the watcher thread (#44). Writing the signal on the UI
+        // thread re-runs the #43 swap effect → full damage → `about_to_wait` requests a redraw.
+        // Without `hot-reload`, `UserEvent` is `()` and nothing posts, so `_event` is unused.
+        #[cfg(feature = "hot-reload")]
+        {
+            let ThemeReload(theme) = _event;
+            if let Some(state) = self.window.as_ref() {
+                state.theme.set(Arc::new(theme));
+            }
         }
     }
 

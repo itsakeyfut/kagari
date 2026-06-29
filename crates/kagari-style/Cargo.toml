@@ -11,6 +11,16 @@ serde = { workspace = true }
 ron = { workspace = true }
 thiserror = { workspace = true }
 kagari-macros = { workspace = true }
+# Dev theme hot-reload (feature `hot-reload`): file watcher + warn-on-parse-error logging.
+notify = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+# Dev-only: watch a theme RON file and reload it on change (#44, specs §3.7).
+hot-reload = ["dep:notify", "dep:tracing"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
