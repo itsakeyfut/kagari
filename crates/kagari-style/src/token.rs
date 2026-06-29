@@ -217,6 +217,30 @@ pub enum ColorRole {
     FocusRing,
 }
 
+impl ColorRole {
+    /// Every semantic role a complete theme must define. Consumed by
+    /// [`Theme::validate`](crate::theme::Theme::validate) and the built-in themes (#45). Keep in
+    /// sync with the variants — `color_role_all_should_list_every_variant` guards this.
+    pub const ALL: [ColorRole; 16] = [
+        ColorRole::Surface,
+        ColorRole::SurfaceRaised,
+        ColorRole::SurfaceOverlay,
+        ColorRole::Bg,
+        ColorRole::Text,
+        ColorRole::TextMuted,
+        ColorRole::TextSubtle,
+        ColorRole::Border,
+        ColorRole::BorderStrong,
+        ColorRole::Accent,
+        ColorRole::AccentFg,
+        ColorRole::Danger,
+        ColorRole::Warning,
+        ColorRole::Success,
+        ColorRole::Info,
+        ColorRole::FocusRing,
+    ];
+}
+
 /// An erased reference to any single token. The element's [`Style`](crate::style::Style) keeps
 /// type-specific fields; `TokenRef` is the uniform form the resolver (#40) and future dynamic
 /// styling use, with `From<…Step>`/`From<ColorRole>` to build it without naming the variant.
@@ -276,5 +300,32 @@ mod tests {
     fn token_ref_from_color_role_should_tag_color() {
         let r: TokenRef = ColorRole::Accent.into();
         assert_eq!(r, TokenRef::Color(ColorRole::Accent));
+    }
+
+    #[test]
+    fn color_role_all_should_list_every_variant() {
+        // Exhaustive match (allowed same-crate despite `#[non_exhaustive]`): adding a `ColorRole`
+        // variant breaks this until it is also added to `ALL`, keeping `validate` complete.
+        for &role in &ColorRole::ALL {
+            match role {
+                ColorRole::Surface
+                | ColorRole::SurfaceRaised
+                | ColorRole::SurfaceOverlay
+                | ColorRole::Bg
+                | ColorRole::Text
+                | ColorRole::TextMuted
+                | ColorRole::TextSubtle
+                | ColorRole::Border
+                | ColorRole::BorderStrong
+                | ColorRole::Accent
+                | ColorRole::AccentFg
+                | ColorRole::Danger
+                | ColorRole::Warning
+                | ColorRole::Success
+                | ColorRole::Info
+                | ColorRole::FocusRing => {}
+            }
+        }
+        assert_eq!(ColorRole::ALL.len(), 16);
     }
 }
