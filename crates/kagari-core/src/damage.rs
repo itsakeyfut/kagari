@@ -33,6 +33,10 @@ struct DamageInner {
     layout: Vec<NodeId>,
     /// Nodes needing repaint only (appearance changed).
     paint: Vec<NodeId>,
+    /// A whole-tree repaint is pending (e.g. a theme swap, #43): every token must re-resolve. Not
+    /// tied to specific nodes — the layout reskin happens as elements re-apply their resolved style
+    /// during the next `request_layout`; this flag only wakes the loop and drives a full repaint.
+    full: bool,
 }
 
 impl DamageSink for DamageState {
@@ -51,12 +55,21 @@ impl DamageSink for DamageState {
 
 impl DamageState {
     /// Whether any node is dirty this frame (the scheduler, #36, polls this to decide whether to
-    /// redraw at all).
+    /// redraw at all). True while a full repaint ([`mark_all_dirty`](Self::mark_all_dirty)) is pending.
     pub fn is_dirty(&self) -> bool {
         self.inner
             .lock()
-            .map(|inner| !inner.layout.is_empty() || !inner.paint.is_empty())
+            .map(|inner| inner.full || !inner.layout.is_empty() || !inner.paint.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Flags a full repaint: every token must re-resolve (e.g. a theme swap, #43). Drives the next
+    /// frame to wake and repaint the whole window (§1.4); the layout reskin follows from elements
+    /// re-applying their resolved style on the next `request_layout`. Cleared by [`clear`](Self::clear).
+    pub fn mark_all_dirty(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.full = true;
+        }
     }
 
     /// Drains and returns the layout-dirty nodes. The frame loop feeds these to
@@ -79,6 +92,10 @@ impl DamageState {
     /// [`take_layout_dirty`](Self::take_layout_dirty)) and clears damage, otherwise the moved /
     /// resized regions are gone from the set. Today the GPU repaints the whole window (§1.4), so
     /// nothing consumes it yet.
+    ///
+    /// A pending full repaint ([`mark_all_dirty`](Self::mark_all_dirty)) is **not** reflected here —
+    /// it tracks no specific nodes. A partial-redraw consumer must treat `is_dirty()` being true with
+    /// an empty/partial `damage_rect` as the whole viewport.
     pub fn damage_rect(&self, arena: &Arena, layout: &LayoutTree) -> Option<Rect> {
         let inner = self.inner.lock().ok()?;
         let union = inner
@@ -99,6 +116,7 @@ impl DamageState {
         if let Ok(mut inner) = self.inner.lock() {
             inner.layout.clear();
             inner.paint.clear();
+            inner.full = false;
         }
     }
 }
