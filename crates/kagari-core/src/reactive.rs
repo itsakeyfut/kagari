@@ -13,6 +13,7 @@
 //! (`static`/`thread_local!`) of our own (design.md §3).
 
 pub use reactive_graph::computed::Memo;
+pub use reactive_graph::owner::Owner;
 pub use reactive_graph::signal::{ReadSignal, WriteSignal};
 
 /// Reactive traits (`Get`/`Set`/…) needed to read and write the signals/memos this module

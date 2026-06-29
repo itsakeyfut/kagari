@@ -67,8 +67,26 @@ impl Arena {
     }
 
     /// Removes and returns the node for `id`, or `None` if the handle is stale.
+    ///
+    /// Removes only this node — not its descendants. To free a whole subtree (e.g. when a
+    /// dynamic child is unmounted) use [`Arena::remove_subtree`], or its children's slots leak.
     pub fn remove(&mut self, id: NodeId) -> Option<Node> {
         self.nodes.remove(to_key(id))
+    }
+
+    /// Removes `id` and all its descendants, returning the number of nodes removed.
+    ///
+    /// Reactive-owner cleanup frees a removed subtree's effects, but not its arena nodes; this
+    /// frees the nodes so the two ownership planes stay in sync on removal (#32).
+    pub fn remove_subtree(&mut self, id: NodeId) -> usize {
+        let mut removed = 0;
+        if let Some(node) = self.nodes.remove(to_key(id)) {
+            removed += 1;
+            for child in node.children {
+                removed += self.remove_subtree(child);
+            }
+        }
+        removed
     }
 
     /// Whether `id` still refers to a live node.
@@ -108,6 +126,34 @@ mod tests {
         assert!(!arena.contains(id));
         // Removing an already-stale handle is a safe miss, not a panic.
         assert!(arena.remove(id).is_none());
+    }
+
+    #[test]
+    fn arena_remove_subtree_should_free_descendants() {
+        let mut arena = Arena::new();
+        let root = arena.insert(Node::default());
+        let child = arena.insert(Node {
+            parent: Some(root),
+            children: Vec::new(),
+        });
+        let grandchild = arena.insert(Node {
+            parent: Some(child),
+            children: Vec::new(),
+        });
+        arena.get_mut(child).unwrap().children.push(grandchild);
+        arena.get_mut(root).unwrap().children.push(child);
+
+        assert_eq!(
+            arena.remove_subtree(root),
+            3,
+            "root + child + grandchild removed"
+        );
+        assert!(!arena.contains(root));
+        assert!(!arena.contains(child));
+        assert!(
+            !arena.contains(grandchild),
+            "descendants are freed, not leaked"
+        );
     }
 
     #[test]

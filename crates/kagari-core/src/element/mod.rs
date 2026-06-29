@@ -9,9 +9,11 @@
 
 mod cx;
 mod div;
+mod dynamic;
 
 pub use cx::{DamageSink, Event, EventCx, LayoutCx, PaintCx};
 pub use div::{Div, div};
+pub use dynamic::{DynIf, DynList, dyn_if, dyn_list};
 
 use kagari_base::{NodeId, Rect};
 
