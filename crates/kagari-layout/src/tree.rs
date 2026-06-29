@@ -112,6 +112,24 @@ impl LayoutTree {
         Ok(())
     }
 
+    /// Marks `node` dirty so the next [`compute`](Self::compute) re-lays-out it (no-op if the
+    /// node is unknown). taffy marks the node *and its ancestors* dirty, so the relayout
+    /// propagates up to the root while clean sibling subtrees keep their cached layout. The
+    /// damage layer (#35) calls this for layout-dirty nodes before recomputing.
+    pub fn mark_dirty(&mut self, node: NodeId) {
+        if let Some(&taffy_id) = self.fwd.get(&node) {
+            let _ = self.taffy.mark_dirty(taffy_id);
+        }
+    }
+
+    /// Whether `node`'s layout is dirty (needs recompute). `false` if the node is unknown.
+    pub fn is_dirty(&self, node: NodeId) -> bool {
+        self.fwd
+            .get(&node)
+            .and_then(|&taffy_id| self.taffy.dirty(taffy_id).ok())
+            .unwrap_or(false)
+    }
+
     /// The computed bounds of `node` (origin + size), or a zero rect if the node is unknown or
     /// not yet laid out.
     pub fn layout(&self, node: NodeId) -> Rect {
@@ -263,5 +281,19 @@ mod tests {
         let mut tree = LayoutTree::new();
         let result = tree.compute(node(99), Size { w: 10.0, h: 10.0 });
         assert!(matches!(result, Err(LayoutError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn mark_dirty_should_ignore_unknown_node() {
+        // Marking a node that was never inserted is a silent no-op (no panic).
+        let mut tree = LayoutTree::new();
+        tree.mark_dirty(node(99));
+        assert!(!tree.is_dirty(node(99)));
+    }
+
+    #[test]
+    fn is_dirty_should_be_false_for_unknown_node() {
+        let tree = LayoutTree::new();
+        assert!(!tree.is_dirty(node(42)));
     }
 }

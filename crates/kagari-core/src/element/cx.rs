@@ -11,10 +11,16 @@ use crate::arena::Arena;
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
 /// paint prop's effect calls [`DamageSink::mark_paint_dirty`]); #35 implements the real
-/// layout/paint-dirty tracking and damage rects behind it.
+/// layout/paint-dirty tracking and damage rects behind it ([`DamageState`](crate::damage::DamageState)).
 pub trait DamageSink: Send + Sync {
-    /// Mark `id`'s painted output as stale (a reactive paint prop changed).
+    /// Mark `id`'s painted output as stale (a reactive paint prop changed: appearance only,
+    /// no relayout).
     fn mark_paint_dirty(&self, id: NodeId);
+
+    /// Mark `id` as needing relayout (a reactive layout prop changed: size/position). Default
+    /// no-op so paint-only sinks need not implement it; the first reactive layout setter that
+    /// calls this lands in #146.
+    fn mark_layout_dirty(&self, _id: NodeId) {}
 }
 
 /// Context for [`Element::request_layout`](super::Element::request_layout): the arena to build
