@@ -8,10 +8,15 @@ rust-version.workspace = true
 [dependencies]
 # `derive` brings in the Pod/Zeroable derive macros used by the value types.
 bytemuck = { workspace = true, optional = true, features = ["derive"] }
+# `derive` (from the workspace dep) brings in Serialize/Deserialize for the value types.
+serde = { workspace = true, optional = true }
 
 [features]
 # Enables `bytemuck::Pod`/`Zeroable` derives so render can cast value types to bytes.
 bytemuck = ["dep:bytemuck"]
+# Enables `serde::Serialize`/`Deserialize` derives so kagari-style can (de)serialize value
+# types (Px/Color/...) from theme RON.
+serde = ["dep:serde"]
 
 [dev-dependencies]
 proptest = { workspace = true }
