@@ -1,0 +1,27 @@
+// Sample dev theme for the `hot_reload` example. Edit a color below while the example runs and the
+// window reskins live (no recompile). This is a self-contained `Theme` (primitives + roles), unlike
+// the bundled light/dark which split the shared palette across files.
+//
+// Try changing `Surface` (the panel background): swap "sky-100" for "amber-100" or "slate-800".
+(
+    primitives: (
+        colors: {
+            "white": "#ffffff",
+            "slate-50": "#f8fafc",
+            "slate-800": "#1e293b",
+            "slate-900": "#0f172a",
+            "sky-100": "#e0f2fe",
+            "amber-100": "#fef3c7",
+            "blue-600": "#2563eb",
+        },
+        spacing: { S4: 16.0 },
+        radius: { Lg: 8.0 },
+    ),
+    roles: (
+        colors: {
+            Surface: "sky-100",
+            Text: "slate-900",
+            Accent: "blue-600",
+        },
+    ),
+)

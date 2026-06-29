@@ -18,6 +18,8 @@ default = ["widgets"]
 widgets = ["dep:kagari-widgets"]
 # Dev/test tracing subscriber init (examples and tests only); never enabled by apps.
 dev = ["dep:tracing-subscriber"]
+# Dev theme hot-reload (#44): watch a theme RON file and reskin on change.
+hot-reload = ["kagari-core/hot-reload"]
 
 [lints]
 workspace = true

@@ -56,7 +56,9 @@ raw-window-handle = "0.6.2"
 directories = "6.0"
 arboard = "3.6.1"            # OS clipboard (kagari-text TextBuffer; Linux uses pure-Rust x11rb)
 pollster = "0.4"           # block_on for wgpu's async init inside winit's sync handlers
+notify = "8.2.0"               # dev theme hot-reload file watcher (kagari-style, feature: hot-reload)
 
 # dev (each crate references via { workspace = true } under [dev-dependencies]).
 proptest = "1.11"
 criterion = "0.8.2"
+tempfile = "3.27.0"             # temp theme files in hot-reload tests
