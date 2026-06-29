@@ -10,6 +10,7 @@ kagari-base = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 ron = { workspace = true }
 thiserror = { workspace = true }
+kagari-macros = { workspace = true }
 
 [lints]
 workspace = true
