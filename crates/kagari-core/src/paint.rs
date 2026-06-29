@@ -32,6 +32,7 @@ pub fn render_tree(
     scene: &mut Scene,
     viewport: Size,
     damage: &Arc<DamageState>,
+    theme: &kagari_style::Theme,
 ) -> Result<(), LayoutError> {
     let root_id = {
         // `Arc<DamageState>` coerces to the `Arc<dyn DamageSink>` the build context holds.
@@ -41,6 +42,7 @@ pub fn render_tree(
             layout,
             text,
             damage: sink,
+            theme,
         };
         root.request_layout(&mut layout_cx)
     };
@@ -56,7 +58,7 @@ pub fn render_tree(
 
     scene.clear();
     let root_bounds = layout.layout(root_id);
-    let mut paint_cx = PaintCx::new(scene, layout, text, atlas);
+    let mut paint_cx = PaintCx::new(scene, layout, text, atlas, theme);
     root.paint(root_bounds, &mut paint_cx);
 
     // The frame consumed this damage. The GPU repaints the whole window for now (§1.4), so the
@@ -73,6 +75,7 @@ mod tests {
     use crate::element::{Element, IntoElement, LayoutCx, div, text};
     use kagari_base::{Color, NodeId};
     use kagari_render::{Background, Scene};
+    use kagari_style::Theme;
     use kagari_text::FontDb;
 
     struct NoopDamage;
@@ -83,13 +86,14 @@ mod tests {
     #[test]
     fn render_tree_should_emit_div_quad_with_computed_bounds() {
         let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
-        let mut root = div().bg(green).child(text("Hi")).into_element();
+        let mut root = div().background(green).child(text("Hi")).into_element();
 
         let mut arena = Arena::new();
         let mut layout = LayoutTree::new();
         let mut text_system = TextSystem::new(FontDb::new());
         let mut scene = Scene::new();
         let damage = Arc::new(DamageState::default());
+        let theme = Theme::default();
 
         render_tree(
             &mut root,
@@ -100,6 +104,7 @@ mod tests {
             &mut scene,
             Size { w: 200.0, h: 100.0 },
             &damage,
+            &theme,
         )
         .unwrap();
 
@@ -125,7 +130,7 @@ mod tests {
         let mut root = div()
             .flex_col()
             .child(div().size(Size { w: 50.0, h: 30.0 }))
-            .child(div().child(div().bg(red)))
+            .child(div().child(div().background(red)))
             .into_element();
 
         let mut arena = Arena::new();
@@ -133,6 +138,7 @@ mod tests {
         let mut text_system = TextSystem::new(FontDb::new());
         let mut scene = Scene::new();
         let damage = Arc::new(DamageState::default());
+        let theme = Theme::default();
 
         render_tree(
             &mut root,
@@ -143,6 +149,7 @@ mod tests {
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,
+            &theme,
         )
         .unwrap();
 
@@ -163,6 +170,7 @@ mod tests {
         let mut layout = LayoutTree::new();
         let mut text_system = TextSystem::new(FontDb::new());
         let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let theme = Theme::default();
 
         let mut leaf = text("Hi");
         let id = {
@@ -171,6 +179,7 @@ mod tests {
                 layout: &mut layout,
                 text: &mut text_system,
                 damage,
+                theme: &theme,
             };
             leaf.request_layout(&mut cx)
         };

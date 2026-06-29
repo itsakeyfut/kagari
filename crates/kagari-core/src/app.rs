@@ -14,6 +14,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use kagari_style::Theme;
+
 use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement, div, text};
@@ -46,6 +48,9 @@ struct WindowState {
     text: TextSystem,
     root: AnyElement,
     damage: Arc<DamageState>,
+    // The current theme, resolved against during paint (#42). Empty default for now; the reactive
+    // theme context (#43) and built-in light/dark themes (#45) replace it.
+    theme: Theme,
     // Hybrid frame scheduler (#36): tracks active sources for continuous driving; `about_to_wait`
     // gates `request_redraw` on damage/active state so the app is idle when nothing changes.
     scheduler: Scheduler,
@@ -59,7 +64,7 @@ fn demo_root() -> AnyElement {
     use kagari_base::Color;
     use kagari_render::Background;
     div()
-        .bg(Background::Solid(Color::from_srgb([0.12, 0.13, 0.16, 1.0])))
+        .background(Background::Solid(Color::from_srgb([0.12, 0.13, 0.16, 1.0])))
         .child(text("Hello, kagari"))
         .into_element()
 }
@@ -128,6 +133,7 @@ impl App {
             text: TextSystem::new(FontDb::new()),
             root: demo_root(),
             damage: Arc::new(DamageState::default()),
+            theme: Theme::default(),
             scheduler: Scheduler::new(),
             ime_enabled: false,
         })
@@ -254,6 +260,7 @@ impl WindowState {
             &mut self.scene,
             viewport,
             &self.damage,
+            &self.theme,
         ) {
             tracing::error!(error = %e, "layout/paint failed");
             return;

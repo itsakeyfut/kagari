@@ -15,7 +15,11 @@ use crate::error::StyleError;
 use crate::token::{ColorRole, FontSizeStep, RadiusStep, SpacingStep};
 
 /// A two-layer theme: primitive palette + scales, plus the semantic role table.
-#[derive(Clone, PartialEq, Debug, Deserialize)]
+///
+/// `Default` is an empty theme (no palette/roles/scales) — used as the app's placeholder until the
+/// reactive theme context (#43) and built-in light/dark themes (#45) land; every token then
+/// resolves to its fallback.
+#[derive(Clone, PartialEq, Debug, Default, Deserialize)]
 pub struct Theme {
     pub primitives: Primitives,
     pub roles: SemanticRoles,

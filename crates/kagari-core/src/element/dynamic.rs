@@ -377,6 +377,7 @@ mod tests {
         layout: LayoutTree,
         text: TextSystem,
         damage: Arc<dyn DamageSink>,
+        theme: kagari_style::Theme,
     }
     impl Env {
         fn new(damage: Arc<dyn DamageSink>) -> Self {
@@ -385,6 +386,7 @@ mod tests {
                 layout: LayoutTree::new(),
                 text: TextSystem::new(FontDb::new()),
                 damage,
+                theme: kagari_style::Theme::default(),
             }
         }
         fn cx(&mut self) -> LayoutCx<'_> {
@@ -393,6 +395,7 @@ mod tests {
                 layout: &mut self.layout,
                 text: &mut self.text,
                 damage: Arc::clone(&self.damage),
+                theme: &self.theme,
             }
         }
     }
@@ -468,7 +471,7 @@ mod tests {
         let mut list = dyn_list(
             move || items.get(),
             |k: &u32| *k,
-            move |_k: &u32| div().bg(rx(move || bg.get())),
+            move |_k: &u32| div().background(rx(move || bg.get())),
         );
         list.request_layout(&mut env.cx());
 
