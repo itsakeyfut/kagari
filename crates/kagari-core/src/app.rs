@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::{NodeId, Size};
+use kagari_base::Size;
 use kagari_layout::LayoutTree;
 use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
@@ -15,7 +15,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::arena::Arena;
-use crate::element::{AnyElement, DamageSink, IntoElement, div, text};
+use crate::damage::DamageState;
+use crate::element::{AnyElement, IntoElement, div, text};
 use crate::error::AppError;
 use crate::paint::render_tree;
 
@@ -43,17 +44,10 @@ struct WindowState {
     layout: LayoutTree,
     text: TextSystem,
     root: AnyElement,
-    damage: Arc<dyn DamageSink>,
+    damage: Arc<DamageState>,
     // Whether the OS IME is currently composing into this window (set by
     // `Ime::Enabled`/`Disabled`). Gates preedit/commit forwarding.
     ime_enabled: bool,
-}
-
-/// A no-op damage sink: paint rebuilds the whole scene each frame for now. Real layout/paint
-/// damage tracking lands in #35.
-struct NoopDamage;
-impl DamageSink for NoopDamage {
-    fn mark_paint_dirty(&self, _id: NodeId) {}
 }
 
 /// The demo root element: a colored panel containing a line of text.
@@ -129,7 +123,7 @@ impl App {
             layout: LayoutTree::new(),
             text: TextSystem::new(FontDb::new()),
             root: demo_root(),
-            damage: Arc::new(NoopDamage),
+            damage: Arc::new(DamageState::default()),
             ime_enabled: false,
         })
     }

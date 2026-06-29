@@ -15,6 +15,7 @@ use kagari_render::{Atlas, Scene};
 use kagari_text::TextSystem;
 
 use crate::arena::Arena;
+use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
 
 /// Builds, lays out, and paints `root` into `scene` for the given `viewport`.
@@ -30,17 +31,26 @@ pub fn render_tree(
     atlas: Option<&mut Atlas>,
     scene: &mut Scene,
     viewport: Size,
-    damage: &Arc<dyn DamageSink>,
+    damage: &Arc<DamageState>,
 ) -> Result<(), LayoutError> {
     let root_id = {
+        // `Arc<DamageState>` coerces to the `Arc<dyn DamageSink>` the build context holds.
+        let sink: Arc<dyn DamageSink> = Arc::clone(damage) as Arc<dyn DamageSink>;
         let mut layout_cx = LayoutCx {
             arena,
             layout,
             text,
-            damage: Arc::clone(damage),
+            damage: sink,
         };
         root.request_layout(&mut layout_cx)
     };
+
+    // Drain layout-dirty nodes flagged since the last frame so `compute` re-lays-out only those
+    // subtrees (clean siblings keep their cached layout). Paint-dirty nodes are left untouched —
+    // an appearance change needs no relayout.
+    for id in damage.take_layout_dirty() {
+        layout.mark_dirty(id);
+    }
 
     layout.compute(root_id, viewport)?;
 
@@ -48,6 +58,12 @@ pub fn render_tree(
     let root_bounds = layout.layout(root_id);
     let mut paint_cx = PaintCx::new(scene, layout, text, atlas);
     root.paint(root_bounds, &mut paint_cx);
+
+    // The frame consumed this damage. The GPU repaints the whole window for now (§1.4), so the
+    // paint-dirty set and `damage_rect` are not read here — the frame scheduler (#36) will poll
+    // `is_dirty`/`damage_rect` to gate redraws and drive partial redraw; such a consumer must run
+    // before this `clear` (and before the layout-dirty drain above) to see the full damage set.
+    damage.clear();
     Ok(())
 }
 
@@ -73,7 +89,7 @@ mod tests {
         let mut layout = LayoutTree::new();
         let mut text_system = TextSystem::new(FontDb::new());
         let mut scene = Scene::new();
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let damage = Arc::new(DamageState::default());
 
         render_tree(
             &mut root,
@@ -116,7 +132,7 @@ mod tests {
         let mut layout = LayoutTree::new();
         let mut text_system = TextSystem::new(FontDb::new());
         let mut scene = Scene::new();
-        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let damage = Arc::new(DamageState::default());
 
         render_tree(
             &mut root,
