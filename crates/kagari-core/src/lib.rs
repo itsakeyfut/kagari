@@ -5,6 +5,7 @@
 //! wrapper (`reactive`).
 
 pub mod app;
+pub mod arena;
 pub mod error;
 pub mod reactive;
 
