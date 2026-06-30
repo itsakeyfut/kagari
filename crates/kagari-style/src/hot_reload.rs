@@ -6,9 +6,10 @@
 //! touch UI state directly — the kagari-core App posts to the UI thread via the winit
 //! `EventLoopProxy` and writes the reactive theme signal there (specs §1.8/§7.2).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::error::StyleError;
 use crate::theme::Theme;
@@ -55,35 +56,70 @@ pub struct ThemeWatcher {
 }
 
 impl ThemeWatcher {
-    /// Watches `path`; on each modify/create event, reloads the theme and calls `sink(theme)`.
+    /// Watches the theme file at `path`; on each relevant change, reloads it and calls `sink(theme)`.
     ///
-    /// `sink` runs on the watcher's background thread (hence `Send + 'static`) and must not mutate
-    /// UI state directly — post to the UI thread (the App uses the winit `EventLoopProxy`). A reload
-    /// that fails to read/parse keeps the current theme and warns (no panic; `sink` is not called).
+    /// Watches the file's **parent directory** (not the file path) and filters events down to `path`
+    /// by file name (#158): a file-path watch loses its inode when an editor saves atomically (write a
+    /// temp file, then `rename` it over the target), so it would silently stop; a directory watch keeps
+    /// seeing the target by name. The parent directory must exist (canonicalized here); the target file
+    /// itself need not exist yet.
+    ///
+    /// `sink` runs on the watcher's background thread (hence `Send + 'static`) and must not mutate UI
+    /// state directly — post to the UI thread (the App uses the winit `EventLoopProxy`). A reload that
+    /// fails to read/parse keeps the current theme and warns (no panic; `sink` is not called).
     pub fn new(
         path: impl Into<PathBuf>,
         sink: impl Fn(Theme) + Send + 'static,
     ) -> Result<Self, StyleError> {
         let path = path.into();
-        let watch_path = path.clone();
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| {
+                StyleError::ThemeWatch(format!("theme path has no file name: {}", path.display()))
+            })?
+            .to_os_string();
+        // Canonicalize the *parent directory* (it must exist) — works even if the target file does not
+        // exist yet, and makes the watch + reload path cwd-independent. An empty parent means "the cwd".
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let dir = parent
+            .canonicalize()
+            .map_err(|e| StyleError::ThemeWatch(e.to_string()))?;
+        let reload_path = dir.join(&file_name);
+
         let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(event) if is_reload_trigger(&event.kind) => dispatch(&path, &sink),
+            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+                Ok(event)
+                    if is_reload_trigger(&event.kind) && event_targets(&event, &file_name) =>
+                {
+                    dispatch(&reload_path, &sink)
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "theme watch error"),
             })
             .map_err(|e| StyleError::ThemeWatch(e.to_string()))?;
         watcher
-            .watch(&watch_path, RecursiveMode::NonRecursive)
+            .watch(&dir, RecursiveMode::NonRecursive)
             .map_err(|e| StyleError::ThemeWatch(e.to_string()))?;
         Ok(Self { _watcher: watcher })
     }
 }
 
-/// Whether a watch event should trigger a reload. Editors save via modify or atomic
-/// remove-and-create, so both `Modify` and `Create` count; access/metadata-only events do not.
+/// Whether a watch event should trigger a reload. In-place saves emit `Modify(Data)` and atomic
+/// saves emit `Create` / `Modify(Name)`, so both `Modify` and `Create` count; `Remove`/`Access` do
+/// not (a remove leaves nothing to parse — the following create triggers the reload).
 fn is_reload_trigger(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Modify(_) | EventKind::Create(_))
+}
+
+/// Whether `event` touches the watched theme file. Since the watch is on the parent **directory**
+/// (#158), events for sibling files (the editor's `*.tmp`, unrelated files) must be filtered out;
+/// the match is by file **name** (not a canonicalized full path — a just-removed inode cannot be
+/// canonicalized, and the atomic-rename's rename-to-target event already carries the target name).
+fn event_targets(event: &Event, file_name: &OsStr) -> bool {
+    event.paths.iter().any(|p| p.file_name() == Some(file_name))
 }
 
 #[cfg(test)]
@@ -146,6 +182,35 @@ mod tests {
         assert!(!is_reload_trigger(&EventKind::Access(AccessKind::Any)));
         assert!(!is_reload_trigger(&EventKind::Remove(RemoveKind::Any)));
         assert!(!is_reload_trigger(&EventKind::Other));
+    }
+
+    #[test]
+    fn event_targets_should_match_watched_file_by_name() {
+        // The watch is on the parent directory (#158), so events are filtered to the target file by
+        // name: the atomic-rename's rename-to-`theme.ron` matches; the editor's `theme.ron.tmp` and
+        // unrelated siblings do not.
+        let target = OsStr::new("theme.ron");
+        let ev =
+            |p: &str| Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from(p));
+
+        assert!(event_targets(&ev("/some/dir/theme.ron"), target));
+        assert!(event_targets(
+            &Event::new(EventKind::Create(CreateKind::Any)).add_path(PathBuf::from("/d/theme.ron")),
+            target
+        ));
+        assert!(
+            !event_targets(&ev("/some/dir/theme.ron.tmp"), target),
+            "the editor's atomic-save temp file must not trigger a reload"
+        );
+        assert!(
+            !event_targets(&ev("/some/dir/other.ron"), target),
+            "an unrelated sibling file must not trigger a reload"
+        );
+        // An event with no paths (rare) targets nothing.
+        assert!(!event_targets(
+            &Event::new(EventKind::Modify(ModifyKind::Any)),
+            target
+        ));
     }
 
     #[test]
