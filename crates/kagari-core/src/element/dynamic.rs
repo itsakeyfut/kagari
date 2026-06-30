@@ -397,6 +397,7 @@ mod tests {
                 damage: Arc::clone(&self.damage),
                 theme: &self.theme,
                 focus: None,
+                cursor: None,
             }
         }
     }

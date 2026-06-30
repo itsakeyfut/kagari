@@ -10,9 +10,9 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 use crate::event::{
-    Action, ActionHandler, DragPayload, DragSource, DropTarget, FocusHandle, FocusId, GestureEvent,
-    GestureHandler, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind, ListenerKind,
-    MouseEvent, MouseHandler,
+    Action, ActionHandler, CursorIcon, DragPayload, DragSource, DropTarget, FocusHandle, FocusId,
+    GestureEvent, GestureHandler, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind,
+    ListenerKind, MouseEvent, MouseHandler,
 };
 use crate::reactive::{Prop, create_effect};
 
@@ -66,6 +66,9 @@ pub struct Div {
     drag_source: Option<DragSource>,
     /// Drop target (#52): accepts a payload of a specific type and runs its handler.
     drop_target: Option<DropTarget>,
+    /// The cursor declared by [`cursor`](Self::cursor) (#53), registered with the cursor registry at
+    /// build (this node → icon) so pointer-move resolution can pick it. `None` declares nothing.
+    cursor: Option<CursorIcon>,
 }
 
 /// Creates an empty [`Div`].
@@ -88,6 +91,7 @@ pub fn div() -> Div {
         gesture_handlers: Vec::new(),
         drag_source: None,
         drop_target: None,
+        cursor: None,
     }
 }
 
@@ -278,6 +282,16 @@ impl Div {
         self
     }
 
+    /// Declares the cursor shown while the pointer is over this node (#53). On pointer move the topmost
+    /// hit's nearest cursor-declaring node wins, so a declaration here covers this node and any
+    /// descendant that declares none; outside any cursor region the cursor reverts to default. The
+    /// `NodeId → CursorIcon` association is recorded with the cursor registry at build. Declaring a
+    /// cursor makes this node hit-testable (recorded into the `HitTest` at paint).
+    pub fn cursor(mut self, icon: CursorIcon) -> Self {
+        self.cursor = Some(icon);
+        self
+    }
+
     /// Resolves the background prop into `resolved_bg`. A static prop writes its value once; a
     /// reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure,
     /// writes the cell, and flags paint-damage for `id` — the #35 hook.
@@ -423,6 +437,11 @@ impl Element for Div {
                 if let (Some(fid), Some(reg)) = (self.focus_id, cx.focus.as_deref_mut()) {
                     reg.register(fid, id);
                 }
+                // Record this node's declared cursor (#53) so pointer-move resolution can pick it.
+                // No-op when no registry is attached (the app path until live cursor wiring lands).
+                if let (Some(icon), Some(reg)) = (self.cursor, cx.cursor.as_deref_mut()) {
+                    reg.register(id, icon);
+                }
                 id
             }
         };
@@ -530,13 +549,14 @@ impl Element for Div {
         }
         // Record an interactive hit region (#48) before painting children, so children take larger
         // painter orders and sit in front (a child is picked over its parent). A node is recorded when
-        // it opts into any pointer interaction — a mouse handler (#48) or a drag source / drop target
-        // (#52). `bounds` is this node's absolute rect (RK-007); the clip is axis-aligned (rounded-corner
-        // hit precision is post-MVP). No-op when no hit-test is attached.
+        // it opts into any pointer interaction — a mouse handler (#48), a drag source / drop target
+        // (#52), or a declared cursor (#53). `bounds` is this node's absolute rect (RK-007); the clip is
+        // axis-aligned (rounded-corner hit precision is post-MVP). No-op when no hit-test is attached.
         let flags = InteractFlags {
             mouse: !self.mouse_handlers.is_empty(),
             drag_source: self.drag_source.is_some(),
             drop_target: self.drop_target.is_some(),
+            cursor: self.cursor.is_some(),
             ..InteractFlags::default()
         };
         if flags != InteractFlags::default() {
@@ -718,6 +738,7 @@ mod tests {
             damage,
             theme: &theme,
             focus: None,
+            cursor: None,
         };
 
         let mut root = div().child(div()).child(div());
@@ -758,6 +779,7 @@ mod tests {
             damage,
             theme: &theme,
             focus: None,
+            cursor: None,
         });
 
         let mut scene = Scene::new();
@@ -795,6 +817,7 @@ mod tests {
             damage: damage.clone(),
             theme: &theme,
             focus: None,
+            cursor: None,
         });
 
         let paint = |d: &mut Div, scene: &mut Scene, text: &mut TextSystem| {
@@ -1144,6 +1167,54 @@ mod tests {
         assert!(
             hit.pick(Point::new(10.0, 30.0)).is_none(),
             "the handler-less sibling records no hit region"
+        );
+    }
+
+    #[test]
+    fn div_cursor_should_register_and_record_hit() {
+        // A div declaring a cursor registers `NodeId → CursorIcon` at build and records a hit region at
+        // paint (it is interactive via its cursor), so pointer-move resolution picks it: the declared
+        // Pointer over the node, the default outside it.
+        use crate::event::{CursorIcon, CursorRegistry, HitTest};
+
+        let theme = Theme::default();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut reg = CursorRegistry::new();
+
+        let mut d = div()
+            .size(Size { w: 20.0, h: 20.0 })
+            .cursor(CursorIcon::Pointer);
+        let id = d.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: Some(&mut reg),
+        });
+        layout.compute(id, Size { w: 200.0, h: 200.0 }).unwrap();
+
+        let mut scene = Scene::new();
+        let mut hit = HitTest::new();
+        let bounds = layout.layout(id);
+        d.paint(
+            bounds,
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, Some(&mut hit), &theme),
+        );
+
+        assert_eq!(
+            reg.resolve(&hit, &arena, Point::new(10.0, 10.0)),
+            CursorIcon::Pointer,
+            "the declared cursor is resolved while the pointer is over the node"
+        );
+        assert_eq!(
+            reg.resolve(&hit, &arena, Point::new(50.0, 50.0)),
+            CursorIcon::Default,
+            "outside the cursor region the cursor reverts to default"
         );
     }
 }

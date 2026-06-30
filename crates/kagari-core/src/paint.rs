@@ -50,6 +50,8 @@ pub fn render_tree(
             // Live winit keyboard wiring (and a window FocusRegistry) lands with the first
             // interactive consumer (#49 scope); nothing registers focus targets in the app path yet.
             focus: None,
+            // Live cursor wiring (and a window CursorRegistry) lands with the same consumer (#53).
+            cursor: None,
         };
         root.request_layout(&mut layout_cx)
     };
@@ -195,6 +197,7 @@ mod tests {
                 damage,
                 theme: &theme,
                 focus: None,
+                cursor: None,
             };
             leaf.request_layout(&mut cx)
         };

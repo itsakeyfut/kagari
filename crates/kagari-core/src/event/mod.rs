@@ -4,6 +4,7 @@
 //! input system builds on.
 
 mod action;
+mod cursor;
 mod dispatch;
 mod dnd;
 mod focus;
@@ -14,6 +15,7 @@ pub use hit_test::{HitRegion, HitTest, InteractFlags};
 
 // Public event/dispatch API.
 pub use action::{Action, KeyChord, KeyContext, Keymap};
+pub use cursor::{CursorIcon, CursorRegistry, CursorState};
 pub use dispatch::{
     DispatchState, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
     dispatch_action, dispatch_gesture, dispatch_key, dispatch_mouse,
