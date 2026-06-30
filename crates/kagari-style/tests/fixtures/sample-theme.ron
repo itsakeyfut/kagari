@@ -1,0 +1,42 @@
+// Integration-test fixture (#46): a self-contained full Theme (primitives + all 16 roles), used by
+// crates/kagari-style/tests/theme_ron.rs to exercise the public RON-load → resolve → validate path.
+// `Accent` is blue-500 (#3b82f6) so the sRGB→linear assertion has a known target.
+(
+    primitives: (
+        colors: {
+            "white": "#ffffff",
+            "black": "#000000",
+            "slate-50": "#f8fafc",
+            "slate-500": "#64748b",
+            "slate-900": "#0f172a",
+            "blue-500": "#3b82f6",
+            "red-500": "#ef4444",
+            "amber-500": "#f59e0b",
+            "green-500": "#22c55e",
+            "sky-500": "#0ea5e9",
+        },
+        spacing: { S4: 16.0 },
+        radius: { Lg: 8.0 },
+        font_size: { Base: 16.0 },
+    ),
+    roles: (
+        colors: {
+            Surface: "white",
+            SurfaceRaised: "white",
+            SurfaceOverlay: "white",
+            Bg: "slate-50",
+            Text: "slate-900",
+            TextMuted: "slate-500",
+            TextSubtle: "slate-500",
+            Border: "slate-500",
+            BorderStrong: "slate-900",
+            Accent: "blue-500",
+            AccentFg: "white",
+            Danger: "red-500",
+            Warning: "amber-500",
+            Success: "green-500",
+            Info: "sky-500",
+            FocusRing: "blue-500",
+        },
+    ),
+)
