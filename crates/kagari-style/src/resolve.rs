@@ -197,4 +197,22 @@ mod tests {
             Px(0.0)
         );
     }
+
+    #[test]
+    fn resolve_color_unmapped_should_return_debug_sentinel() {
+        // An unmapped role (an empty theme maps nothing) hits the defense-in-depth fallback: loud
+        // opaque magenta in debug builds (the missing token is visible on screen), transparent in
+        // release (never shipped to users). Cover both profiles so `cargo test --release` is sound.
+        let c = Theme::default().resolve_color(ColorRole::Accent);
+        if cfg!(debug_assertions) {
+            assert_eq!(c.a, 1.0, "debug sentinel is opaque");
+            // Magenta: red & blue high, green absent.
+            assert!(
+                c.r > 0.5 && c.b > 0.5 && c.g < 0.01,
+                "debug sentinel is magenta: {c:?}"
+            );
+        } else {
+            assert_eq!(c, Color::TRANSPARENT, "release sentinel is transparent");
+        }
+    }
 }
