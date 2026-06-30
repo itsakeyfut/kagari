@@ -2,8 +2,6 @@
 //! deterministic scene headlessly and compare it to a committed reference PNG. This
 //! proves the readback + compare round-trip; the full Quad golden matrix is #17.
 
-mod common;
-
 use kagari_base::{Color, Corners, Edges, Rect};
 use kagari_render::{Background, Border, Quad, RoundedRect, Scene};
 
@@ -48,7 +46,7 @@ fn smoke_scene() -> Scene {
 #[test]
 fn headless_render_should_match_golden() {
     let mut scene = smoke_scene();
-    let Some(rendered) = common::headless_render(&mut scene, (50, 50), 1.0) else {
+    let Some(rendered) = kagari_golden::headless_render(&mut scene, (50, 50), 1.0) else {
         eprintln!(
             "skipping golden 'harness_smoke': no software adapter available (force_fallback_adapter)"
         );
@@ -63,5 +61,5 @@ fn headless_render_should_match_golden() {
         );
         return;
     }
-    assert_golden!("harness_smoke", rendered.image);
+    kagari_golden::assert_golden!("harness_smoke", rendered.image);
 }

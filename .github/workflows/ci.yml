@@ -78,13 +78,17 @@ jobs:
       - name: Vulkan adapter summary (diagnostic)
         run: vulkaninfo --summary || true
       - name: Run golden tests
-        run: cargo test -p kagari-render
+        run: |
+          cargo test -p kagari-render
+          cargo test -p kagari-core --test paint_golden
       - name: Upload mismatch images
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: golden-actuals
-          path: crates/kagari-render/target/*-actual.png
+          path: |
+            crates/kagari-render/target/*-actual.png
+            crates/kagari-core/target/*-actual.png
           if-no-files-found: ignore
 
   # Manual: regenerate the golden references on lavapipe and upload them as an
@@ -109,9 +113,13 @@ jobs:
           echo "--- Vulkan ICD manifests (loader auto-discovers these) ---"
           ls -la /usr/share/vulkan/icd.d/ || true
       - name: Regenerate golden references
-        run: cargo test -p kagari-render
+        run: |
+          cargo test -p kagari-render
+          cargo test -p kagari-core --test paint_golden
       - name: Upload regenerated references
         uses: actions/upload-artifact@v4
         with:
           name: golden-references
-          path: crates/kagari-render/tests/golden/*.png
+          path: |
+            crates/kagari-render/tests/golden/*.png
+            crates/kagari-core/tests/golden/*.png

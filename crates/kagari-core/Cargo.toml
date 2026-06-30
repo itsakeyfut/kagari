@@ -27,6 +27,8 @@ hot-reload = ["kagari-style/hot-reload"]
 # Example-only: surfaces IME event flow + key pass-through logs for the manual IME
 # test (docs/dev/ime-manual-test.md, #27). `env-filter` scopes RUST_LOG to our targets.
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# Shared headless-render + golden-image harness for the paint-pass pixel golden (#144).
+kagari-golden = { workspace = true }
 
 [[example]]
 name = "hot_reload"

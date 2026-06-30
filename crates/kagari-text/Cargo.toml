@@ -16,9 +16,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-wgpu = { workspace = true }
-image = { workspace = true }
-pollster = { workspace = true }
+# Shared headless-render + golden-image harness (#144).
+kagari-golden = { workspace = true }
 
 [lints]
 workspace = true

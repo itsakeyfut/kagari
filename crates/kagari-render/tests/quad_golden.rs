@@ -7,8 +7,6 @@
 //! comparison, so these never false-fail locally. Regenerate references on lavapipe via
 //! the `golden-update` CI job (`UPDATE_GOLDEN=1`).
 
-mod common;
-
 use kagari_base::{Color, Corners, Edges, Point, Rect};
 use kagari_render::{Background, Border, Quad, RoundedRect, Scene};
 
@@ -55,7 +53,13 @@ fn rounded_quad_should_match_golden() {
         },
         ..base_quad()
     });
-    common::assert_scene_golden("rounded_quad", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "rounded_quad",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }
 
 #[test]
@@ -79,7 +83,13 @@ fn per_edge_border_should_match_golden() {
         },
         ..base_quad()
     });
-    common::assert_scene_golden("per_edge_border", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "per_edge_border",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }
 
 #[test]
@@ -100,7 +110,13 @@ fn linear_gradient_should_match_golden() {
         },
         ..base_quad()
     });
-    common::assert_scene_golden("linear_gradient", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "linear_gradient",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }
 
 #[test]
@@ -117,7 +133,13 @@ fn aa_edge_should_match_golden() {
         },
         ..base_quad()
     });
-    common::assert_scene_golden("aa_edge", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "aa_edge",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }
 
 #[test]
@@ -138,5 +160,11 @@ fn rounded_clip_should_match_golden() {
         },
         ..base_quad()
     });
-    common::assert_scene_golden("rounded_clip", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "rounded_clip",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }

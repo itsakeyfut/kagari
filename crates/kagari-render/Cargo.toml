@@ -16,9 +16,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Golden-image harness: readback decode/encode + blocking the async wgpu calls.
-image = { workspace = true }
-pollster = { workspace = true }
+# Shared headless-render + golden-image harness (#144).
+kagari-golden = { workspace = true }
 
 [lints]
 workspace = true
