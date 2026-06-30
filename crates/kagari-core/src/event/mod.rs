@@ -5,6 +5,7 @@
 
 mod action;
 mod dispatch;
+mod dnd;
 mod focus;
 mod gesture;
 mod hit_test;
@@ -17,6 +18,7 @@ pub use dispatch::{
     DispatchState, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
     dispatch_action, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
+pub use dnd::{DragPayload, DragSource, DropTarget, FileDrop};
 pub use focus::{FocusHandle, FocusId, FocusRegistry};
 pub use gesture::{GestureEvent, GestureRecognizer};
 

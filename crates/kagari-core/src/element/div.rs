@@ -10,8 +10,9 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 use crate::event::{
-    Action, ActionHandler, FocusHandle, FocusId, GestureEvent, GestureHandler, HitRegion,
-    InteractFlags, KeyEvent, KeyHandler, KeyListenerKind, ListenerKind, MouseEvent, MouseHandler,
+    Action, ActionHandler, DragPayload, DragSource, DropTarget, FocusHandle, FocusId, GestureEvent,
+    GestureHandler, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind, ListenerKind,
+    MouseEvent, MouseHandler,
 };
 use crate::reactive::{Prop, create_effect};
 
@@ -61,6 +62,10 @@ pub struct Div {
     action_handlers: Vec<ActionHandler>,
     /// Gesture listeners (#51), run as a recognized `GestureEvent` (pan/zoom) bubbles the hit path.
     gesture_handlers: Vec<GestureHandler>,
+    /// Drag source (#52): produces a typed payload when a drag begins from this node.
+    drag_source: Option<DragSource>,
+    /// Drop target (#52): accepts a payload of a specific type and runs its handler.
+    drop_target: Option<DropTarget>,
 }
 
 /// Creates an empty [`Div`].
@@ -81,6 +86,8 @@ pub fn div() -> Div {
         key_handlers: Vec::new(),
         action_handlers: Vec::new(),
         gesture_handlers: Vec::new(),
+        drag_source: None,
+        drop_target: None,
     }
 }
 
@@ -250,6 +257,24 @@ impl Div {
         handler: impl FnMut(&GestureEvent, &mut EventCx) + 'static,
     ) -> Self {
         self.gesture_handlers.push(Box::new(handler));
+        self
+    }
+
+    /// Makes this node a drag source (#52): a drag starting here carries the payload produced by
+    /// `payload`. The live mouse-driven drag is wired later; the node becomes hit-testable now.
+    pub fn drag_source<P: DragPayload>(mut self, payload: impl FnMut() -> P + 'static) -> Self {
+        self.drag_source = Some(DragSource::new(payload));
+        self
+    }
+
+    /// Makes this node a drop target (#52) accepting a payload of type `T`: a matching drop runs
+    /// `on_drop` with the payload; other types are rejected. While a compatible drag hovers, the
+    /// target can highlight (the live hover-feedback signal is wired with the live drag).
+    pub fn drop_target<T: 'static>(
+        mut self,
+        on_drop: impl FnMut(T, &mut EventCx) + 'static,
+    ) -> Self {
+        self.drop_target = Some(DropTarget::new(on_drop));
         self
     }
 
@@ -504,10 +529,17 @@ impl Element for Div {
             });
         }
         // Record an interactive hit region (#48) before painting children, so children take larger
-        // painter orders and sit in front (a child is picked over its parent). Only nodes with a
-        // mouse handler are recorded; `bounds` is this node's absolute rect (RK-007). The clip is
-        // axis-aligned (rounded-corner hit precision is post-MVP). No-op when no hit-test is attached.
-        if !self.mouse_handlers.is_empty() {
+        // painter orders and sit in front (a child is picked over its parent). A node is recorded when
+        // it opts into any pointer interaction — a mouse handler (#48) or a drag source / drop target
+        // (#52). `bounds` is this node's absolute rect (RK-007); the clip is axis-aligned (rounded-corner
+        // hit precision is post-MVP). No-op when no hit-test is attached.
+        let flags = InteractFlags {
+            mouse: !self.mouse_handlers.is_empty(),
+            drag_source: self.drag_source.is_some(),
+            drop_target: self.drop_target.is_some(),
+            ..InteractFlags::default()
+        };
+        if flags != InteractFlags::default() {
             if let Some(id) = self.id {
                 let order = cx.next_order();
                 cx.record_hit(HitRegion {
@@ -515,10 +547,7 @@ impl Element for Div {
                     bounds,
                     clip: bounds,
                     order,
-                    flags: InteractFlags {
-                        mouse: true,
-                        ..InteractFlags::default()
-                    },
+                    flags,
                 });
             }
         }
