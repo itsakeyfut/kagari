@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::atlas::Atlas;
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
+use crate::polychrome::PolychromeRenderer;
 use crate::quad::QuadRenderer;
 use crate::scene::{Batch, PrimitiveKind, Scene};
 use crate::shadow::ShadowRenderer;
@@ -26,11 +27,16 @@ pub struct Renderer {
     shadow: ShadowRenderer,
     quad: QuadRenderer,
     sprite: SpriteRenderer,
+    polychrome: PolychromeRenderer,
     underline: UnderlineRenderer,
     atlas: Atlas,
-    /// Group-1 bind group for the sprite pipeline (atlas array + sampler). Rebuilt
+    /// Group-1 bind group for the sprite pipeline (mono atlas array + sampler). Rebuilt
     /// when the atlas texture is re-created (device loss).
     atlas_bind: wgpu::BindGroup,
+    rgba_atlas: Atlas,
+    /// Group-1 bind group for the polychrome pipeline (RGBA atlas array + sampler).
+    /// Rebuilt when the RGBA atlas texture is re-created (device loss).
+    rgba_atlas_bind: wgpu::BindGroup,
     /// Reused across frames so the per-frame painter's-order merge does not allocate
     /// (filled by `Scene::batches_into`; perf.md).
     batches: Vec<Batch>,
@@ -40,6 +46,12 @@ pub struct Renderer {
 /// growth is post-MVP; see `atlas.rs`.
 const ATLAS_LAYER_SIZE: u32 = 1024;
 const ATLAS_MAX_LAYERS: u32 = 4;
+
+/// RGBA image atlas geometry (#55): 4 pre-allocated 2048² Rgba8UnormSrgb layers (64 MiB) —
+/// larger than the glyph atlas since UI images/icons exceed glyph sizes. Images larger than
+/// a layer are skipped (the live-texture path is post-MVP). Tunable; growth is post-MVP.
+const RGBA_ATLAS_LAYER_SIZE: u32 = 2048;
+const RGBA_ATLAS_MAX_LAYERS: u32 = 4;
 
 impl Renderer {
     /// `target_format` is the swapchain format (an sRGB format in MVP); the output
@@ -60,10 +72,20 @@ impl Renderer {
             queue.clone(),
             ATLAS_LAYER_SIZE,
             ATLAS_MAX_LAYERS,
+            wgpu::TextureFormat::R8Unorm,
+        );
+        let rgba_atlas = Atlas::new(
+            device.clone(),
+            queue.clone(),
+            RGBA_ATLAS_LAYER_SIZE,
+            RGBA_ATLAS_MAX_LAYERS,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let sprite = SpriteRenderer::new(&device, OFFSCREEN_FORMAT);
+        let polychrome = PolychromeRenderer::new(&device, OFFSCREEN_FORMAT);
         let underline = UnderlineRenderer::new(&device, OFFSCREEN_FORMAT);
         let atlas_bind = sprite.make_atlas_bind(&device, atlas.texture_view());
+        let rgba_atlas_bind = polychrome.make_atlas_bind(&device, rgba_atlas.texture_view());
         Self {
             device,
             queue,
@@ -75,9 +97,12 @@ impl Renderer {
             shadow,
             quad,
             sprite,
+            polychrome,
             underline,
             atlas,
             atlas_bind,
+            rgba_atlas,
+            rgba_atlas_bind,
             batches: Vec::new(),
         }
     }
@@ -86,6 +111,12 @@ impl Renderer {
     /// here (#22) and the sprite pipeline samples it (#19).
     pub fn atlas_mut(&mut self) -> &mut Atlas {
         &mut self.atlas
+    }
+
+    /// The RGBA image atlas — the image/SVG loaders (#56/#57) insert decoded tiles here
+    /// and the polychrome pipeline samples it (#55).
+    pub fn rgba_atlas_mut(&mut self) -> &mut Atlas {
+        &mut self.rgba_atlas
     }
 
     /// Render one frame: draw the scene's quads into the offscreen linear target,
@@ -113,6 +144,8 @@ impl Renderer {
         self.quad
             .prepare(&self.device, &self.queue, scene, size, scale);
         self.sprite
+            .prepare(&self.device, &self.queue, scene, size, scale);
+        self.polychrome
             .prepare(&self.device, &self.queue, scene, size, scale);
         self.underline
             .prepare(&self.device, &self.queue, scene, size, scale);
@@ -151,6 +184,10 @@ impl Renderer {
                 match batch.kind {
                     PrimitiveKind::Shadow => self.shadow.draw(&mut pass, batch),
                     PrimitiveKind::Quad => self.quad.draw(&mut pass, batch),
+                    PrimitiveKind::Image => {
+                        self.polychrome
+                            .draw(&mut pass, batch, &self.rgba_atlas_bind)
+                    }
                     PrimitiveKind::Sprite => self.sprite.draw(&mut pass, batch, &self.atlas_bind),
                     PrimitiveKind::Underline => self.underline.draw(&mut pass, batch),
                 }
@@ -193,12 +230,18 @@ impl Renderer {
         self.shadow = ShadowRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.sprite = SpriteRenderer::new(&self.device, OFFSCREEN_FORMAT);
+        self.polychrome = PolychromeRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.underline = UnderlineRenderer::new(&self.device, OFFSCREEN_FORMAT);
-        // Re-create the atlas texture and re-upload every cached tile from its CPU cache,
-        // then rebuild the sprite's atlas bind group against the new texture view.
+        // Re-create each atlas texture and re-upload every cached tile from its CPU cache,
+        // then rebuild each pipeline's atlas bind group against the new texture view.
         self.atlas.recreate(self.device.clone(), self.queue.clone());
         self.atlas_bind = self
             .sprite
             .make_atlas_bind(&self.device, self.atlas.texture_view());
+        self.rgba_atlas
+            .recreate(self.device.clone(), self.queue.clone());
+        self.rgba_atlas_bind = self
+            .polychrome
+            .make_atlas_bind(&self.device, self.rgba_atlas.texture_view());
     }
 }
