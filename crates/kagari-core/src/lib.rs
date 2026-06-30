@@ -21,5 +21,8 @@ pub use app::App;
 pub use damage::DamageState;
 pub use element::{div, text};
 pub use error::AppError;
-pub use event::{HitRegion, HitTest, InteractFlags};
+pub use event::{
+    DispatchState, HitRegion, HitTest, InteractFlags, Modifiers, MouseButton, MouseEvent,
+    MouseKind, dispatch_mouse,
+};
 pub use scheduler::Scheduler;

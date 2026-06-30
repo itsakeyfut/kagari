@@ -17,11 +17,14 @@ use kagari_text::TextSystem;
 use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
+use crate::event::HitTest;
 
 /// Builds, lays out, and paints `root` into `scene` for the given `viewport`.
 ///
 /// `scene` is cleared first (its capacity is retained for reuse). `atlas` receives rasterized
-/// glyphs; pass `None` for GPU-free Scene-structure tests (text emits no glyphs then).
+/// glyphs; pass `None` for GPU-free Scene-structure tests (text emits no glyphs then). `hit_test`
+/// receives the frame's interactive regions (#48); pass `None` to skip hit recording (it is cleared
+/// first when present, mirroring `scene`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_tree(
     root: &mut AnyElement,
@@ -29,6 +32,7 @@ pub fn render_tree(
     layout: &mut LayoutTree,
     text: &mut TextSystem,
     atlas: Option<&mut Atlas>,
+    hit_test: Option<&mut HitTest>,
     scene: &mut Scene,
     viewport: Size,
     damage: &Arc<DamageState>,
@@ -58,7 +62,12 @@ pub fn render_tree(
 
     scene.clear();
     let root_bounds = layout.layout(root_id);
-    let mut paint_cx = PaintCx::new(scene, layout, text, atlas, theme);
+    // Clear the hit-test for this frame (capacity retained), then record into it during paint.
+    let mut hit_test = hit_test;
+    if let Some(ht) = hit_test.as_deref_mut() {
+        ht.clear();
+    }
+    let mut paint_cx = PaintCx::new(scene, layout, text, atlas, hit_test, theme);
     root.paint(root_bounds, &mut paint_cx);
 
     // The frame consumed this damage. The GPU repaints the whole window for now (§1.4), so the
@@ -101,6 +110,7 @@ mod tests {
             &mut layout,
             &mut text_system,
             None, // GPU-free: text emits no glyphs; we assert the div quad + its layout.
+            None, // no hit-test recording here
             &mut scene,
             Size { w: 200.0, h: 100.0 },
             &damage,
@@ -146,6 +156,7 @@ mod tests {
             &mut layout,
             &mut text_system,
             None,
+            None, // no hit-test recording here
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,

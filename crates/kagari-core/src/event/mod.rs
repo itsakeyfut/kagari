@@ -1,7 +1,16 @@
 //! Events & input (Phase 5, specs §1.5/§1.9): hit-test, dispatch, focus, actions, gestures, DnD,
-//! cursor. So far: the [`HitTest`] structure (#47) — the data-oriented "what is under the pointer?"
-//! query the rest of the input system builds on.
+//! cursor. So far: the [`HitTest`] structure (#47) and mouse [`dispatch_mouse`] (#48) — the
+//! data-oriented "what is under the pointer?" query plus capture+bubble delivery the rest of the
+//! input system builds on.
 
+mod dispatch;
 mod hit_test;
 
 pub use hit_test::{HitRegion, HitTest, InteractFlags};
+
+// Public event/dispatch API.
+pub use dispatch::{DispatchState, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse};
+
+// Crate-internal dispatch machinery used by the element layer: the delivery mode + capture request
+// (`EventCx` fields, cx.rs) and the listener tagging + handler type (`Div` storage, div.rs).
+pub(crate) use dispatch::{CaptureOp, Delivery, ListenerKind, MouseHandler};

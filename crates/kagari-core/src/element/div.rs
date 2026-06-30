@@ -9,6 +9,7 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
+use crate::event::{HitRegion, InteractFlags, ListenerKind, MouseEvent, MouseHandler};
 use crate::reactive::{Prop, create_effect};
 
 /// A flex container element: children plus style props.
@@ -42,6 +43,10 @@ pub struct Div {
     /// `set_style` re-runs only when the resolved value changes — on first build, after a theme
     /// swap (#43), and after a reactive layout prop changes (#146), but not on idle frames.
     applied_layout: Option<LayoutStyle>,
+    /// Mouse listeners (#48), tagged by kind, run during dispatch (capture+bubble / hover). These
+    /// are imperative `FnMut` callbacks that write to signals (design.md §3) — not reactive effects
+    /// (RK-005 N/A) — and drop with this `Div` when its node is removed (RK-006).
+    mouse_handlers: Vec<(ListenerKind, MouseHandler)>,
 }
 
 /// Creates an empty [`Div`].
@@ -57,6 +62,7 @@ pub fn div() -> Div {
         size: None,
         resolved_size: Arc::new(Mutex::new(None)),
         applied_layout: None,
+        mouse_handlers: Vec::new(),
     }
 }
 
@@ -118,6 +124,71 @@ impl Div {
     /// paint-dirty). A static `Size` resolves once.
     pub fn size(mut self, size: impl Into<Prop<Size>>) -> Self {
         self.size = Some(size.into());
+        self
+    }
+
+    /// Registers a mouse-button-press handler (#48). Bubble-phase: it runs as the event bubbles
+    /// from the target up through this node. The handler writes to signals (design.md §3); call
+    /// [`EventCx::stop_propagation`] to halt bubbling or [`EventCx::capture_pointer`] to start a drag
+    /// grab. Adding any handler makes this node hit-testable (recorded into the `HitTest` at paint).
+    pub fn on_mouse_down(
+        mut self,
+        handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static,
+    ) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Down, Box::new(handler)));
+        self
+    }
+
+    /// Registers a mouse-button-release handler (#48); see [`on_mouse_down`](Self::on_mouse_down).
+    pub fn on_mouse_up(mut self, handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Up, Box::new(handler)));
+        self
+    }
+
+    /// Registers a click handler — a press and release of the same button on this node (#48).
+    pub fn on_click(mut self, handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Click, Box::new(handler)));
+        self
+    }
+
+    /// Registers a pointer-move handler (#48).
+    pub fn on_mouse_move(
+        mut self,
+        handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static,
+    ) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Move, Box::new(handler)));
+        self
+    }
+
+    /// Registers a wheel/scroll handler (#48); the delta is in the event's `Wheel` kind.
+    pub fn on_wheel(mut self, handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Wheel, Box::new(handler)));
+        self
+    }
+
+    /// Registers a pointer-enter handler — fired when the pointer enters this node's region as the
+    /// hover path changes (#48, path-based hover).
+    pub fn on_mouse_enter(
+        mut self,
+        handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static,
+    ) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Enter, Box::new(handler)));
+        self
+    }
+
+    /// Registers a pointer-leave handler — the counterpart of [`on_mouse_enter`](Self::on_mouse_enter).
+    pub fn on_mouse_leave(
+        mut self,
+        handler: impl FnMut(&MouseEvent, &mut EventCx) + 'static,
+    ) -> Self {
+        self.mouse_handlers
+            .push((ListenerKind::Leave, Box::new(handler)));
         self
     }
 
@@ -365,6 +436,26 @@ impl Element for Div {
                 order,
             });
         }
+        // Record an interactive hit region (#48) before painting children, so children take larger
+        // painter orders and sit in front (a child is picked over its parent). Only nodes with a
+        // mouse handler are recorded; `bounds` is this node's absolute rect (RK-007). The clip is
+        // axis-aligned (rounded-corner hit precision is post-MVP). No-op when no hit-test is attached.
+        if !self.mouse_handlers.is_empty() {
+            if let Some(id) = self.id {
+                let order = cx.next_order();
+                cx.record_hit(HitRegion {
+                    node: id,
+                    bounds,
+                    clip: bounds,
+                    order,
+                    flags: InteractFlags {
+                        mouse: true,
+                        ..InteractFlags::default()
+                    },
+                });
+            }
+        }
+
         // Paint each child at its absolute bounds. `LayoutTree::layout` returns parent-relative
         // coordinates (taffy), so offset by this node's origin to get the child's absolute rect.
         for (child, &child_id) in self.children.iter_mut().zip(&self.child_ids) {
@@ -380,7 +471,35 @@ impl Element for Div {
         }
     }
 
-    fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
+    fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
+        let Some(id) = self.id else {
+            return;
+        };
+        match ev {
+            Event::Mouse(me) => {
+                // Descend toward the target along the dispatch path (capture phase: no MVP handlers).
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                // A descendant may have stopped propagation — then this node does not bubble.
+                if cx.is_stopped() {
+                    return;
+                }
+                // Bubble (or filtered enter/leave) phase: run this node's matching listeners.
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    let kind = me.kind;
+                    for (lk, handler) in self.mouse_handlers.iter_mut() {
+                        if lk.matches(kind) {
+                            handler(me, cx);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl IntoElement for Div {
@@ -489,7 +608,7 @@ mod tests {
         let mut scene = Scene::new();
         d.paint(
             Rect::default(),
-            &mut PaintCx::new(&mut scene, &layout, &mut text, None, &theme),
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, None, &theme),
         );
 
         assert_eq!(scene.quads.len(), 1);
@@ -525,7 +644,7 @@ mod tests {
         let paint = |d: &mut Div, scene: &mut Scene, text: &mut TextSystem| {
             d.paint(
                 Rect::default(),
-                &mut PaintCx::new(scene, &layout, text, None, &theme),
+                &mut PaintCx::new(scene, &layout, text, None, None, &theme),
             );
         };
 
@@ -567,6 +686,7 @@ mod tests {
             &mut arena,
             &mut layout,
             &mut text,
+            None,
             None,
             &mut scene,
             Size { w: 200.0, h: 200.0 },
@@ -631,6 +751,7 @@ mod tests {
             arena,
             layout,
             text,
+            None,
             None,
             &mut scene,
             Size { w: 200.0, h: 200.0 },
@@ -750,6 +871,7 @@ mod tests {
             &mut layout,
             &mut text,
             None,
+            None,
             &mut scene,
             viewport,
             &damage,
@@ -780,6 +902,7 @@ mod tests {
             &mut arena,
             &mut layout,
             &mut text,
+            None,
             None,
             &mut scene,
             viewport,
@@ -820,5 +943,51 @@ mod tests {
         assert_eq!(scene.shadows[0].blur, 6.0);
         assert_eq!(scene.shadows[0].offset.y, 4.0);
         assert_eq!(scene.shadows[0].spread, -1.0);
+    }
+
+    #[test]
+    fn paint_should_record_hit_region_for_interactive_div() {
+        // A div with a mouse handler records a HitRegion (#48); a handler-less sibling records none.
+        // `on_click` makes the node interactive; the recorded region picks at its painted bounds.
+        use crate::event::HitTest;
+
+        let theme = Theme::default();
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let mut root = div()
+            .flex_col()
+            .child(div().size(Size { w: 20.0, h: 20.0 }).on_click(|_e, _c| {}))
+            .child(div().size(Size { w: 20.0, h: 20.0 }).background(green))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let mut hit = HitTest::new();
+        let damage = Arc::new(DamageState::default());
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            Some(&mut hit),
+            &mut scene,
+            Size { w: 200.0, h: 200.0 },
+            &damage,
+            &theme,
+        )
+        .unwrap();
+
+        // The interactive child is the first 20x20 row → a point inside it hits its node; the
+        // non-interactive sibling (below it) records nothing, so a point there misses.
+        assert!(
+            hit.pick(Point::new(10.0, 10.0)).is_some(),
+            "the interactive div records a pickable hit region"
+        );
+        assert!(
+            hit.pick(Point::new(10.0, 30.0)).is_none(),
+            "the handler-less sibling records no hit region"
+        );
     }
 }
