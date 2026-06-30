@@ -7,8 +7,6 @@
 //! (`UPDATE_GOLDEN=1`). The harness lives here because kagari-render cannot depend
 //! on kagari-text (render→text dependency direction).
 
-mod common;
-
 use kagari_base::{Color, Px};
 use kagari_render::Scene;
 use kagari_text::{FontDb, TextStyle, TextSystem, fontdb};
@@ -24,7 +22,7 @@ fn style(family: &'static str, size: f32) -> TextStyle {
 
 #[test]
 fn japanese_text_should_match_golden() {
-    let rendered = common::headless_render_with((112, 48), 1.0, |renderer| {
+    let rendered = kagari_golden::headless_render_with((112, 48), 1.0, |renderer| {
         let mut text = TextSystem::new(FontDb::new());
         let shaped = text.shape("日本語", &style("Noto Sans JP", 32.0), None);
         let mut scene = Scene::new();
@@ -57,14 +55,14 @@ fn japanese_text_should_match_golden() {
         );
         return;
     }
-    assert_golden!("jp_text", r.image);
+    kagari_golden::assert_golden!("jp_text", r.image);
 }
 
 #[test]
 fn rasterize_into_should_reuse_coord_for_repeated_glyph() {
     // Adapter-gated: the assertions run inside `build`, which only executes when a
     // software adapter is available (otherwise `headless_render_with` returns None).
-    let rendered = common::headless_render_with((8, 8), 1.0, |renderer| {
+    let rendered = kagari_golden::headless_render_with((8, 8), 1.0, |renderer| {
         let mut text = TextSystem::new(FontDb::new());
         let shaped = text.shape("AA", &style("Noto Sans", 16.0), None);
         let mut scene = Scene::new();

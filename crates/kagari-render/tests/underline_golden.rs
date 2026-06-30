@@ -6,8 +6,6 @@
 //! comparison. Regenerate references on lavapipe via the `golden-update` CI job
 //! (`UPDATE_GOLDEN=1`).
 
-mod common;
-
 use kagari_base::{Color, Corners, Rect};
 use kagari_render::{RoundedRect, Scene, Underline, UnderlineStyle};
 
@@ -36,11 +34,23 @@ fn one_underline(style: UnderlineStyle) -> Scene {
 #[test]
 fn solid_underline_should_match_golden() {
     let mut scene = one_underline(UnderlineStyle::Solid);
-    common::assert_scene_golden("solid_underline", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "solid_underline",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }
 
 #[test]
 fn dotted_underline_should_match_golden() {
     let mut scene = one_underline(UnderlineStyle::Dotted);
-    common::assert_scene_golden("dotted_underline", &mut scene, SIZE, 1.0);
+    kagari_golden::assert_scene_golden(
+        env!("CARGO_MANIFEST_DIR"),
+        "dotted_underline",
+        &mut scene,
+        SIZE,
+        1.0,
+    );
 }

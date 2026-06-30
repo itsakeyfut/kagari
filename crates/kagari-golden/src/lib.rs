@@ -1,20 +1,25 @@
-//! Headless render + golden-image test harness (duplicated from kagari-render's
-//! #16 harness). kagari-render cannot depend on kagari-text (render→text is the
-//! dependency direction), so a text-rendering golden lives here and brings its own
-//! copy of the harness. Keep in sync with `crates/kagari-render/tests/common/mod.rs`
-//! (rule of three: extract a shared dev crate once a third consumer appears).
+#![forbid(unsafe_code)]
+//! Shared headless-render + golden-image test harness (#16, extracted in #144).
 //!
-//! Renders a `Scene` with no window/surface, reads the pixels back, and compares
-//! them to a committed reference PNG within a per-channel tolerance. Determinism is
-//! via a software/reference adapter (`force_fallback_adapter`) + the tolerance, not
-//! pixel-exact matching across GPUs (specs §8.1, test.md §3). References are
-//! canonical to Mesa lavapipe (the CI `golden` job).
+//! Renders a `Scene` with no window/surface, reads the pixels back, and compares them to a committed
+//! reference PNG within a per-channel tolerance. Determinism is via a software/reference adapter
+//! (`force_fallback_adapter`) + the tolerance, not pixel-exact matching across GPUs (specs §8.1,
+//! test.md §3).
 //!
-//! `expect`/`unwrap` are intentional here — this is test-only code.
-
-// Shared test-support module: each integration-test binary uses a different subset of
-// these helpers, so unused-in-one-binary items are expected (not dead code).
-#![allow(dead_code)]
+//! This is the single source for the harness used by every crate's golden tests
+//! (`kagari-render`, `kagari-text`, `kagari-core`); each was previously a copy (rule of three →
+//! extract). It is a **dev-only** crate: consumers add it under `[dev-dependencies]`. Because the
+//! golden references live next to each consumer's tests (`<crate>/tests/golden/`), the
+//! comparison/assertion fns take the caller's `CARGO_MANIFEST_DIR` so they resolve to the *consuming*
+//! crate's golden dir; the [`assert_golden!`] macro injects it for you.
+//!
+//! **References are canonical to Mesa lavapipe ("llvmpipe").** Antialiased (SDF coverage) edges and
+//! the `Rgba16Float`→`Rgba8UnormSrgb` rounding differ between rasterizers (e.g. DX12 WARP vs Vulkan
+//! lavapipe) by more than the `≤ 2` tolerance, so a reference generated on one will not match
+//! another. The CI `golden`/`golden-update` jobs establish lavapipe as canonical and re-baseline
+//! (`UPDATE_GOLDEN=1`) there; on any other adapter the harness renders-only and skips the compare.
+//!
+//! `expect`/`unwrap` are intentional here — this is test-support code.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -25,13 +30,14 @@ use kagari_render::{Renderer, Scene};
 /// wgpu requires `bytes_per_row` of a texture→buffer copy to be 256-byte aligned.
 const ROW_ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
-/// A headless render result: the read-back image plus whether it was produced on the
-/// canonical golden rasterizer (Mesa lavapipe / "llvmpipe").
+/// A headless render result: the read-back image plus whether it was produced on the canonical
+/// golden rasterizer (Mesa lavapipe / "llvmpipe").
 pub struct Rendered {
     pub image: RgbaImage,
-    /// `true` only on Mesa lavapipe. Goldens are committed from lavapipe, and the
-    /// f16-offscreen + sRGB-encode path is not bit-identical across software
-    /// rasterizers, so a pixel comparison is only meaningful here.
+    /// `true` only on Mesa lavapipe. Goldens are committed from lavapipe, and the f16-offscreen +
+    /// sRGB-encode path is not bit-identical across software rasterizers (DX12 WARP differs by
+    /// ~15/255 even for a flat fill), so a pixel comparison is only meaningful here — callers
+    /// render-only on other adapters.
     pub canonical: bool,
 }
 
@@ -40,10 +46,10 @@ pub fn headless_render(scene: &mut Scene, size: (u32, u32), scale: f32) -> Optio
     headless_render_with(size, scale, |_| std::mem::take(scene))
 }
 
-/// Render headlessly into an `Rgba8UnormSrgb` offscreen target and read it back.
-/// `build` receives the `Renderer` so a caller can seed GPU state (e.g. insert atlas
-/// tiles via `renderer.atlas_mut()`) before constructing the `Scene` it returns.
-/// Returns `None` when no software adapter is available, so callers can skip.
+/// Render headlessly into an `Rgba8UnormSrgb` offscreen target and read it back. `build` receives
+/// the `Renderer` so a caller can seed GPU state (e.g. insert atlas tiles via `renderer.atlas_mut()`)
+/// before constructing the `Scene` it returns. Returns `None` when no software adapter is available
+/// (e.g. a GPU-less CI without lavapipe), so callers can skip rather than fail.
 pub fn headless_render_with(
     size: (u32, u32),
     scale: f32,
@@ -59,10 +65,10 @@ pub fn headless_render_with(
         display: None,
     });
 
-    // A software/reference adapter (DX12 WARP / Vulkan lavapipe) for determinism.
-    // No adapter ⇒ return `None` so the caller skips — unless the canonical
-    // software-adapter CI job sets `KAGARI_GOLDEN_REQUIRE_ADAPTER`, where a missing
-    // adapter must fail loudly rather than silently skip the goldens.
+    // A software/reference adapter (DX12 WARP / Vulkan lavapipe) for determinism. No adapter ⇒
+    // return `None` so the caller skips — unless the canonical software-adapter CI job sets
+    // `KAGARI_GOLDEN_REQUIRE_ADAPTER`, where a missing adapter must fail loudly rather than silently
+    // skip the goldens.
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
         compatible_surface: None,
@@ -93,8 +99,8 @@ pub fn headless_render_with(
     let device = Arc::new(device);
     let queue = Arc::new(queue);
 
-    // Match what the window presents: an sRGB swapchain format, so the HW does the
-    // linear→sRGB encode in the output-transform pass.
+    // Match what the window presents: an sRGB swapchain format, so the HW does the linear→sRGB
+    // encode in the output-transform pass.
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(device.clone(), queue.clone(), size, format);
 
@@ -182,11 +188,13 @@ pub fn headless_render_with(
     Some(Rendered { image, canonical })
 }
 
-/// Compare `img` to the committed reference `tests/golden/{name}.png` within a
-/// per-channel tolerance of `≤ 2`. `UPDATE_GOLDEN=1` regenerates the reference; on a
-/// mismatch the actual image is written to `target/{name}-actual.png` for inspection.
-pub fn compare_golden(name: &str, img: &RgbaImage) {
-    let golden_path = format!("{}/tests/golden/{name}.png", env!("CARGO_MANIFEST_DIR"));
+/// Compare `img` to the committed reference `{manifest_dir}/tests/golden/{name}.png` within a
+/// per-channel tolerance of `≤ 2`. `manifest_dir` is the *consuming* crate's `CARGO_MANIFEST_DIR`
+/// (so each crate's goldens live next to its own tests). `UPDATE_GOLDEN=1` regenerates the
+/// reference; on a mismatch the actual image is written to `{manifest_dir}/target/{name}-actual.png`
+/// for inspection.
+pub fn compare_golden(manifest_dir: &str, name: &str, img: &RgbaImage) {
+    let golden_path = format!("{manifest_dir}/tests/golden/{name}.png");
 
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         if let Some(parent) = std::path::Path::new(&golden_path).parent() {
@@ -216,7 +224,10 @@ pub fn compare_golden(name: &str, img: &RgbaImage) {
         .max()
         .unwrap_or(0);
     if max_delta > 2 {
-        let actual_path = format!("{}/target/{name}-actual.png", env!("CARGO_MANIFEST_DIR"));
+        // Write under the crate's `target/` (gitignored via `**/target/`) for CI to upload. The dir
+        // is created first: a workspace build emits to the root `/target`, so the per-crate
+        // `target/` does not otherwise exist.
+        let actual_path = format!("{manifest_dir}/target/{name}-actual.png");
         if let Some(parent) = std::path::Path::new(&actual_path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -227,10 +238,30 @@ pub fn compare_golden(name: &str, img: &RgbaImage) {
     }
 }
 
-/// Render `scene` headlessly and assert it matches the committed golden `name`,
-/// skipping (no software adapter) or render-only (non-canonical rasterizer).
-pub fn assert_scene_golden(name: &str, scene: &mut Scene, size: (u32, u32), scale: f32) {
-    let Some(rendered) = headless_render(scene, size, scale) else {
+/// Render `scene` headlessly and assert it matches the committed golden `name`, with the two
+/// skip-guards every golden test uses: no software adapter → skip; non-canonical rasterizer (e.g.
+/// local DX12 WARP) → render-only/skip-compare. The pixel comparison runs only on lavapipe (CI).
+pub fn assert_scene_golden(
+    manifest_dir: &str,
+    name: &str,
+    scene: &mut Scene,
+    size: (u32, u32),
+    scale: f32,
+) {
+    assert_golden_with(manifest_dir, name, size, scale, |_| std::mem::take(scene));
+}
+
+/// Like [`assert_scene_golden`] but takes a `build` closure (which receives the `Renderer` to seed
+/// atlas/GPU state before returning the `Scene`) — used by callers whose scene needs the atlas, e.g.
+/// the kagari-core paint pass (`render_tree` rasterizes glyphs into `renderer.atlas_mut()`).
+pub fn assert_golden_with(
+    manifest_dir: &str,
+    name: &str,
+    size: (u32, u32),
+    scale: f32,
+    build: impl FnOnce(&mut Renderer) -> Scene,
+) {
+    let Some(rendered) = headless_render_with(size, scale, build) else {
         eprintln!("skipping golden '{name}': no software adapter available");
         return;
     };
@@ -240,13 +271,16 @@ pub fn assert_scene_golden(name: &str, scene: &mut Scene, size: (u32, u32), scal
         );
         return;
     }
-    compare_golden(name, &rendered.image);
+    compare_golden(manifest_dir, name, &rendered.image);
 }
 
-/// Assert a rendered image matches the committed golden `name` (per-channel `≤ 2`).
+/// Assert a rendered image matches the committed golden `name` (per-channel `≤ 2`). Thin wrapper
+/// over [`compare_golden`] that injects the caller's `CARGO_MANIFEST_DIR` (expanded in the caller
+/// crate), so the golden resolves to the consuming crate's `tests/golden/`. Obtain `img` from
+/// [`headless_render`] (which signals skip via `None`).
 #[macro_export]
 macro_rules! assert_golden {
     ($name:expr, $img:expr) => {
-        $crate::common::compare_golden($name, &$img)
+        $crate::compare_golden(env!("CARGO_MANIFEST_DIR"), $name, &$img)
     };
 }

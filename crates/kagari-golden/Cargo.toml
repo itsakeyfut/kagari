@@ -1,0 +1,18 @@
+[package]
+name = "kagari-golden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Dev-only test-support crate (headless render + golden compare), shared by the crates' golden
+# tests. Not part of the runtime dependency graph and never published.
+publish = false
+
+[dependencies]
+kagari-render = { workspace = true }
+wgpu = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
+
+[lints]
+workspace = true

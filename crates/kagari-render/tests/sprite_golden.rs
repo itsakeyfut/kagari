@@ -6,14 +6,12 @@
 //! adapter (local DX12 WARP) the pixel compare is skipped (render-only). Regenerate on
 //! lavapipe via the `golden-update` CI job (`UPDATE_GOLDEN=1`).
 
-mod common;
-
 use kagari_base::{Color, Corners, Rect};
 use kagari_render::{MonochromeSprite, RoundedRect, Scene};
 
 #[test]
 fn mono_sprite_should_match_golden() {
-    let rendered = common::headless_render_with((64, 64), 1.0, |renderer| {
+    let rendered = kagari_golden::headless_render_with((64, 64), 1.0, |renderer| {
         // A 32×16 horizontal coverage ramp (0..255 left→right).
         let (tw, th) = (32u32, 16u32);
         let coord = renderer.atlas_mut().get_or_insert(1, (tw, th), || {
@@ -51,5 +49,5 @@ fn mono_sprite_should_match_golden() {
         );
         return;
     }
-    assert_golden!("mono_sprite", r.image);
+    kagari_golden::assert_golden!("mono_sprite", r.image);
 }

@@ -6,15 +6,13 @@
 //! Regenerate on lavapipe via the `golden-update` CI job (`UPDATE_GOLDEN=1`). The
 //! harness lives here because kagari-render cannot depend on kagari-text.
 
-mod common;
-
 use kagari_base::{Color, Point, Px};
 use kagari_render::Scene;
 use kagari_text::{FontDb, ImeEvent, ImeState, TextStyle, TextSystem, fontdb};
 
 #[test]
 fn preedit_underline_should_match_golden() {
-    let rendered = common::headless_render_with((112, 48), 1.0, |renderer| {
+    let rendered = kagari_golden::headless_render_with((112, 48), 1.0, |renderer| {
         let mut text = TextSystem::new(FontDb::new());
         let style = TextStyle {
             family: "Noto Sans JP".into(),
@@ -58,5 +56,5 @@ fn preedit_underline_should_match_golden() {
         );
         return;
     }
-    assert_golden!("preedit_underline", r.image);
+    kagari_golden::assert_golden!("preedit_underline", r.image);
 }
