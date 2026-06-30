@@ -22,7 +22,7 @@ pub use damage::DamageState;
 pub use element::{div, text};
 pub use error::AppError;
 pub use event::{
-    DispatchState, HitRegion, HitTest, InteractFlags, Modifiers, MouseButton, MouseEvent,
-    MouseKind, dispatch_mouse,
+    DispatchState, FocusHandle, FocusId, FocusRegistry, HitRegion, HitTest, InteractFlags, KeyCode,
+    KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_key, dispatch_mouse,
 };
 pub use scheduler::Scheduler;

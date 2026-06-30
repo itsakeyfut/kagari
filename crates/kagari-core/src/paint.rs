@@ -47,6 +47,9 @@ pub fn render_tree(
             text,
             damage: sink,
             theme,
+            // Live winit keyboard wiring (and a window FocusRegistry) lands with the first
+            // interactive consumer (#49 scope); nothing registers focus targets in the app path yet.
+            focus: None,
         };
         root.request_layout(&mut layout_cx)
     };
@@ -191,6 +194,7 @@ mod tests {
                 text: &mut text_system,
                 damage,
                 theme: &theme,
+                focus: None,
             };
             leaf.request_layout(&mut cx)
         };

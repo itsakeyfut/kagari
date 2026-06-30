@@ -19,6 +19,12 @@ use crate::arena::Arena;
 use crate::element::{AnyElement, Event, EventCx};
 use crate::event::HitTest;
 
+/// Physical key identity (#49). Re-exported from winit (W3C UI Events `code`): kagari is desktop-only
+/// and winit is a permanent dependency, so the standard `KeyCode` is used directly rather than
+/// mirrored (RK-002 — classify keys physically). Pre-1.0 this can be swapped for a kagari enum if
+/// publish-time decoupling from winit's `KeyCode` semver is wanted.
+pub use winit::keyboard::KeyCode;
+
 /// Active keyboard modifiers at the time of a mouse event. `#[non_exhaustive]`: delivered to
 /// handlers (not user-constructed), so more modifier state can be added without a breaking change.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -64,6 +70,39 @@ pub struct MouseEvent {
     pub pos: Point,
     pub modifiers: Modifiers,
 }
+
+/// A resolved keyboard event delivered to elements (#49): the physical `code`, the `modifiers` held,
+/// whether it is a press (`pressed`) or release, and whether it is an auto-`repeat`. `#[non_exhaustive]`:
+/// delivered to handlers (not user-constructed), so fields can be added without a breaking change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub struct KeyEvent {
+    pub code: KeyCode,
+    pub modifiers: Modifiers,
+    pub pressed: bool,
+    pub repeat: bool,
+}
+
+/// Which key-listener a builder setter registers (matched against a [`KeyEvent`]'s `pressed` flag).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeyListenerKind {
+    Down,
+    Up,
+}
+
+impl KeyListenerKind {
+    /// Whether this listener fires for a key event with the given `pressed` state.
+    pub(crate) fn matches(self, pressed: bool) -> bool {
+        matches!(
+            (self, pressed),
+            (KeyListenerKind::Down, true) | (KeyListenerKind::Up, false)
+        )
+    }
+}
+
+/// A boxed keyboard handler stored on an element (#49). Imperative (writes to signals), not a
+/// reactive effect.
+pub(crate) type KeyHandler = Box<dyn FnMut(&KeyEvent, &mut EventCx)>;
 
 /// A dispatch phase. Describes the capture→target→bubble visit order the recursive delivery
 /// follows; verified by `visit_order` (test-only — public handlers are bubble-phase, so no MVP
@@ -161,8 +200,9 @@ pub struct DispatchState {
     hover_path: Vec<NodeId>,
 }
 
-/// The ancestor path root→`node` (walks `Node::parent` up, then reverses). The dispatch path.
-fn ancestor_path(arena: &Arena, node: NodeId) -> Vec<NodeId> {
+/// The ancestor path root→`node` (walks `Node::parent` up, then reverses). The dispatch path; also
+/// reused by focus-within (#49).
+pub(crate) fn ancestor_path(arena: &Arena, node: NodeId) -> Vec<NodeId> {
     let mut chain = vec![node];
     let mut cur = node;
     while let Some(parent) = arena.get(cur).and_then(|n| n.parent) {
@@ -324,18 +364,36 @@ pub fn dispatch_mouse(
     }
 }
 
+/// Dispatches one key event to the `focused` node, bubbling up its ancestor chain (#49). Keyboard
+/// events go to the focus chain (not a pointer hit), so the caller resolves the focused node from the
+/// focus registry. A `None` focus (nothing focused) drops the event. Reuses the same bubble delivery
+/// as the mouse path. Unhandled keys fall through to #50's keymap/actions (not yet wired).
+pub fn dispatch_key(root: &mut AnyElement, arena: &Arena, focused: Option<NodeId>, ev: &KeyEvent) {
+    if let Some(node) = focused {
+        let path = ancestor_path(arena, node);
+        deliver(
+            root,
+            arena,
+            Delivery::Bubble { path: &path },
+            &Event::Keyboard(*ev),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::{Arena, Node};
     use crate::element::{DamageSink, Div, IntoElement, LayoutCx, div};
-    use crate::event::{HitRegion, InteractFlags};
+    use crate::event::{FocusRegistry, HitRegion, InteractFlags};
+    use crate::reactive::Owner;
     use kagari_base::Rect;
     use kagari_layout::LayoutTree;
     use kagari_style::Theme;
     use kagari_text::{FontDb, TextSystem};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     fn nid(raw: u64) -> NodeId {
         NodeId::from_raw(raw)
@@ -403,6 +461,7 @@ mod tests {
             text: &mut text,
             damage,
             theme: &theme,
+            focus: None,
         });
         (root, arena, root_id)
     }
@@ -579,6 +638,140 @@ mod tests {
             (3.0, -5.0),
             "wheel delta reaches the handler"
         );
+    }
+
+    #[test]
+    fn key_should_deliver_to_focused_and_bubble() {
+        // A key event delivered to the focused (inner) node bubbles up its ancestor chain: the inner
+        // node's on_key_down fires, then the outer's. Needs an Owner (the focus signal) — RK-005.
+        let owner = Owner::new();
+        owner.set();
+
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (l_outer, l_inner) = (Rc::clone(&log), Rc::clone(&log));
+
+        let mut reg = FocusRegistry::new();
+        let inner_focus = reg.handle();
+        let root = div()
+            .on_key_down(move |_e, _c| l_outer.borrow_mut().push("outer"))
+            .child(
+                div()
+                    .track_focus(&inner_focus)
+                    .on_key_down(move |_e, _c| l_inner.borrow_mut().push("inner")),
+            );
+
+        // Build with the registry attached so the inner FocusId → NodeId is recorded.
+        struct NoopDamage;
+        impl DamageSink for NoopDamage {
+            fn mark_paint_dirty(&self, _id: NodeId) {}
+        }
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = root.into_element();
+        root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: Some(&mut reg),
+        });
+
+        inner_focus.focus();
+        let key = KeyEvent {
+            code: KeyCode::KeyA,
+            modifiers: Modifiers::default(),
+            pressed: true,
+            repeat: false,
+        };
+        dispatch_key(&mut root, &arena, reg.focused_node(), &key);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["inner", "outer"],
+            "the key bubbles from the focused node up to the root"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn key_should_not_deliver_when_no_focus() {
+        // With nothing focused, dispatch_key drops the event — no handler fires. No signal/registry
+        // is created here, so no Owner is needed.
+        let fired = Rc::new(RefCell::new(false));
+        let f = Rc::clone(&fired);
+        let root = div().on_key_down(move |_e, _c| *f.borrow_mut() = true);
+
+        let (mut root, arena, _root_id) = build(root);
+        let key = KeyEvent {
+            code: KeyCode::KeyA,
+            modifiers: Modifiers::default(),
+            pressed: true,
+            repeat: false,
+        };
+        dispatch_key(&mut root, &arena, None, &key);
+
+        assert!(
+            !*fired.borrow(),
+            "no focused node → the key is dropped and no handler fires"
+        );
+    }
+
+    #[test]
+    fn key_up_should_deliver_to_release_handler_only() {
+        // A release (`pressed: false`) fires `on_key_up` but not `on_key_down`.
+        let owner = Owner::new();
+        owner.set();
+
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (l_down, l_up) = (Rc::clone(&log), Rc::clone(&log));
+
+        let mut reg = FocusRegistry::new();
+        let focus = reg.handle();
+        let root = div()
+            .track_focus(&focus)
+            .on_key_down(move |_e, _c| l_down.borrow_mut().push("down"))
+            .on_key_up(move |_e, _c| l_up.borrow_mut().push("up"));
+
+        struct NoopDamage;
+        impl DamageSink for NoopDamage {
+            fn mark_paint_dirty(&self, _id: NodeId) {}
+        }
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = root.into_element();
+        root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: Some(&mut reg),
+        });
+
+        focus.focus();
+        let key_up = KeyEvent {
+            code: KeyCode::KeyA,
+            modifiers: Modifiers::default(),
+            pressed: false,
+            repeat: false,
+        };
+        dispatch_key(&mut root, &arena, reg.focused_node(), &key_up);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["up"],
+            "a release fires on_key_up only, not on_key_down"
+        );
+
+        drop(owner);
     }
 
     #[test]

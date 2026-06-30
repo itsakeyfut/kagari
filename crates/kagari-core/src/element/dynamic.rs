@@ -396,6 +396,7 @@ mod tests {
                 text: &mut self.text,
                 damage: Arc::clone(&self.damage),
                 theme: &self.theme,
+                focus: None,
             }
         }
     }
