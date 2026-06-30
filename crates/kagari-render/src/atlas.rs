@@ -1,9 +1,14 @@
-//! Multi-page monochrome (R8) coverage atlas for glyphs/coverage tiles (specs §2.6).
+//! Multi-page texel-format-parameterized atlas for glyphs/coverage tiles (R8) and
+//! colored images (RGBA, #55) (specs §2.6).
 //!
-//! Pages are layers of one `texture_2d_array<r8>` (a single bind group serves all
-//! pages, so sprites of any page batch into one draw — #19). The `Atlas` owns the
+//! Pages are layers of one `texture_2d_array` (a single bind group serves all pages,
+//! so sprites of any page batch into one draw — #19). The `Atlas` owns the
 //! `key → AtlasCoord` cache *and* the LRU together, so a consumer's coord can never
 //! outlive its slot (decision Q2): callers use `get_or_insert(key, size, rasterize)`.
+//!
+//! The texel format is chosen at construction (`R8Unorm` for the mono glyph atlas,
+//! `Rgba8UnormSrgb` for the image atlas); packing and coord math are in pixels and
+//! format-agnostic, while upload scales by the format's bytes-per-texel.
 //!
 //! Tiles are packed with a 1px transparent **gutter** so that linear sampling
 //! (decision Q4) at a glyph's edge blends toward 0 coverage, not into a neighbor.
@@ -91,10 +96,13 @@ struct Packer {
     lru: u64,
     layer_size: u32,
     max_layers: u32,
+    /// Bytes per texel of the atlas format (R8 = 1, RGBA8 = 4). The CPU bitmap a tile
+    /// carries is `w*h*bytes_per_texel` bytes; packing itself is in pixels.
+    bytes_per_texel: usize,
 }
 
 impl Packer {
-    fn new(layer_size: u32, max_layers: u32) -> Self {
+    fn new(layer_size: u32, max_layers: u32, bytes_per_texel: usize) -> Self {
         Self {
             layers: Vec::new(),
             cache: HashMap::new(),
@@ -102,6 +110,7 @@ impl Packer {
             lru: 0,
             layer_size,
             max_layers,
+            bytes_per_texel,
         }
     }
 
@@ -169,8 +178,8 @@ impl Packer {
         }
         debug_assert_eq!(
             bitmap.len(),
-            (w * h) as usize,
-            "atlas tile bitmap must be w*h R8 bytes"
+            (w * h) as usize * self.bytes_per_texel,
+            "atlas tile bitmap must be w*h*bytes_per_texel bytes"
         );
 
         let (pw, ph) = (w + 2 * GUTTER, h + 2 * GUTTER);
@@ -226,14 +235,16 @@ impl Packer {
     }
 }
 
-const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
-
-/// The GPU atlas: the `Packer` plus the `texture_2d_array<r8>` it packs into.
+/// The GPU atlas: the `Packer` plus the `texture_2d_array` it packs into. The texel
+/// format is set at construction (`R8Unorm` mono glyphs / `Rgba8UnormSrgb` images).
 pub struct Atlas {
     packer: Packer,
     queue: Arc<wgpu::Queue>,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    /// Bytes per texel of `format` (the upload's row stride / padded-box size scale).
+    bytes_per_texel: usize,
 }
 
 impl Atlas {
@@ -242,13 +253,22 @@ impl Atlas {
         queue: Arc<wgpu::Queue>,
         layer_size: u32,
         max_layers: u32,
+        format: wgpu::TextureFormat,
     ) -> Self {
-        let (texture, view) = Self::create_texture(&device, layer_size, max_layers);
+        // INVARIANT: the atlas formats we use (R8Unorm / Rgba8UnormSrgb) are
+        // uncompressed single-plane, so `block_copy_size(None)` is always `Some`.
+        let bytes_per_texel = format
+            .block_copy_size(None)
+            .expect("atlas format must be uncompressed single-plane")
+            as usize;
+        let (texture, view) = Self::create_texture(&device, layer_size, max_layers, format);
         Self {
-            packer: Packer::new(layer_size, max_layers),
+            packer: Packer::new(layer_size, max_layers, bytes_per_texel),
             queue,
             texture,
             view,
+            format,
+            bytes_per_texel,
         }
     }
 
@@ -256,9 +276,10 @@ impl Atlas {
         device: &wgpu::Device,
         layer_size: u32,
         max_layers: u32,
+        format: wgpu::TextureFormat,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("kagari.atlas.mono"),
+            label: Some("kagari.atlas"),
             size: wgpu::Extent3d {
                 width: layer_size,
                 height: layer_size,
@@ -267,12 +288,12 @@ impl Atlas {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: ATLAS_FORMAT,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("kagari.atlas.mono.view"),
+            label: Some("kagari.atlas.view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
@@ -280,8 +301,9 @@ impl Atlas {
     }
 
     /// Cache hit → the cached coord (no re-raster). Miss → run `rasterize` to get the
-    /// R8 coverage bitmap (`w*h` bytes, row-major), pack it (evicting LRU when full),
-    /// upload it to its layer, and return the coord.
+    /// tile bitmap (`w*h*bytes_per_texel` bytes, row-major — R8 coverage for the mono
+    /// atlas, RGBA for the image atlas), pack it (evicting LRU when full), upload it to
+    /// its layer, and return the coord.
     pub fn get_or_insert(
         &mut self,
         key: u64,
@@ -303,19 +325,13 @@ impl Atlas {
     }
 
     /// Upload a tile's pixels into its padded box, zeroing the gutter so linear
-    /// sampling at the glyph edge blends toward 0 (not a neighbor tile). `bitmap` is
-    /// the inner `w*h` R8 glyph, centered in the `pw*ph` box.
+    /// sampling at the tile edge blends toward 0 (not a neighbor). `bitmap` is the
+    /// inner `w*h` tile (`bytes_per_texel` bytes per texel), centered in the `pw*ph` box.
     fn upload(&self, rect: &TileRect, bitmap: &[u8]) {
-        let (w, pw, ph) = (rect.w as usize, rect.pw as usize, rect.ph as usize);
-        let g = GUTTER as usize;
-        let mut padded = vec![0u8; pw * ph];
-        for row in 0..rect.h as usize {
-            let src = &bitmap[row * w..row * w + w];
-            let start = (row + g) * pw + g;
-            padded[start..start + w].copy_from_slice(src);
-        }
+        let bpp = self.bytes_per_texel;
+        let padded = pad_tile(bitmap, rect, bpp);
         // write_texture takes a tight `bytes_per_row` (no 256 alignment, unlike a
-        // buffer copy); R8 ⇒ one byte per texel.
+        // buffer copy): `pw` texels × `bpp` bytes each.
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -330,7 +346,7 @@ impl Atlas {
             &padded,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(rect.pw),
+                bytes_per_row: Some(rect.pw * bpp as u32),
                 rows_per_image: Some(rect.ph),
             },
             wgpu::Extent3d {
@@ -349,8 +365,12 @@ impl Atlas {
     /// Rebuild the GPU texture and re-upload every cached tile from the CPU bitmap
     /// cache (device-loss recovery, specs §2.9). The packing/cache state is retained.
     pub fn recreate(&mut self, device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) {
-        let (texture, view) =
-            Self::create_texture(&device, self.packer.layer_size, self.packer.max_layers);
+        let (texture, view) = Self::create_texture(
+            &device,
+            self.packer.layer_size,
+            self.packer.max_layers,
+            self.format,
+        );
         self.queue = queue;
         self.texture = texture;
         self.view = view;
@@ -362,14 +382,33 @@ impl Atlas {
     }
 }
 
+/// Center a tile's `w*h` texels (`bpp` bytes each) inside its `pw*ph` padded box with a
+/// zeroed gutter, row-major. GPU-free (the upload's CPU half) so it is unit-testable for
+/// any `bpp`. The gutter stays 0 so linear sampling at the tile edge blends toward a
+/// transparent/zero texel (R8 ⇒ 0 coverage; RGBA ⇒ transparent black), not a neighbor.
+fn pad_tile(bitmap: &[u8], rect: &TileRect, bpp: usize) -> Vec<u8> {
+    let (w, pw, ph) = (rect.w as usize, rect.pw as usize, rect.ph as usize);
+    let g = GUTTER as usize;
+    let row_bytes = w * bpp;
+    let pw_bytes = pw * bpp;
+    let mut padded = vec![0u8; pw_bytes * ph];
+    for row in 0..rect.h as usize {
+        let src = &bitmap[row * row_bytes..row * row_bytes + row_bytes];
+        let start = (row + g) * pw_bytes + g * bpp;
+        padded[start..start + row_bytes].copy_from_slice(src);
+    }
+    padded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // The packing/cache/LRU core is GPU-free, so these run without a device. A small
     // 16px layer with 2 layers (inner max 14 after the 1px gutter) drives overflow.
+    // Mono (R8): one byte per texel.
     fn packer() -> Packer {
-        Packer::new(16, 2)
+        Packer::new(16, 2, 1)
     }
 
     #[test]
@@ -414,6 +453,58 @@ mod tests {
         assert_eq!(placement.coord.page, 0);
         assert_eq!(placement.coord.min, [1.0 / 16.0, 1.0 / 16.0]);
         assert_eq!(placement.coord.max, [9.0 / 16.0, 9.0 / 16.0]);
+    }
+
+    #[test]
+    fn packer_should_pack_rgba_tile_with_bpp4() {
+        // The packer is format-agnostic in pixels; the only bpp-dependent step is the
+        // bitmap-length check. A bpp=4 packer accepts a `w*h*4`-byte tile and produces the
+        // same normalized coord as the mono path (coords are in pixels, not bytes).
+        let mut p = Packer::new(16, 2, 4);
+        let (placement, evicted) = p.insert(1, 8, 8, vec![0u8; 8 * 8 * 4]);
+        assert!(evicted.is_empty());
+        assert_eq!(placement.coord.page, 0);
+        // Same gutter inset as the mono 8×8 case: uv = [1/16, 1/16] .. [9/16, 9/16].
+        assert_eq!(placement.coord.min, [1.0 / 16.0, 1.0 / 16.0]);
+        assert_eq!(placement.coord.max, [9.0 / 16.0, 9.0 / 16.0]);
+        assert_eq!(p.get(1), Some(placement.coord), "cached for reuse");
+    }
+
+    #[test]
+    fn pad_tile_should_center_rgba_tile_in_gutter() {
+        // A 2×1 RGBA tile (bpp=4) → padded box 4×3 (1px gutter all around). The two
+        // texels must land at row 1, starting one texel (4 bytes) in; the gutter is 0.
+        let rect = TileRect {
+            page: 0,
+            px: 0,
+            py: 0,
+            pw: 4,
+            ph: 3,
+            w: 2,
+            h: 1,
+        };
+        let red = [255u8, 0, 0, 255];
+        let green = [0u8, 255, 0, 255];
+        let bitmap: Vec<u8> = red.iter().chain(green.iter()).copied().collect();
+        let padded = pad_tile(&bitmap, &rect, 4);
+
+        assert_eq!(padded.len(), 4 * 3 * 4, "padded box is pw*ph*bpp bytes");
+        // Row 0 (top gutter) is all zero.
+        assert!(
+            padded[0..16].iter().all(|&b| b == 0),
+            "top gutter row is zero"
+        );
+        // Row 1: [gutter texel][red][green][gutter texel].
+        let row1 = &padded[16..32];
+        assert_eq!(&row1[0..4], &[0, 0, 0, 0], "left gutter texel is zero");
+        assert_eq!(&row1[4..8], &red, "first texel is red");
+        assert_eq!(&row1[8..12], &green, "second texel is green");
+        assert_eq!(&row1[12..16], &[0, 0, 0, 0], "right gutter texel is zero");
+        // Row 2 (bottom gutter) is all zero.
+        assert!(
+            padded[32..48].iter().all(|&b| b == 0),
+            "bottom gutter row is zero"
+        );
     }
 
     #[test]

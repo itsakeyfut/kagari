@@ -8,6 +8,7 @@
 mod atlas;
 mod color;
 pub mod error;
+mod polychrome;
 mod quad;
 pub mod renderer;
 pub mod scene;
@@ -19,6 +20,6 @@ pub use atlas::{Atlas, AtlasCoord};
 pub use error::RenderError;
 pub use renderer::Renderer;
 pub use scene::{
-    Background, Batch, Border, MonochromeSprite, PrimitiveKind, Quad, RoundedRect, Scene, Shadow,
-    Underline, UnderlineStyle,
+    Background, Batch, Border, MonochromeSprite, PolychromeSprite, PrimitiveKind, Quad,
+    RoundedRect, Scene, Shadow, Underline, UnderlineStyle,
 };
