@@ -12,12 +12,16 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 # Shelf packing for the monochrome glyph/coverage atlas.
 etagere = { workspace = true }
+# Raster image decode (PNG/JPG) for the asset loader (#56).
+image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 # Shared headless-render + golden-image harness (#144).
 kagari-golden = { workspace = true }
+# Encode in-memory PNG fixtures for the asset-loader golden (#56); also a normal dep above.
+image = { workspace = true }
 
 [lints]
 workspace = true

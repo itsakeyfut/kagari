@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::assets::{AssetLoader, checkerboard};
 use crate::atlas::Atlas;
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
@@ -37,6 +38,10 @@ pub struct Renderer {
     /// Group-1 bind group for the polychrome pipeline (RGBA atlas array + sampler).
     /// Rebuilt when the RGBA atlas texture is re-created (device loss).
     rgba_atlas_bind: wgpu::BindGroup,
+    /// Image asset loader (#56): decodes off-thread and uploads into the RGBA atlas. Drained at the
+    /// start of each frame. Holds atlas coords (not GPU handles), so device-loss needs no rebuild — the
+    /// RGBA atlas re-uploads its cached tiles, keeping the coords valid.
+    assets: AssetLoader,
     /// Reused across frames so the per-frame painter's-order merge does not allocate
     /// (filled by `Scene::batches_into`; perf.md).
     batches: Vec<Batch>,
@@ -74,12 +79,26 @@ impl Renderer {
             ATLAS_MAX_LAYERS,
             wgpu::TextureFormat::R8Unorm,
         );
-        let rgba_atlas = Atlas::new(
+        let mut rgba_atlas = Atlas::new(
             device.clone(),
             queue.clone(),
             RGBA_ATLAS_LAYER_SIZE,
             RGBA_ATLAS_MAX_LAYERS,
             wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        // Upload the shared "broken image" placeholder once; the asset loader resolves to it while a
+        // tile is still loading or after a decode failure (#56).
+        let ph = checkerboard();
+        let (pw, ph_h) = (ph.width, ph.height);
+        let placeholder =
+            rgba_atlas.get_or_insert(AssetLoader::placeholder_key(), (pw, ph_h), || ph.rgba);
+        // Prod spawner: decode on a detached background thread (runtime-agnostic — §7.2). The result is
+        // delivered via the loader's channel and drained on the UI thread.
+        let assets = AssetLoader::new(
+            |job| {
+                std::thread::spawn(job);
+            },
+            placeholder,
         );
         let sprite = SpriteRenderer::new(&device, OFFSCREEN_FORMAT);
         let polychrome = PolychromeRenderer::new(&device, OFFSCREEN_FORMAT);
@@ -103,6 +122,7 @@ impl Renderer {
             atlas_bind,
             rgba_atlas,
             rgba_atlas_bind,
+            assets,
             batches: Vec::new(),
         }
     }
@@ -117,6 +137,12 @@ impl Renderer {
     /// and the polychrome pipeline samples it (#55).
     pub fn rgba_atlas_mut(&mut self) -> &mut Atlas {
         &mut self.rgba_atlas
+    }
+
+    /// The image asset loader (#56) — the app calls `load` to decode an image off-thread; the renderer
+    /// drains finished decodes into the RGBA atlas at the start of each `render`.
+    pub fn assets_mut(&mut self) -> &mut AssetLoader {
+        &mut self.assets
     }
 
     /// Render one frame: draw the scene's quads into the offscreen linear target,
@@ -134,6 +160,10 @@ impl Renderer {
             self.offscreen = OffscreenTarget::new(&self.device, size);
             self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         }
+
+        // Drain any image decodes that finished since the last frame into the RGBA atlas (#56), so a
+        // freshly-loaded image is uploaded before this frame samples it. Disjoint field borrow.
+        self.assets.drain(&mut self.rgba_atlas);
 
         // Sort + merge all primitive kinds into one painter's-order batch list (into
         // the reused buffer), then pack each kind's instances (in that order) so the

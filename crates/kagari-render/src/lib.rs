@@ -5,6 +5,7 @@
 //! atlas, then runs the output-transform pass to the swapchain. Further primitives
 //! and assets follow in later issues.
 
+mod assets;
 mod atlas;
 mod color;
 pub mod error;
@@ -16,6 +17,7 @@ mod shadow;
 mod sprite;
 mod underline;
 
+pub use assets::{AssetId, AssetLoader, AssetSource, LoadState};
 pub use atlas::{Atlas, AtlasCoord};
 pub use error::RenderError;
 pub use renderer::Renderer;
