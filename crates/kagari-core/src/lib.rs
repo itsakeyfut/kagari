@@ -22,8 +22,9 @@ pub use damage::DamageState;
 pub use element::{div, text};
 pub use error::AppError;
 pub use event::{
-    Action, DispatchState, FocusHandle, FocusId, FocusRegistry, HitRegion, HitTest, InteractFlags,
-    KeyChord, KeyCode, KeyContext, KeyEvent, Keymap, Modifiers, MouseButton, MouseEvent, MouseKind,
-    dispatch_action, dispatch_key, dispatch_mouse,
+    Action, DispatchState, FocusHandle, FocusId, FocusRegistry, GestureEvent, GestureRecognizer,
+    HitRegion, HitTest, InteractFlags, KeyChord, KeyCode, KeyContext, KeyEvent, Keymap, Modifiers,
+    MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key,
+    dispatch_mouse,
 };
 pub use scheduler::Scheduler;

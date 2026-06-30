@@ -10,7 +10,8 @@ use kagari_text::TextSystem;
 
 use crate::arena::Arena;
 use crate::event::{
-    Action, CaptureOp, Delivery, FocusRegistry, HitRegion, HitTest, KeyEvent, MouseEvent,
+    Action, CaptureOp, Delivery, FocusRegistry, GestureEvent, HitRegion, HitTest, KeyEvent,
+    MouseEvent,
 };
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
@@ -110,6 +111,8 @@ pub enum Event {
     Keyboard(KeyEvent),
     /// A resolved [`Action`] (#50), dispatched up the focus chain to `on_action` handlers.
     Action(Action),
+    /// A recognized [`GestureEvent`] (#51), dispatched up the hit path to `on_gesture` handlers.
+    Gesture(GestureEvent),
 }
 
 /// Context for [`Element::handle_event`](super::Element::handle_event) during a dispatch walk (#48).

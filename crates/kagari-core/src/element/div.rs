@@ -10,8 +10,8 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 use crate::event::{
-    Action, ActionHandler, FocusHandle, FocusId, HitRegion, InteractFlags, KeyEvent, KeyHandler,
-    KeyListenerKind, ListenerKind, MouseEvent, MouseHandler,
+    Action, ActionHandler, FocusHandle, FocusId, GestureEvent, GestureHandler, HitRegion,
+    InteractFlags, KeyEvent, KeyHandler, KeyListenerKind, ListenerKind, MouseEvent, MouseHandler,
 };
 use crate::reactive::{Prop, create_effect};
 
@@ -59,6 +59,8 @@ pub struct Div {
     /// Action listeners (#50), run as a resolved `Action` bubbles the focus chain. Each fires for any
     /// `Action`; the handler matches the one it cares about.
     action_handlers: Vec<ActionHandler>,
+    /// Gesture listeners (#51), run as a recognized `GestureEvent` (pan/zoom) bubbles the hit path.
+    gesture_handlers: Vec<GestureHandler>,
 }
 
 /// Creates an empty [`Div`].
@@ -78,6 +80,7 @@ pub fn div() -> Div {
         focus_id: None,
         key_handlers: Vec::new(),
         action_handlers: Vec::new(),
+        gesture_handlers: Vec::new(),
     }
 }
 
@@ -236,6 +239,17 @@ impl Div {
     /// handles; call [`EventCx::stop_propagation`] to halt bubbling.
     pub fn on_action(mut self, handler: impl FnMut(&Action, &mut EventCx) + 'static) -> Self {
         self.action_handlers.push(Box::new(handler));
+        self
+    }
+
+    /// Registers a gesture handler (#51): runs as a recognized [`GestureEvent`] (pan/zoom) bubbles
+    /// from the hit node up this node's chain. The handler matches the gesture it cares about (e.g. a
+    /// timeline scrolls on `Pan`, zooms on `Zoom`); call [`EventCx::stop_propagation`] to halt bubbling.
+    pub fn on_gesture(
+        mut self,
+        handler: impl FnMut(&GestureEvent, &mut EventCx) + 'static,
+    ) -> Self {
+        self.gesture_handlers.push(Box::new(handler));
         self
     }
 
@@ -587,6 +601,24 @@ impl Element for Div {
                     cx.set_current(id);
                     for handler in self.action_handlers.iter_mut() {
                         handler(action, cx);
+                    }
+                }
+            }
+            Event::Gesture(gesture) => {
+                // A recognized gesture bubbles the hit path (#51), same descend-then-fire as action;
+                // every gesture handler fires (it matches the pan/zoom it cares about).
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.is_stopped() {
+                    return;
+                }
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    for handler in self.gesture_handlers.iter_mut() {
+                        handler(gesture, cx);
                     }
                 }
             }
