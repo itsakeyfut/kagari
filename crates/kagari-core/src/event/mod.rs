@@ -4,13 +4,21 @@
 //! input system builds on.
 
 mod dispatch;
+mod focus;
 mod hit_test;
 
 pub use hit_test::{HitRegion, HitTest, InteractFlags};
 
 // Public event/dispatch API.
-pub use dispatch::{DispatchState, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse};
+pub use dispatch::{
+    DispatchState, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_key,
+    dispatch_mouse,
+};
+pub use focus::{FocusHandle, FocusId, FocusRegistry};
 
 // Crate-internal dispatch machinery used by the element layer: the delivery mode + capture request
-// (`EventCx` fields, cx.rs) and the listener tagging + handler type (`Div` storage, div.rs).
-pub(crate) use dispatch::{CaptureOp, Delivery, ListenerKind, MouseHandler};
+// (`EventCx` fields, cx.rs), the listener tagging + handler types (`Div` storage, div.rs), and the
+// ancestor-path walk (focus-within, focus.rs).
+pub(crate) use dispatch::{
+    CaptureOp, Delivery, KeyHandler, KeyListenerKind, ListenerKind, MouseHandler, ancestor_path,
+};

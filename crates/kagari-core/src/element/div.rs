@@ -9,7 +9,10 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
-use crate::event::{HitRegion, InteractFlags, ListenerKind, MouseEvent, MouseHandler};
+use crate::event::{
+    FocusHandle, FocusId, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind,
+    ListenerKind, MouseEvent, MouseHandler,
+};
 use crate::reactive::{Prop, create_effect};
 
 /// A flex container element: children plus style props.
@@ -47,6 +50,12 @@ pub struct Div {
     /// are imperative `FnMut` callbacks that write to signals (design.md §3) — not reactive effects
     /// (RK-005 N/A) — and drop with this `Div` when its node is removed (RK-006).
     mouse_handlers: Vec<(ListenerKind, MouseHandler)>,
+    /// The focus identity bound by [`track_focus`](Self::track_focus) (#49), registered with the
+    /// focus registry at build (FocusId → this node) so keyboard dispatch / focus-within can resolve
+    /// the focused node. `None` for non-focusable elements.
+    focus_id: Option<FocusId>,
+    /// Keyboard listeners (#49), tagged by press/release, run as a key bubbles the focus chain.
+    key_handlers: Vec<(KeyListenerKind, KeyHandler)>,
 }
 
 /// Creates an empty [`Div`].
@@ -63,6 +72,8 @@ pub fn div() -> Div {
         resolved_size: Arc::new(Mutex::new(None)),
         applied_layout: None,
         mouse_handlers: Vec::new(),
+        focus_id: None,
+        key_handlers: Vec::new(),
     }
 }
 
@@ -189,6 +200,30 @@ impl Div {
     ) -> Self {
         self.mouse_handlers
             .push((ListenerKind::Leave, Box::new(handler)));
+        self
+    }
+
+    /// Binds this element to a [`FocusHandle`](crate::event::FocusHandle) (#49): the node becomes a
+    /// focus target (tab order, `focus()`, focus-within) and keyboard events route here while focused.
+    /// The `FocusId → NodeId` association is recorded with the focus registry at build.
+    pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
+        self.focus_id = Some(handle.id());
+        self
+    }
+
+    /// Registers a key-press handler (#49). Bubble-phase: runs as the key bubbles from the focused
+    /// node up its ancestor chain. The handler writes to signals (design.md §3); call
+    /// [`EventCx::stop_propagation`] to halt bubbling.
+    pub fn on_key_down(mut self, handler: impl FnMut(&KeyEvent, &mut EventCx) + 'static) -> Self {
+        self.key_handlers
+            .push((KeyListenerKind::Down, Box::new(handler)));
+        self
+    }
+
+    /// Registers a key-release handler (#49); see [`on_key_down`](Self::on_key_down).
+    pub fn on_key_up(mut self, handler: impl FnMut(&KeyEvent, &mut EventCx) + 'static) -> Self {
+        self.key_handlers
+            .push((KeyListenerKind::Up, Box::new(handler)));
         self
     }
 
@@ -331,6 +366,12 @@ impl Element for Div {
                 cx.layout.insert(id, None);
                 self.bind_background(&cx.damage, id);
                 self.bind_size(&cx.damage, id);
+                // Record this focus target's FocusId → NodeId so keyboard dispatch / focus-within
+                // can resolve the focused node (#49). No-op when no registry is attached (the app
+                // path until live keyboard wiring lands).
+                if let (Some(fid), Some(reg)) = (self.focus_id, cx.focus.as_deref_mut()) {
+                    reg.register(fid, id);
+                }
                 id
             }
         };
@@ -498,6 +539,27 @@ impl Element for Div {
                     }
                 }
             }
+            Event::Keyboard(ke) => {
+                // Keyboard bubbles the focused node's ancestor chain (#49), same descend-then-fire
+                // as the mouse path; key listeners match on the press/release state.
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.is_stopped() {
+                    return;
+                }
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    let pressed = ke.pressed;
+                    for (lk, handler) in self.key_handlers.iter_mut() {
+                        if lk.matches(pressed) {
+                            handler(ke, cx);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -564,6 +626,7 @@ mod tests {
             text: &mut text,
             damage,
             theme: &theme,
+            focus: None,
         };
 
         let mut root = div().child(div()).child(div());
@@ -603,6 +666,7 @@ mod tests {
             text: &mut text,
             damage,
             theme: &theme,
+            focus: None,
         });
 
         let mut scene = Scene::new();
@@ -639,6 +703,7 @@ mod tests {
             text: &mut text,
             damage: damage.clone(),
             theme: &theme,
+            focus: None,
         });
 
         let paint = |d: &mut Div, scene: &mut Scene, text: &mut TextSystem| {

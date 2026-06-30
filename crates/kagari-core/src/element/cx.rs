@@ -9,7 +9,7 @@ use kagari_style::Theme;
 use kagari_text::TextSystem;
 
 use crate::arena::Arena;
-use crate::event::{CaptureOp, Delivery, HitRegion, HitTest, MouseEvent};
+use crate::event::{CaptureOp, Delivery, FocusRegistry, HitRegion, HitTest, KeyEvent, MouseEvent};
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
 /// paint prop's effect calls [`DamageSink::mark_paint_dirty`]); #35 implements the real
@@ -35,6 +35,11 @@ pub struct LayoutCx<'a> {
     pub damage: Arc<dyn DamageSink>,
     /// The current theme, for resolving layout tokens (gap/padding) into concrete px (#42).
     pub theme: &'a Theme,
+    /// The focus registry to record `track_focus` associations into (#49), optional like the paint
+    /// pass's hit-test sink: `None` skips registration (the app path until live keyboard wiring
+    /// lands; the focus unit tests pass `Some`). A `Div` with a tracked focus id registers its
+    /// `FocusId → NodeId` here at build so dispatch/focus-within can resolve the focused node.
+    pub focus: Option<&'a mut FocusRegistry>,
 }
 
 /// Context for [`Element::paint`](super::Element::paint): the scene to emit primitives into, the
@@ -100,6 +105,7 @@ impl<'a> PaintCx<'a> {
 #[non_exhaustive]
 pub enum Event {
     Mouse(MouseEvent),
+    Keyboard(KeyEvent),
 }
 
 /// Context for [`Element::handle_event`](super::Element::handle_event) during a dispatch walk (#48).
