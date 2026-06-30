@@ -3,6 +3,7 @@
 /// Errors from the renderer. Recoverable GPU conditions (surface/device loss)
 /// are surfaced so the app shell can reconfigure or rebuild (specs §1.11 / §2.9).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RenderError {
     #[error("surface lost")]
     SurfaceLost,
