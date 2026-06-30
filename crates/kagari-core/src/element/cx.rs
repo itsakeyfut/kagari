@@ -10,8 +10,8 @@ use kagari_text::TextSystem;
 
 use crate::arena::Arena;
 use crate::event::{
-    Action, CaptureOp, Delivery, FocusRegistry, GestureEvent, HitRegion, HitTest, KeyEvent,
-    MouseEvent,
+    Action, CaptureOp, CursorRegistry, Delivery, FocusRegistry, GestureEvent, HitRegion, HitTest,
+    KeyEvent, MouseEvent,
 };
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
@@ -43,6 +43,11 @@ pub struct LayoutCx<'a> {
     /// lands; the focus unit tests pass `Some`). A `Div` with a tracked focus id registers its
     /// `FocusId → NodeId` here at build so dispatch/focus-within can resolve the focused node.
     pub focus: Option<&'a mut FocusRegistry>,
+    /// The cursor registry to record `cursor` declarations into (#53), optional like `focus`: `None`
+    /// skips registration (the app path until live cursor wiring lands; the cursor unit tests pass
+    /// `Some`). A `Div` with a declared cursor registers its `NodeId → CursorIcon` here at build so
+    /// pointer-move cursor resolution can find it.
+    pub cursor: Option<&'a mut CursorRegistry>,
 }
 
 /// Context for [`Element::paint`](super::Element::paint): the scene to emit primitives into, the

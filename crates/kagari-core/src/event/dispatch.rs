@@ -504,6 +504,7 @@ mod tests {
             damage,
             theme: &theme,
             focus: None,
+            cursor: None,
         });
         (root, arena, root_id)
     }
@@ -720,6 +721,7 @@ mod tests {
             damage,
             theme: &theme,
             focus: Some(&mut reg),
+            cursor: None,
         });
 
         inner_focus.focus();
@@ -866,6 +868,7 @@ mod tests {
             damage,
             theme: &theme,
             focus: Some(&mut reg),
+            cursor: None,
         });
 
         focus.focus();
