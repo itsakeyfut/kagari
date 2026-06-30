@@ -32,9 +32,15 @@ pub struct Div {
     /// Resolved background: written by the bound reactive effect (or once, for a static prop),
     /// read by `paint`. Shared + `'static` so the effect can own a handle to it.
     resolved_bg: Arc<Mutex<Option<Background>>>,
+    /// Raw/reactive fixed size (#146). A reactive size's bind effect flags **layout-dirty** (vs `bg`'s
+    /// paint-dirty), so a signal-driven size change triggers relayout.
+    size: Option<Prop<Size>>,
+    /// Resolved fixed size: written by the bound reactive effect (or once, for a static prop), read
+    /// by `effective_layout`. Shared + `'static` so the effect can own a handle to it.
+    resolved_size: Arc<Mutex<Option<Size>>>,
     /// The layout style last applied to taffy (resolved against the theme). Compared each build so
-    /// `set_style` re-runs only when the resolved value changes — on first build and after a theme
-    /// swap (#43), but not on idle frames (no per-frame taffy churn).
+    /// `set_style` re-runs only when the resolved value changes — on first build, after a theme
+    /// swap (#43), and after a reactive layout prop changes (#146), but not on idle frames.
     applied_layout: Option<LayoutStyle>,
 }
 
@@ -48,6 +54,8 @@ pub fn div() -> Div {
         id: None,
         child_ids: Vec::new(),
         resolved_bg: Arc::new(Mutex::new(None)),
+        size: None,
+        resolved_size: Arc::new(Mutex::new(None)),
         applied_layout: None,
     }
 }
@@ -79,32 +87,37 @@ impl Div {
     /// Sets a raw/reactive [`Background`] (static value or reactive closure via [`Prop`]) — the
     /// escape hatch beside the semantic [`Styled::bg`](Styled::bg) token setter. Use this for a
     /// literal color/gradient or a signal-driven background; use `.bg(role)` for theme tokens.
+    /// **Damage kind: paint-dirty** (appearance only, no relayout — contrast [`size`](Self::size)).
     pub fn background(mut self, bg: impl Into<Prop<Background>>) -> Self {
         self.bg = Some(bg.into());
         self
     }
 
-    /// Lays children out in a row (the flex default).
+    /// Lays children out in a row (the flex default). Damage kind: static layout (build-time only).
     pub fn flex(mut self) -> Self {
         self.layout.flex_direction = FlexDirection::Row;
         self
     }
 
-    /// Lays children out in a column.
+    /// Lays children out in a column. Damage kind: static layout (build-time only).
     pub fn flex_col(mut self) -> Self {
         self.layout.flex_direction = FlexDirection::Column;
         self
     }
 
-    /// Sets the gap between children.
+    /// Sets the gap between children. Damage kind: static layout (a reactive `gap` is a future
+    /// extension of the #146 reactive-size path).
     pub fn gap(mut self, gap: Px) -> Self {
         self.layout.gap = gap;
         self
     }
 
-    /// Sets a fixed size.
-    pub fn size(mut self, size: Size) -> Self {
-        self.layout.size = Some(size);
+    /// Sets a fixed size — a static value or a reactive [`Prop`] (#146). **Damage kind: layout-dirty**:
+    /// a reactive size's bind effect re-applies the layout style and marks the node layout-dirty, so a
+    /// signal-driven size change triggers relayout (contrast [`background`](Self::background), which is
+    /// paint-dirty). A static `Size` resolves once.
+    pub fn size(mut self, size: impl Into<Prop<Size>>) -> Self {
+        self.size = Some(size.into());
         self
     }
 
@@ -149,11 +162,54 @@ impl Div {
         self.resolved_bg.lock().ok().and_then(|slot| *slot)
     }
 
+    /// Resolves the size prop into `resolved_size` (#146), the **layout-dirty** counterpart of
+    /// [`bind_background`](Self::bind_background). A static prop writes the cell once; a reactive prop
+    /// registers a synchronous effect (ADR 0001) that re-resolves the closure and — only when the
+    /// value changed (design.md §9) — writes the cell and flags **layout**-damage for `id`. The new
+    /// size reaches taffy on the next `request_layout` via the dedup `set_style` path (#43); the
+    /// `mark_layout_dirty` call is what wakes the scheduler so that frame runs. Registered once at
+    /// build, so the effect only re-fires on external signal writes (never inside `request_layout`),
+    /// keeping the write serial with the frame loop (RK-009).
+    fn bind_size(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.size.take() {
+            Some(Prop::Static(size)) => self.store_size(size),
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_size);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let size = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != Some(size) {
+                            *slot = Some(size);
+                            damage.mark_layout_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn store_size(&self, size: Size) {
+        if let Ok(mut slot) = self.resolved_size.lock() {
+            *slot = Some(size);
+        }
+    }
+
+    fn current_size(&self) -> Option<Size> {
+        self.resolved_size.lock().ok().and_then(|slot| *slot)
+    }
+
     /// The raw [`LayoutStyle`] overlaid with the resolved layout tokens (gap + padding) from the
     /// theme. size/margin tokens are not applied yet (LayoutStyle's `size` is a paired value and
     /// `margin` is not mapped to taffy — a follow-up).
     fn effective_layout(&self, theme: &Theme) -> LayoutStyle {
         let mut ls = self.layout;
+        // The reactive/static fixed size (#146) is resolved into a shared cell; overlay it so a
+        // changed reactive size flows into the `LayoutStyle` the dedup `set_style` compares.
+        if let Some(size) = self.current_size() {
+            ls.size = Some(size);
+        }
         let lt = &self.style.layout;
         if let Some(step) = lt.gap {
             ls.gap = theme.resolve_spacing(step);
@@ -203,6 +259,7 @@ impl Element for Div {
                 self.id = Some(id);
                 cx.layout.insert(id, None);
                 self.bind_background(&cx.damage, id);
+                self.bind_size(&cx.damage, id);
                 id
             }
         };
@@ -628,5 +685,86 @@ mod tests {
             theme_b.resolve_color(ColorRole::Accent),
             "the two themes' Accent differ, so the swap is observable"
         );
+    }
+
+    #[test]
+    fn div_reactive_size_should_relayout_and_flag_layout_dirty() {
+        // The element-API counterpart of #35's `layout_dirty_should_trigger_relayout` (#146): a
+        // reactive `.size` write must mark the node *layout*-dirty and relayout on the next frame.
+        // Synchronous `ImmediateEffect` → hang-free; keep `owner` alive (RK-003/005). The size signal
+        // is written *between* frames (serial with `render_tree`), never during it (RK-009).
+        let owner = Owner::new();
+        owner.set();
+
+        let (read, write) = signal(Size { w: 40.0, h: 20.0 });
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let mut root = div()
+            .size(rx(move || read.get()))
+            .background(green)
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        // One shared damage across both frames: the bound effect captured it at build (frame 1).
+        let damage = Arc::new(DamageState::default());
+        let viewport = Size { w: 200.0, h: 200.0 };
+
+        // Frame 1: lays out at the initial size A.
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        assert_eq!(scene.quads.len(), 1, "the div paints one bg quad");
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 40.0,
+            "frame 1 width is size A"
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 20.0,
+            "frame 1 height is size A"
+        );
+
+        // Write a new size between frames: the effect re-runs and flags layout-dirty (not paint).
+        write.set(Size { w: 80.0, h: 50.0 });
+        assert!(
+            damage.is_dirty(),
+            "the reactive size write flags damage (layout-dirty)"
+        );
+
+        // Frame 2: the dedup `set_style` re-applies the new size → relayout to size B.
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 80.0,
+            "frame 2 relays out to size B width"
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 50.0,
+            "frame 2 relays out to size B height"
+        );
+
+        drop(owner);
     }
 }
