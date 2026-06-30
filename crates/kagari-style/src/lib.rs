@@ -11,7 +11,7 @@ pub mod error;
 // Dev theme hot-reload (#44): file watcher + RON loader. Optional `notify` dependency.
 #[cfg(feature = "hot-reload")]
 pub mod hot_reload;
-// Inherent `impl Theme` resolution/validation methods only — no new public type to re-export.
+// `impl Theme` resolution/validation methods, plus the resolved [`ResolvedShadow`] value (#155).
 mod resolve;
 pub mod style;
 pub mod styled;
@@ -21,9 +21,10 @@ pub mod token;
 pub use error::StyleError;
 #[cfg(feature = "hot-reload")]
 pub use hot_reload::{ThemeWatcher, load_theme_file};
+pub use resolve::ResolvedShadow;
 pub use style::{LayoutTokens, PaintTokens, Style};
 pub use styled::Styled;
-pub use theme::{HexColor, Primitives, SemanticRoles, Theme};
+pub use theme::{HexColor, Primitives, SemanticRoles, ShadowSpec, Theme};
 pub use token::{
     BlurStep, BorderWidthStep, ColorRole, FontSizeStep, FontWeightStep, LetterSpacingStep,
     LineHeightStep, OpacityStep, RadiusStep, ShadowStep, SpacingStep, TokenRef, ZIndexStep,

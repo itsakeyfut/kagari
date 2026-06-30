@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, Size};
 use kagari_layout::{FlexDirection, LayoutStyle};
-use kagari_render::{Background, Border, Quad, RoundedRect};
+use kagari_render::{Background, Border, Quad, RoundedRect, Shadow};
 use kagari_style::{SpacingStep, Style, Styled, Theme};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
@@ -293,6 +293,50 @@ impl Element for Div {
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
+        // Corner radius from the `rounded` token (all corners equal); 0 when unset. Shared by the
+        // shadow and the background quad so they round identically.
+        let radius = self
+            .style
+            .paint
+            .rounded
+            .map(|step| cx.theme.resolve_radius(step).0)
+            .unwrap_or(0.0);
+        let corner_radii = Corners {
+            tl: radius,
+            tr: radius,
+            br: radius,
+            bl: radius,
+        };
+
+        // Drop shadow (#155): emitted first so it takes a lower painter's order and draws *behind*
+        // the box (Shadow batch precedes the Quad batch). The `shadow` token resolves to a
+        // `ResolvedShadow` (offset/blur/spread + linear color); unset / `None` / `Inner` (post-MVP)
+        // → no shadow. Its content-mask is a no-op (huge) rect — the blur extends beyond the box.
+        if let Some(shadow) = self
+            .style
+            .paint
+            .shadow
+            .and_then(|step| cx.theme.resolve_shadow(step))
+        {
+            let order = cx.next_order();
+            cx.scene.shadows.push(Shadow {
+                bounds,
+                corner_radii,
+                offset: Point {
+                    x: shadow.offset_x.0,
+                    y: shadow.offset_y.0,
+                },
+                blur: shadow.blur.0,
+                spread: shadow.spread.0,
+                color: shadow.color,
+                content_mask: RoundedRect {
+                    rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
+                    radii: Corners::default(),
+                },
+                order,
+            });
+        }
+
         // Background: the semantic token (`bg(role)` → resolved theme color) takes precedence; the
         // raw/reactive `.background()` value is the fallback. border emit is deferred (the theme has
         // no border-width resolution yet — a follow-up).
@@ -303,19 +347,6 @@ impl Element for Div {
             .map(|role| Background::Solid(cx.theme.resolve_color(role)))
             .or_else(|| self.current_bg());
         if let Some(bg) = bg {
-            // Corner radius from the `rounded` token (all corners equal); 0 when unset.
-            let radius = self
-                .style
-                .paint
-                .rounded
-                .map(|step| cx.theme.resolve_radius(step).0)
-                .unwrap_or(0.0);
-            let corner_radii = Corners {
-                tl: radius,
-                tr: radius,
-                br: radius,
-                bl: radius,
-            };
             let order = cx.next_order();
             cx.scene.quads.push(Quad {
                 bounds,
@@ -766,5 +797,28 @@ mod tests {
         );
 
         drop(owner);
+    }
+
+    #[test]
+    fn div_shadow_should_emit_behind_quad() {
+        // `div().shadow_md().bg(role)` emits a shadow primitive *behind* the bg quad (#155). The
+        // built-in light theme (#45) carries the shadow scale, so `shadow_md` resolves.
+        let theme = Theme::light();
+        let scene = render(
+            div().shadow_md().bg(ColorRole::Surface).into_element(),
+            &theme,
+        );
+        assert_eq!(scene.shadows.len(), 1, "the div emits one shadow");
+        assert_eq!(scene.quads.len(), 1, "and one background quad");
+        assert!(
+            scene.shadows[0].order < scene.quads[0].order,
+            "shadow (order {}) draws behind the quad (order {})",
+            scene.shadows[0].order,
+            scene.quads[0].order
+        );
+        // Resolved from the Md spec (blur 6, offset_y 4, spread -1).
+        assert_eq!(scene.shadows[0].blur, 6.0);
+        assert_eq!(scene.shadows[0].offset.y, 4.0);
+        assert_eq!(scene.shadows[0].spread, -1.0);
     }
 }
