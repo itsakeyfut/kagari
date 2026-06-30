@@ -6,6 +6,7 @@
 mod action;
 mod dispatch;
 mod focus;
+mod gesture;
 mod hit_test;
 
 pub use hit_test::{HitRegion, HitTest, InteractFlags};
@@ -14,9 +15,10 @@ pub use hit_test::{HitRegion, HitTest, InteractFlags};
 pub use action::{Action, KeyChord, KeyContext, Keymap};
 pub use dispatch::{
     DispatchState, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
-    dispatch_action, dispatch_key, dispatch_mouse,
+    dispatch_action, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
 pub use focus::{FocusHandle, FocusId, FocusRegistry};
+pub use gesture::{GestureEvent, GestureRecognizer};
 
 // Crate-internal dispatch machinery used by the element layer: the delivery mode + capture request
 // (`EventCx` fields, cx.rs), the listener tagging + handler types (`Div` storage, div.rs), and the
@@ -25,3 +27,4 @@ pub(crate) use action::ActionHandler;
 pub(crate) use dispatch::{
     CaptureOp, Delivery, KeyHandler, KeyListenerKind, ListenerKind, MouseHandler, ancestor_path,
 };
+pub(crate) use gesture::GestureHandler;

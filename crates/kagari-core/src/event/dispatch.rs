@@ -401,12 +401,33 @@ pub fn dispatch_action(
     }
 }
 
+/// Dispatches a recognized [`GestureEvent`](crate::event::GestureEvent) to the `target` node (the
+/// topmost hit at the cursor), bubbling up its ancestor chain to `on_gesture` handlers (#51). Like
+/// the other dispatch entries the caller resolves `target` (from the hit-test); a `None` target drops
+/// the gesture. Reuses the same bubble delivery.
+pub fn dispatch_gesture(
+    root: &mut AnyElement,
+    arena: &Arena,
+    target: Option<NodeId>,
+    ev: &crate::event::GestureEvent,
+) {
+    if let Some(node) = target {
+        let path = ancestor_path(arena, node);
+        deliver(
+            root,
+            arena,
+            Delivery::Bubble { path: &path },
+            &Event::Gesture(*ev),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::{Arena, Node};
     use crate::element::{DamageSink, Div, IntoElement, LayoutCx, div};
-    use crate::event::{Action, FocusRegistry, HitRegion, InteractFlags};
+    use crate::event::{Action, FocusRegistry, GestureEvent, HitRegion, InteractFlags};
     use crate::reactive::Owner;
     use kagari_base::Rect;
     use kagari_layout::LayoutTree;
@@ -768,6 +789,47 @@ mod tests {
         assert!(
             log.borrow().is_empty(),
             "no focused node → the action is dropped"
+        );
+    }
+
+    #[test]
+    fn gesture_should_dispatch_up_hit_path() {
+        // A gesture dispatched to the inner node bubbles up to the outer node's on_gesture, and the
+        // handler receives the gesture (a surface scrolls/zooms on pan/zoom).
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::new(RefCell::new(None));
+        let (l_outer, l_inner) = (Rc::clone(&log), Rc::clone(&log));
+        let seen_inner = Rc::clone(&seen);
+        let root = div()
+            .on_gesture(move |_g, _c| l_outer.borrow_mut().push("outer"))
+            .child(div().on_gesture(move |g, _c| {
+                l_inner.borrow_mut().push("inner");
+                *seen_inner.borrow_mut() = Some(*g);
+            }));
+
+        let (mut root, arena, root_id) = build(root);
+        let inner = arena.get(root_id).unwrap().children[0];
+
+        let pan = GestureEvent::Pan { dx: 4.0, dy: -2.0 };
+        dispatch_gesture(&mut root, &arena, Some(inner), &pan);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["inner", "outer"],
+            "the gesture bubbles from the hit node up to the root"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            Some(pan),
+            "the handler receives the gesture"
+        );
+
+        // With no target, the gesture is dropped.
+        log.borrow_mut().clear();
+        dispatch_gesture(&mut root, &arena, None, &pan);
+        assert!(
+            log.borrow().is_empty(),
+            "no target → the gesture is dropped"
         );
     }
 
