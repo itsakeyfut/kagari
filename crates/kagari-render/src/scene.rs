@@ -55,6 +55,24 @@ pub struct Quad {
     pub order: u32,
 }
 
+/// A resolved drop-shadow primitive (#155): an analytic blurred rounded rectangle drawn **behind**
+/// the casting box. `bounds`/`corner_radii` are the casting box (typically the element's quad); the
+/// shadow shape is that box translated by `offset` and inflated by `spread`, with a Gaussian blur of
+/// radius `blur` (all logical px). `color` is linear premultiplied. Inner/inset shadow is post-MVP
+/// (specs §2.5/§2.8).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shadow {
+    pub bounds: Rect,
+    pub corner_radii: Corners,
+    pub offset: Point,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+    pub content_mask: RoundedRect,
+    /// Painter's-order key (CPU-side only — not uploaded to the GPU).
+    pub order: u32,
+}
+
 /// A monochrome sprite: an alpha-coverage tile from the R8 atlas (#18) multiplied by
 /// a color (glyphs, coverage masks). `bounds` is integer-snapped by the producer.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -90,9 +108,10 @@ pub struct Underline {
 }
 
 /// The kind of primitive a batch draws (one pipeline per kind). More kinds are
-/// added alongside their primitives (Shadow, paths).
+/// added alongside their primitives (paths).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrimitiveKind {
+    Shadow,
     Quad,
     Sprite,
     Underline,
@@ -109,6 +128,7 @@ pub struct Batch {
 /// (capacity retained, perf.md).
 #[derive(Default)]
 pub struct Scene {
+    pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub glyphs: Vec<MonochromeSprite>,
     pub underlines: Vec<Underline>,
@@ -121,6 +141,7 @@ impl Scene {
 
     /// Clear all primitives, retaining allocated capacity for next frame.
     pub fn clear(&mut self) {
+        self.shadows.clear();
         self.quads.clear();
         self.glyphs.clear();
         self.underlines.clear();
@@ -136,21 +157,26 @@ impl Scene {
     /// (perf.md), mirroring how the instance `Vec`s are reused.
     ///
     /// The per-vector sort is stable (equal `order` keeps insertion order); ties
-    /// across kinds draw by kind priority (Quad before Sprite before Underline),
-    /// per the painter's order in the renderer design. Consecutive same-kind picks
-    /// coalesce into one batch (contiguous indices within a kind).
+    /// across kinds draw by kind priority (Shadow before Quad before Sprite before
+    /// Underline), per the painter's order in the renderer design — so a shadow at the
+    /// same `order` as its quad draws behind it. Consecutive same-kind picks coalesce
+    /// into one batch (contiguous indices within a kind).
     pub fn batches_into(&mut self, out: &mut Vec<Batch>) {
+        self.shadows.sort_by_key(|s| s.order);
         self.quads.sort_by_key(|q| q.order);
         self.glyphs.sort_by_key(|g| g.order);
         self.underlines.sort_by_key(|u| u.order);
 
         out.clear();
-        let (mut qi, mut gi, mut ui) = (0usize, 0usize, 0usize);
+        let (mut si, mut qi, mut gi, mut ui) = (0usize, 0usize, 0usize, 0usize);
         loop {
             // Each kind's next head as (order, kind-priority); pick the minimum. The
             // priorities are distinct, so the minimum is unique — equal `order` falls
-            // back to priority (Quad < Sprite < Underline).
+            // back to priority (Shadow < Quad < Sprite < Underline).
             let heads = [
+                self.shadows
+                    .get(si)
+                    .map(|s| (s.order, PrimitiveKind::Shadow)),
                 self.quads.get(qi).map(|q| (q.order, PrimitiveKind::Quad)),
                 self.glyphs
                     .get(gi)
@@ -167,6 +193,11 @@ impl Scene {
                 break;
             };
             let idx = match kind {
+                PrimitiveKind::Shadow => {
+                    let i = si as u32;
+                    si += 1;
+                    i
+                }
                 PrimitiveKind::Quad => {
                     let i = qi as u32;
                     qi += 1;
@@ -196,13 +227,14 @@ impl Scene {
     }
 }
 
-/// Painter's-order priority for an equal-`order` tie: Quad first, then Sprite, then
-/// Underline (drawn last), per the renderer's frame flow.
+/// Painter's-order priority for an equal-`order` tie: Shadow first (behind), then Quad,
+/// then Sprite, then Underline (drawn last), per the renderer's frame flow.
 fn kind_priority(kind: PrimitiveKind) -> u8 {
     match kind {
-        PrimitiveKind::Quad => 0,
-        PrimitiveKind::Sprite => 1,
-        PrimitiveKind::Underline => 2,
+        PrimitiveKind::Shadow => 0,
+        PrimitiveKind::Quad => 1,
+        PrimitiveKind::Sprite => 2,
+        PrimitiveKind::Underline => 3,
     }
 }
 
@@ -397,6 +429,48 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].range, 0..3);
         assert_eq!(batches[0].kind, PrimitiveKind::Underline);
+    }
+
+    fn test_shadow(order: u32) -> Shadow {
+        Shadow {
+            bounds: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            corner_radii: Corners::default(),
+            offset: Point::new(0.0, 2.0),
+            blur: 4.0,
+            spread: 0.0,
+            color: Color::new(0.0, 0.0, 0.0, 0.5),
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
+                radii: Corners::default(),
+            },
+            order,
+        }
+    }
+
+    #[test]
+    fn batches_should_sort_shadows_into_painter_order() {
+        let mut scene = Scene::new();
+        scene.shadows.push(test_shadow(3));
+        scene.shadows.push(test_shadow(1));
+        scene.shadows.push(test_shadow(2));
+        let batches = collect_batches(&mut scene);
+        let orders: Vec<u32> = scene.shadows.iter().map(|s| s.order).collect();
+        assert_eq!(orders, vec![1, 2, 3]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].range, 0..3);
+        assert_eq!(batches[0].kind, PrimitiveKind::Shadow);
+    }
+
+    #[test]
+    fn batches_should_draw_shadow_before_quad_on_tie() {
+        // Equal order → Shadow batch precedes the Quad batch (kind priority), so a drop
+        // shadow draws behind the box that casts it.
+        let mut scene = Scene::new();
+        scene.quads.push(test_quad(5));
+        scene.shadows.push(test_shadow(5));
+        let batches = collect_batches(&mut scene);
+        assert_eq!(batches[0].kind, PrimitiveKind::Shadow);
+        assert_eq!(batches[1].kind, PrimitiveKind::Quad);
     }
 
     #[test]

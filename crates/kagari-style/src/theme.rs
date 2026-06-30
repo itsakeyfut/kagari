@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::error::StyleError;
 use crate::token::{
-    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, SpacingStep,
+    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, ShadowStep, SpacingStep,
 };
 
 /// A two-layer theme: primitive palette + scales, plus the semantic role table.
@@ -47,6 +47,27 @@ pub struct Primitives {
     /// Border-width scale → logical px.
     #[serde(default)]
     pub border_width: HashMap<BorderWidthStep, Px>,
+    /// Box-shadow scale → [`ShadowSpec`] (offset/blur/spread + sRGB-hex color).
+    #[serde(default)]
+    pub shadow: HashMap<ShadowStep, ShadowSpec>,
+}
+
+/// A box-shadow spec authored in the theme (#155): outset drop shadow geometry (logical px) plus a
+/// color authored as an sRGB hex string (Tailwind shadows are black at a low alpha). Resolved to a
+/// renderer-ready form (linear premultiplied color) by
+/// [`resolve_shadow`](crate::theme::Theme::resolve_shadow). Inner/inset shadow is post-MVP (§2.5).
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
+pub struct ShadowSpec {
+    /// Horizontal offset (positive = right).
+    pub offset_x: Px,
+    /// Vertical offset (positive = down).
+    pub offset_y: Px,
+    /// Gaussian blur radius.
+    pub blur: Px,
+    /// Inflation of the casting box (negative shrinks it).
+    pub spread: Px,
+    /// Shadow color, authored as sRGB hex (`"#rrggbbaa"`).
+    pub color: HexColor,
 }
 
 /// The upper layer: each semantic [`ColorRole`] points at a palette key (e.g. `Accent → "blue-500"`).
@@ -155,6 +176,11 @@ impl Theme {
     pub fn font_size(&self, step: FontSizeStep) -> Option<Px> {
         self.primitives.font_size.get(&step).copied()
     }
+
+    /// Box-shadow scale lookup (#155), or `None` if the step is not defined by this theme.
+    pub fn shadow(&self, step: ShadowStep) -> Option<ShadowSpec> {
+        self.primitives.shadow.get(&step).copied()
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +288,29 @@ mod tests {
         assert!(close(c.g, 0.223), "g {}", c.g);
         assert!(close(c.b, 0.921), "b {}", c.b);
         assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn theme_from_ron_should_parse_shadow_spec() {
+        let ron = r##"(
+            primitives: ( colors: {}, shadow: {
+                Md: (offset_x: 0.0, offset_y: 4.0, blur: 6.0, spread: -1.0, color: "#0000001a"),
+            } ),
+            roles: ( colors: {} ),
+        )"##;
+        let theme = Theme::from_ron(ron).expect("shadow RON parses (bare-number Px, RK-010)");
+        let md = theme.shadow(ShadowStep::Md).expect("Md shadow present");
+        assert_eq!(md.offset_y, Px(4.0));
+        assert_eq!(md.blur, Px(6.0));
+        assert_eq!(md.spread, Px(-1.0));
+        assert_eq!(md.color.0.space, ColorSpace::Srgb); // authored sRGB, pre-linear
+    }
+
+    #[test]
+    fn theme_light_should_define_shadow_scale() {
+        // #45's bundled light theme now carries the #155 shadow scale.
+        assert!(Theme::light().shadow(ShadowStep::Md).is_some());
+        // `Inner` (inset) is post-MVP, so it is intentionally absent.
+        assert!(Theme::light().shadow(ShadowStep::Inner).is_none());
     }
 }

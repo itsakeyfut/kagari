@@ -12,8 +12,20 @@ use kagari_base::{Color, ColorSpace, Px};
 use crate::error::StyleError;
 use crate::theme::Theme;
 use crate::token::{
-    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, SpacingStep,
+    BorderWidthStep, ColorRole, FontSizeStep, OpacityStep, RadiusStep, ShadowStep, SpacingStep,
 };
+
+/// A resolved box-shadow (#155): the renderer-ready form of a [`ShadowSpec`](crate::theme::ShadowSpec)
+/// — geometry in logical px, color decoded to a linear premultiplied [`Color`]. Consumed by the core
+/// paint pass to emit the renderer's shadow primitive.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResolvedShadow {
+    pub offset_x: Px,
+    pub offset_y: Px,
+    pub blur: Px,
+    pub spread: Px,
+    pub color: Color,
+}
 
 /// kagari's MVP working space (linear-Rec709, kagari-base §6.1). Colors resolve into it.
 const WORKING_SPACE: ColorSpace = ColorSpace::Rec709;
@@ -68,6 +80,21 @@ impl Theme {
             .get(&step)
             .copied()
             .unwrap_or(Px(0.0))
+    }
+
+    /// Resolves a box-shadow step to a renderer-ready [`ResolvedShadow`] (#155), decoding the
+    /// authored sRGB color to linear working space (premultiplied). Returns `None` when the theme
+    /// does not define the step (e.g. `ShadowStep::None`, or `Inner` which is post-MVP) — the caller
+    /// then emits no shadow.
+    pub fn resolve_shadow(&self, step: ShadowStep) -> Option<ResolvedShadow> {
+        let spec = self.shadow(step)?;
+        Some(ResolvedShadow {
+            offset_x: spec.offset_x,
+            offset_y: spec.offset_y,
+            blur: spec.blur,
+            spread: spec.spread,
+            color: spec.color.0.to_working(WORKING_SPACE),
+        })
     }
 
     /// Validates that every [`ColorRole`] resolves to a palette color (mapped, and its palette key
@@ -214,5 +241,22 @@ mod tests {
         } else {
             assert_eq!(c, Color::TRANSPARENT, "release sentinel is transparent");
         }
+    }
+
+    #[test]
+    fn resolve_shadow_should_return_resolved_or_none() {
+        let light = Theme::light();
+        let md = light
+            .resolve_shadow(ShadowStep::Md)
+            .expect("light defines the Md shadow");
+        assert_eq!(md.offset_y, Px(4.0));
+        assert_eq!(md.blur, Px(6.0));
+        assert_eq!(md.spread, Px(-1.0));
+        // "#0000001a" → black, alpha ~0.1; linear premultiplied keeps rgb at 0.
+        assert_eq!(md.color.r, 0.0);
+        assert!(md.color.a > 0.0 && md.color.a < 0.2, "alpha {}", md.color.a);
+        // `Inner` is post-MVP (omitted from the scale) → no shadow; empty theme → no shadow.
+        assert!(light.resolve_shadow(ShadowStep::Inner).is_none());
+        assert!(Theme::default().resolve_shadow(ShadowStep::Md).is_none());
     }
 }

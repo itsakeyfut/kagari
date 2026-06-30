@@ -122,7 +122,7 @@ pub enum LetterSpacingStep {
 }
 
 /// Box-shadow scale.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ShadowStep {
     None,

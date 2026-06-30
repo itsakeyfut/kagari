@@ -68,4 +68,14 @@
     border_width: {
         B0: 0.0, B1: 1.0, B2: 2.0, B4: 4.0, B8: 8.0,
     },
+    // Box-shadow scale (#155): single-layer approximations of Tailwind v3's dominant layer
+    // (black at the Tailwind alpha). Inner/inset is post-MVP (specs §2.5), so `Inner` is omitted.
+    shadow: {
+        Sm:   (offset_x: 0.0, offset_y: 1.0,  blur: 2.0,  spread: 0.0,   color: "#0000000d"),
+        Base: (offset_x: 0.0, offset_y: 1.0,  blur: 3.0,  spread: 0.0,   color: "#0000001a"),
+        Md:   (offset_x: 0.0, offset_y: 4.0,  blur: 6.0,  spread: -1.0,  color: "#0000001a"),
+        Lg:   (offset_x: 0.0, offset_y: 10.0, blur: 15.0, spread: -3.0,  color: "#0000001a"),
+        Xl:   (offset_x: 0.0, offset_y: 20.0, blur: 25.0, spread: -5.0,  color: "#0000001a"),
+        Xl2:  (offset_x: 0.0, offset_y: 25.0, blur: 50.0, spread: -12.0, color: "#00000040"),
+    },
 )

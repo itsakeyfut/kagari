@@ -11,6 +11,7 @@ pub mod error;
 mod quad;
 pub mod renderer;
 pub mod scene;
+mod shadow;
 mod sprite;
 mod underline;
 
@@ -18,6 +19,6 @@ pub use atlas::{Atlas, AtlasCoord};
 pub use error::RenderError;
 pub use renderer::Renderer;
 pub use scene::{
-    Background, Batch, Border, MonochromeSprite, PrimitiveKind, Quad, RoundedRect, Scene,
+    Background, Batch, Border, MonochromeSprite, PrimitiveKind, Quad, RoundedRect, Scene, Shadow,
     Underline, UnderlineStyle,
 };
