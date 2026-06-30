@@ -380,12 +380,33 @@ pub fn dispatch_key(root: &mut AnyElement, arena: &Arena, focused: Option<NodeId
     }
 }
 
+/// Dispatches a resolved [`Action`](crate::event::Action) to the `focused` node, bubbling up its
+/// ancestor chain to `on_action` handlers (#50). Like [`dispatch_key`], the caller resolves the
+/// focused node (from the focus registry); a `None` focus drops the action. Reuses the same bubble
+/// delivery as the key/mouse paths.
+pub fn dispatch_action(
+    root: &mut AnyElement,
+    arena: &Arena,
+    focused: Option<NodeId>,
+    action: &crate::event::Action,
+) {
+    if let Some(node) = focused {
+        let path = ancestor_path(arena, node);
+        deliver(
+            root,
+            arena,
+            Delivery::Bubble { path: &path },
+            &Event::Action(action.clone()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::{Arena, Node};
     use crate::element::{DamageSink, Div, IntoElement, LayoutCx, div};
-    use crate::event::{FocusRegistry, HitRegion, InteractFlags};
+    use crate::event::{Action, FocusRegistry, HitRegion, InteractFlags};
     use crate::reactive::Owner;
     use kagari_base::Rect;
     use kagari_layout::LayoutTree;
@@ -718,6 +739,35 @@ mod tests {
         assert!(
             !*fired.borrow(),
             "no focused node → the key is dropped and no handler fires"
+        );
+    }
+
+    #[test]
+    fn action_should_dispatch_up_focus_chain() {
+        // A resolved action dispatched to the inner node bubbles up to the outer node's on_action.
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (l_outer, l_inner) = (Rc::clone(&log), Rc::clone(&log));
+        let root = div()
+            .on_action(move |_a, _c| l_outer.borrow_mut().push("outer"))
+            .child(div().on_action(move |_a, _c| l_inner.borrow_mut().push("inner")));
+
+        let (mut root, arena, root_id) = build(root);
+        let inner = arena.get(root_id).unwrap().children[0];
+
+        dispatch_action(&mut root, &arena, Some(inner), &Action::FocusNext);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["inner", "outer"],
+            "the action bubbles from the focused node up to the root"
+        );
+
+        // With nothing focused, the action is dropped.
+        log.borrow_mut().clear();
+        dispatch_action(&mut root, &arena, None, &Action::FocusNext);
+        assert!(
+            log.borrow().is_empty(),
+            "no focused node → the action is dropped"
         );
     }
 

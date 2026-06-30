@@ -10,8 +10,8 @@ use kagari_style::{SpacingStep, Style, Styled, Theme};
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 use crate::event::{
-    FocusHandle, FocusId, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind,
-    ListenerKind, MouseEvent, MouseHandler,
+    Action, ActionHandler, FocusHandle, FocusId, HitRegion, InteractFlags, KeyEvent, KeyHandler,
+    KeyListenerKind, ListenerKind, MouseEvent, MouseHandler,
 };
 use crate::reactive::{Prop, create_effect};
 
@@ -56,6 +56,9 @@ pub struct Div {
     focus_id: Option<FocusId>,
     /// Keyboard listeners (#49), tagged by press/release, run as a key bubbles the focus chain.
     key_handlers: Vec<(KeyListenerKind, KeyHandler)>,
+    /// Action listeners (#50), run as a resolved `Action` bubbles the focus chain. Each fires for any
+    /// `Action`; the handler matches the one it cares about.
+    action_handlers: Vec<ActionHandler>,
 }
 
 /// Creates an empty [`Div`].
@@ -74,6 +77,7 @@ pub fn div() -> Div {
         mouse_handlers: Vec::new(),
         focus_id: None,
         key_handlers: Vec::new(),
+        action_handlers: Vec::new(),
     }
 }
 
@@ -224,6 +228,14 @@ impl Div {
     pub fn on_key_up(mut self, handler: impl FnMut(&KeyEvent, &mut EventCx) + 'static) -> Self {
         self.key_handlers
             .push((KeyListenerKind::Up, Box::new(handler)));
+        self
+    }
+
+    /// Registers an action handler (#50): runs as a resolved [`Action`] bubbles from the focused node
+    /// up this node's chain. The handler receives every dispatched `Action` and matches the ones it
+    /// handles; call [`EventCx::stop_propagation`] to halt bubbling.
+    pub fn on_action(mut self, handler: impl FnMut(&Action, &mut EventCx) + 'static) -> Self {
+        self.action_handlers.push(Box::new(handler));
         self
     }
 
@@ -557,6 +569,24 @@ impl Element for Div {
                         if lk.matches(pressed) {
                             handler(ke, cx);
                         }
+                    }
+                }
+            }
+            Event::Action(action) => {
+                // A resolved action bubbles the focus chain (#50), same descend-then-fire as keyboard;
+                // every action handler fires (it matches the action it cares about).
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.is_stopped() {
+                    return;
+                }
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    for handler in self.action_handlers.iter_mut() {
+                        handler(action, cx);
                     }
                 }
             }
