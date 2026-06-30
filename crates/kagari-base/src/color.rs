@@ -24,6 +24,7 @@ pub struct Color {
 /// so conversions between them need no chromatic adaptation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum ColorSpace {
     Srgb,
     Rec709,
@@ -34,6 +35,7 @@ pub enum ColorSpace {
 /// Transfer function relating encoded values to linear light.
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Transfer {
     Srgb,
     Linear,

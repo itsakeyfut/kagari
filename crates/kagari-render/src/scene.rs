@@ -21,6 +21,7 @@ pub struct RoundedRect {
 
 /// A quad's background fill.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[non_exhaustive]
 pub enum Background {
     /// A single linear premultiplied color.
     Solid(Color),
@@ -87,6 +88,7 @@ pub struct MonochromeSprite {
 
 /// How an underline band is filled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum UnderlineStyle {
     /// A continuous filled band.
     Solid,
@@ -110,6 +112,7 @@ pub struct Underline {
 /// The kind of primitive a batch draws (one pipeline per kind). More kinds are
 /// added alongside their primitives (paths).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum PrimitiveKind {
     Shadow,
     Quad,
