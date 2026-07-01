@@ -7,6 +7,7 @@
 //! tracking (`damage`), the hybrid frame scheduler (`scheduler`), and the events/input layer
 //! (`event`) — so far the hit-test structure (#47).
 
+pub mod anim;
 pub mod app;
 pub mod arena;
 pub mod damage;
@@ -18,6 +19,7 @@ pub mod paint;
 pub mod reactive;
 pub mod scheduler;
 
+pub use anim::{Animatable, Animated, AnimationSpec, Easing};
 pub use app::App;
 pub use damage::DamageState;
 pub use element::{
@@ -32,4 +34,4 @@ pub use event::{
     dispatch_mouse,
 };
 pub use overlay::{OverlayEntry, OverlayRegistry};
-pub use scheduler::Scheduler;
+pub use scheduler::{ActiveSources, Scheduler};
