@@ -366,6 +366,7 @@ impl WindowState {
             // Live winit→dispatch wiring (and a `WindowState` hit-test) lands with the first
             // interactive consumer (#48 scope decision); nothing reads a recorded hit-test yet.
             None,
+            None,
             &mut self.scene,
             viewport,
             &self.damage,

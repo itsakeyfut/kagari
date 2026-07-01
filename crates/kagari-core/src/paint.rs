@@ -18,6 +18,7 @@ use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
 use crate::event::HitTest;
+use crate::overlay::OverlayRegistry;
 
 /// Builds, lays out, and paints `root` into `scene` for the given `viewport`.
 ///
@@ -33,6 +34,7 @@ pub fn render_tree(
     text: &mut TextSystem,
     atlas: Option<&mut Atlas>,
     hit_test: Option<&mut HitTest>,
+    overlay: Option<&mut OverlayRegistry>,
     scene: &mut Scene,
     viewport: Size,
     damage: &Arc<DamageState>,
@@ -72,7 +74,15 @@ pub fn render_tree(
     if let Some(ht) = hit_test.as_deref_mut() {
         ht.clear();
     }
+    // Clear the overlay registry for this frame; overlays re-register during paint (#62).
+    let mut overlay = overlay;
+    if let Some(reg) = overlay.as_deref_mut() {
+        reg.clear();
+    }
     let mut paint_cx = PaintCx::new(scene, layout, text, atlas, hit_test, theme);
+    if let Some(reg) = overlay {
+        paint_cx.attach_overlay(reg);
+    }
     root.paint(root_bounds, &mut paint_cx);
 
     // The frame consumed this damage. The GPU repaints the whole window for now (§1.4), so the
@@ -116,6 +126,7 @@ mod tests {
             &mut text_system,
             None, // GPU-free: text emits no glyphs; we assert the div quad + its layout.
             None, // no hit-test recording here
+            None,
             &mut scene,
             Size { w: 200.0, h: 100.0 },
             &damage,
@@ -162,6 +173,7 @@ mod tests {
             &mut text_system,
             None,
             None, // no hit-test recording here
+            None,
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,

@@ -13,13 +13,14 @@ pub mod damage;
 pub mod element;
 pub mod error;
 pub mod event;
+pub mod overlay;
 pub mod paint;
 pub mod reactive;
 pub mod scheduler;
 
 pub use app::App;
 pub use damage::DamageState;
-pub use element::{ScrollHandle, div, scroll, text, virtualized_list};
+pub use element::{ScrollHandle, div, overlay, scroll, text, virtualized_list};
 pub use error::AppError;
 pub use event::{
     Action, CursorIcon, CursorRegistry, CursorState, DispatchState, DragPayload, DragSource,
@@ -28,4 +29,5 @@ pub use event::{
     MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key,
     dispatch_mouse,
 };
+pub use overlay::{OverlayEntry, OverlayRegistry};
 pub use scheduler::Scheduler;
