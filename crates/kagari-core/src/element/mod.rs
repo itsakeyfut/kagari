@@ -18,7 +18,7 @@ mod virtualized;
 pub use cx::{DamageSink, Event, EventCx, LayoutCx, PaintCx};
 pub use div::{Div, div};
 pub use dynamic::{DynIf, DynList, dyn_if, dyn_list};
-pub use overlay::{Overlay, overlay};
+pub use overlay::{AnchorHandle, Overlay, Placement, overlay};
 pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};
 pub use virtualized::{VirtualizedList, virtualized_list};

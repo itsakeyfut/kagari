@@ -7,7 +7,9 @@ use kagari_layout::{FlexDirection, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect, Shadow};
 use kagari_style::{SpacingStep, Style, Styled, Theme};
 
-use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::{
+    AnchorHandle, AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx,
+};
 use crate::arena::Node;
 use crate::event::{
     Action, ActionHandler, CursorIcon, DragPayload, DragSource, DropTarget, FocusHandle, FocusId,
@@ -69,6 +71,9 @@ pub struct Div {
     /// The cursor declared by [`cursor`](Self::cursor) (#53), registered with the cursor registry at
     /// build (this node → icon) so pointer-move resolution can pick it. `None` declares nothing.
     cursor: Option<CursorIcon>,
+    /// The anchor handle bound by [`anchor_ref`](Self::anchor_ref) (#175): this node records its
+    /// `NodeId` into the handle at build so an overlay can anchor to it. `None` = not an anchor.
+    anchor_handle: Option<AnchorHandle>,
 }
 
 /// Creates an empty [`Div`].
@@ -92,6 +97,7 @@ pub fn div() -> Div {
         drag_source: None,
         drop_target: None,
         cursor: None,
+        anchor_handle: None,
     }
 }
 
@@ -292,6 +298,13 @@ impl Div {
         self
     }
 
+    /// Tags this element as an overlay anchor (#175): it records its `NodeId` into `handle` at build
+    /// so an `overlay(...).anchor(&handle, placement)` can position relative to this element.
+    pub fn anchor_ref(mut self, handle: &AnchorHandle) -> Self {
+        self.anchor_handle = Some(handle.clone());
+        self
+    }
+
     /// Resolves the background prop into `resolved_bg`. A static prop writes its value once; a
     /// reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure,
     /// writes the cell, and flags paint-damage for `id` — the #35 hook.
@@ -441,6 +454,10 @@ impl Element for Div {
                 // No-op when no registry is attached (the app path until live cursor wiring lands).
                 if let (Some(icon), Some(reg)) = (self.cursor, cx.cursor.as_deref_mut()) {
                     reg.register(id, icon);
+                }
+                // Record this node's id into its anchor handle (#175) so an overlay can anchor to it.
+                if let Some(handle) = &self.anchor_handle {
+                    handle.set(id);
                 }
                 id
             }

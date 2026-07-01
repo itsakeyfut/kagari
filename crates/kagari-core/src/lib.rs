@@ -20,7 +20,9 @@ pub mod scheduler;
 
 pub use app::App;
 pub use damage::DamageState;
-pub use element::{ScrollHandle, div, overlay, scroll, text, virtualized_list};
+pub use element::{
+    AnchorHandle, Placement, ScrollHandle, div, overlay, scroll, text, virtualized_list,
+};
 pub use error::AppError;
 pub use event::{
     Action, CursorIcon, CursorRegistry, CursorState, DispatchState, DragPayload, DragSource,

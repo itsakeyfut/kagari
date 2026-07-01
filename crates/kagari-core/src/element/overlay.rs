@@ -1,6 +1,9 @@
 //! The [`Overlay`] element (#62): a deferred-draw portal. Its child paints above all normal content,
-//! escaping any parent clip, at an absolute window position — via the overlay order namespace + the
-//! [`OverlayRegistry`](crate::OverlayRegistry). Anchored placement (below/above/auto-flip) is #175.
+//! escaping any parent clip — via the overlay order namespace + the [`OverlayRegistry`](crate::OverlayRegistry).
+//! It is placed at an absolute point ([`Overlay::position`]) or anchored to a target element with
+//! auto-flipping [`Placement`] ([`Overlay::anchor`] / [`AnchorHandle`], #175).
+
+use std::sync::{Arc, Mutex};
 
 use kagari_base::{NodeId, Point, Rect, Size};
 use kagari_layout::{Display, LayoutStyle};
@@ -8,32 +11,125 @@ use kagari_layout::{Display, LayoutStyle};
 use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
 
+/// An anchored overlay's side preference relative to its anchor element (#175).
+///
+/// `#[non_exhaustive]`: placement is a growth area (left/right/corner sides are common), so more
+/// variants can be added without a breaking change — matching [`CursorIcon`](crate::CursorIcon).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub enum Placement {
+    /// Below the anchor (the menu/dropdown default).
+    #[default]
+    Below,
+    /// Above the anchor.
+    Above,
+    /// Below, flipping to above when below would overflow the bottom window edge.
+    Auto,
+}
+
+/// Resolves an anchored overlay's absolute top-left from the `anchor` rect (absolute), the overlay's
+/// `size`, the window `viewport`, and the side `placement`. `Auto` flips to above when below would
+/// overflow the bottom edge and above fits; the cross axis is clamped to keep the overlay on-screen.
+pub(crate) fn resolve_placement(
+    anchor: Rect,
+    size: Size,
+    viewport: Size,
+    placement: Placement,
+) -> Point {
+    let below_y = anchor.origin.y + anchor.size.h;
+    let above_y = anchor.origin.y - size.h;
+    let y = match placement {
+        Placement::Below => below_y,
+        Placement::Above => above_y,
+        Placement::Auto => {
+            let below_overflows = below_y + size.h > viewport.h;
+            let above_fits = above_y >= 0.0;
+            if below_overflows && above_fits {
+                above_y
+            } else {
+                below_y
+            }
+        }
+    };
+    // Cross axis: left-align to the anchor, clamped so the overlay's full width stays on-screen.
+    let max_x = (viewport.w - size.w).max(0.0);
+    let x = anchor.origin.x.clamp(0.0, max_x);
+    Point::new(x, y)
+}
+
+/// A clone-shared handle identifying an anchor element for [`Overlay::anchor`]. Tag the anchor with
+/// `div().anchor_ref(&handle)` — it records its `NodeId` here at build; the overlay reads it at paint
+/// (build finishes before paint, so the tag/overlay build order is irrelevant). Mirrors
+/// [`FocusHandle`](crate::event::FocusHandle)'s "hold a handle before the element mounts" ergonomics.
+#[derive(Clone, Default)]
+pub struct AnchorHandle {
+    node: Arc<Mutex<Option<NodeId>>>,
+}
+
+impl AnchorHandle {
+    /// A new, unbound handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The anchor's `NodeId`, once its element has been built (else `None`).
+    pub fn node_id(&self) -> Option<NodeId> {
+        self.node.lock().ok().and_then(|n| *n)
+    }
+
+    /// Records the anchor element's `NodeId` — called by `anchor_ref` at build.
+    pub(crate) fn set(&self, node: NodeId) {
+        if let Ok(mut slot) = self.node.lock() {
+            *slot = Some(node);
+        }
+    }
+}
+
+/// Where an overlay's content is placed: an absolute window point, or anchored to an element.
+enum OverlayPlacement {
+    Absolute(Point),
+    Anchored {
+        anchor: AnchorHandle,
+        placement: Placement,
+    },
+}
+
 /// A portal overlay: its `child` is deferred-drawn at an absolute window `position`, above all
 /// normal content and clipped only to itself (escaping a parent clip / scroll). Built with
 /// [`overlay`]. Its own node takes no space in normal flow.
 pub struct Overlay {
     child: Option<AnyElement>,
-    position: Point,
+    placement: OverlayPlacement,
     id: Option<NodeId>,
     child_id: Option<NodeId>,
 }
 
-/// Creates an overlay portal wrapping `child`. Set the window position with [`Overlay::position`]
-/// (default `(0, 0)`).
+/// Creates an overlay portal wrapping `child`. It paints at an absolute `(0, 0)` until placed with
+/// [`Overlay::position`] (absolute) or [`Overlay::anchor`] (relative to an element).
 pub fn overlay(child: impl IntoElement) -> Overlay {
     Overlay {
         child: Some(child.into_element()),
-        position: Point::new(0.0, 0.0),
+        placement: OverlayPlacement::Absolute(Point::new(0.0, 0.0)),
         id: None,
         child_id: None,
     }
 }
 
 impl Overlay {
-    /// Sets the absolute window position (top-left) the overlay content paints at. Anchored placement
-    /// relative to another element is a follow-up (#175).
+    /// Places the overlay content at an absolute window position (top-left).
     pub fn position(mut self, position: Point) -> Self {
-        self.position = position;
+        self.placement = OverlayPlacement::Absolute(position);
+        self
+    }
+
+    /// Anchors the overlay relative to the element tagged by `anchor` (via `div().anchor_ref(&h)`),
+    /// with a side `placement` (`Auto` flips below→above at the bottom edge; the cross axis clamps
+    /// on-screen). Resolved each frame at paint from the anchor's laid-out bounds (#175).
+    pub fn anchor(mut self, anchor: &AnchorHandle, placement: Placement) -> Self {
+        self.placement = OverlayPlacement::Anchored {
+            anchor: anchor.clone(),
+            placement,
+        };
         self
     }
 }
@@ -76,19 +172,34 @@ impl Element for Overlay {
     }
 
     fn paint(&mut self, _bounds: Rect, cx: &mut PaintCx) {
-        // The overlay ignores its zero-size in-flow `bounds` and paints its child at the absolute
+        // The overlay ignores its zero-size in-flow `bounds` and paints its child at the resolved
         // window position, deferred to the top painter-order and escaping any parent clip.
         let (Some(child), Some(child_id)) = (self.child.as_mut(), self.child_id) else {
             return;
         };
-        let child_bounds = Rect {
-            origin: self.position,
-            size: cx.layout.layout(child_id).size,
+        let overlay_size = cx.layout.layout(child_id).size;
+        // Resolve the origin: an absolute point, or anchored to a target element's absolute bounds
+        // (auto-flip / on-screen clamp against the viewport). An unbound anchor falls back to (0, 0).
+        let origin = match &self.placement {
+            OverlayPlacement::Absolute(p) => *p,
+            OverlayPlacement::Anchored { anchor, placement } => match anchor.node_id() {
+                Some(anchor_id) => resolve_placement(
+                    cx.layout.absolute_layout(anchor_id),
+                    overlay_size,
+                    cx.viewport(),
+                    *placement,
+                ),
+                None => Point::new(0.0, 0.0),
+            },
         };
-        // Register the overlay (records the entry + hands out its z-slot in registration order);
+        let child_bounds = Rect {
+            origin,
+            size: overlay_size,
+        };
+        // Register the overlay node (records the entry + hands out its z-slot in registration order);
         // slot 0 when no registry is attached (a lone overlay still draws frontmost).
-        let anchor = self.id.unwrap_or(child_id);
-        let slot = cx.overlay_register(anchor, child_bounds).unwrap_or(0);
+        let anchor_node = self.id.unwrap_or(child_id);
+        let slot = cx.overlay_register(anchor_node, child_bounds).unwrap_or(0);
         // Escape any parent clip and draw the subtree in the overlay's high painter-order band.
         let saved_clip = cx.clip();
         cx.set_clip(None);
@@ -167,6 +278,7 @@ mod tests {
         {
             let bounds = layout.layout(id);
             let mut cx = PaintCx::new(&mut scene, &layout, &mut text, None, Some(&mut hit), &theme);
+            cx.set_viewport(viewport);
             cx.attach_overlay(&mut overlay_reg);
             root.paint(bounds, &mut cx);
         }
@@ -463,6 +575,147 @@ mod tests {
             reg.entries().len(),
             1,
             "render_tree clears the registry each frame (no accumulation)"
+        );
+    }
+
+    #[test]
+    fn resolve_placement_should_place_below() {
+        // Below: the overlay hangs off the anchor's bottom edge, left-aligned to the anchor.
+        let anchor = Rect::from_xywh(20.0, 40.0, 60.0, 30.0); // bottom = 70
+        let p = resolve_placement(
+            anchor,
+            Size::new(50.0, 50.0),
+            Size::new(200.0, 200.0),
+            Placement::Below,
+        );
+        assert_eq!(p, Point::new(20.0, 70.0));
+    }
+
+    #[test]
+    fn resolve_placement_should_flip_to_above_on_bottom_overflow() {
+        // Auto: an anchor near the bottom (bottom = 90). Below (y 90, +50 = 140 > 100 viewport)
+        // overflows, so it flips above: y = anchor.top (80) - overlay.h (50) = 30.
+        let anchor = Rect::from_xywh(20.0, 80.0, 60.0, 10.0);
+        let p = resolve_placement(
+            anchor,
+            Size::new(50.0, 50.0),
+            Size::new(200.0, 100.0),
+            Placement::Auto,
+        );
+        assert_eq!(
+            p.y, 30.0,
+            "flips above when below would overflow the bottom edge"
+        );
+    }
+
+    #[test]
+    fn resolve_placement_should_clamp_cross_axis() {
+        // An anchor near the right edge: the 80-wide overlay would run off, so x clamps to
+        // viewport.w - overlay.w = 200 - 80 = 120.
+        let anchor = Rect::from_xywh(180.0, 10.0, 20.0, 20.0);
+        let p = resolve_placement(
+            anchor,
+            Size::new(80.0, 30.0),
+            Size::new(200.0, 200.0),
+            Placement::Below,
+        );
+        assert_eq!(
+            p.x, 120.0,
+            "clamps cross-axis so the overlay stays on-screen"
+        );
+    }
+
+    #[test]
+    fn overlay_anchor_should_flip_on_edge() {
+        // An anchor near the bottom of a 200x100 window, anchored `Auto`: the overlay flips above.
+        // Column: an 80px spacer, then the 20px anchor (absolute y 80..100), then the anchored overlay.
+        let anchor = AnchorHandle::new();
+        let mut root = div()
+            .flex_col()
+            .size(Size { w: 200.0, h: 100.0 })
+            .child(div().size(Size { w: 50.0, h: 80.0 }))
+            .child(div().size(Size { w: 50.0, h: 20.0 }).anchor_ref(&anchor))
+            .child(
+                overlay(div().size(Size { w: 50.0, h: 50.0 }).background(green()))
+                    .anchor(&anchor, Placement::Auto),
+            )
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 100.0 });
+
+        // The anchor sits at absolute y 80..100 (near the bottom). Below (100, +50 = 150 > 100)
+        // overflows, so Auto flips above: the overlay child paints at y = 80 - 50 = 30.
+        assert_eq!(scene.quads.len(), 1, "only the overlay child has a bg quad");
+        assert_eq!(
+            scene.quads[0].bounds.origin.y, 30.0,
+            "Auto flips the overlay above the bottom-edge anchor"
+        );
+    }
+
+    #[test]
+    fn resolve_placement_should_stay_below_when_above_also_overflows() {
+        // A tall overlay (95) in a 100 window anchored `Auto`: below (bottom 90 + 95 = 185 > 100)
+        // overflows, but above (top 80 - 95 = -15) also overflows the top — so it stays below
+        // (the main axis is flip-only, no clamp).
+        let anchor = Rect::from_xywh(20.0, 80.0, 60.0, 10.0);
+        let p = resolve_placement(
+            anchor,
+            Size::new(50.0, 95.0),
+            Size::new(200.0, 100.0),
+            Placement::Auto,
+        );
+        assert_eq!(
+            p.y, 90.0,
+            "stays below (= anchor bottom) when above also overflows"
+        );
+    }
+
+    #[test]
+    fn overlay_unbound_anchor_should_paint_at_origin() {
+        // An overlay anchored to a handle never bound to an element (no `anchor_ref`) degrades to
+        // the origin (0, 0) rather than panicking.
+        let handle = AnchorHandle::new();
+        let mut root = div()
+            .child(
+                overlay(div().size(Size { w: 50.0, h: 50.0 }).background(green()))
+                    .anchor(&handle, Placement::Auto),
+            )
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 200.0 });
+
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(
+            scene.quads[0].bounds.origin,
+            Point::new(0.0, 0.0),
+            "an unbound anchor falls back to the origin"
+        );
+    }
+
+    #[test]
+    fn overlay_anchor_should_clamp_to_screen_edge() {
+        // A right-edge anchor (x 180) with an 80-wide overlay: Below places at the anchor's bottom,
+        // and the cross axis clamps to viewport.w - overlay.w = 200 - 80 = 120 to stay on-screen.
+        let anchor = AnchorHandle::new();
+        let mut root = div()
+            .flex()
+            .size(Size { w: 200.0, h: 100.0 })
+            .child(div().size(Size { w: 180.0, h: 20.0 }))
+            .child(div().size(Size { w: 20.0, h: 20.0 }).anchor_ref(&anchor))
+            .child(
+                overlay(div().size(Size { w: 80.0, h: 30.0 }).background(green()))
+                    .anchor(&anchor, Placement::Below),
+            )
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 100.0 });
+
+        // Anchor at (180, 0) size (20, 20): Below → y = 20; x = clamp(180, 0, 120) = 120.
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(
+            scene.quads[0].bounds.origin,
+            Point::new(120.0, 20.0),
+            "places below the anchor and clamps the cross axis on-screen"
         );
     }
 }

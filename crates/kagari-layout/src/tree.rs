@@ -150,6 +150,39 @@ impl LayoutTree {
             Err(_) => Rect::default(),
         }
     }
+
+    /// The absolute (window-space) bounds of `node`: its size plus the sum of its own and every
+    /// ancestor's parent-relative origin up to the root, via taffy's parent links. This matches the
+    /// paint pass's origin accumulation (each element paints its children at `parent_origin +
+    /// local`), so it is the anchor rect an overlay places against (#175). A scroll's paint-time
+    /// `-offset` translation is *not* reflected here — anchoring to a scrolled element is off by the
+    /// scroll offset (a follow-up).
+    pub fn absolute_layout(&self, node: NodeId) -> Rect {
+        let Some(&taffy_id) = self.fwd.get(&node) else {
+            return Rect::default();
+        };
+        let Ok(own) = self.taffy.layout(taffy_id) else {
+            return Rect::default();
+        };
+        let size = Size {
+            w: own.size.width,
+            h: own.size.height,
+        };
+        // Start from the node's own location (already fetched), then add each ancestor's up to root.
+        let mut origin = Point {
+            x: own.location.x,
+            y: own.location.y,
+        };
+        let mut cur = self.taffy.parent(taffy_id);
+        while let Some(tid) = cur {
+            if let Ok(layout) = self.taffy.layout(tid) {
+                origin.x += layout.location.x;
+                origin.y += layout.location.y;
+            }
+            cur = self.taffy.parent(tid);
+        }
+        Rect { origin, size }
+    }
 }
 
 impl Default for LayoutTree {
@@ -295,5 +328,61 @@ mod tests {
     fn is_dirty_should_be_false_for_unknown_node() {
         let tree = LayoutTree::new();
         assert!(!tree.is_dirty(node(42)));
+    }
+
+    #[test]
+    fn absolute_layout_should_sum_ancestor_origins() {
+        // Column root: a 30px spacer then a 50px container holding a child. The child's absolute
+        // origin accumulates its container's origin (30) — not just its parent-relative (0).
+        let mut tree = LayoutTree::new();
+        let (root, spacer, container, child) = (node(1), node(2), node(3), node(4));
+        tree.insert(root, None);
+        tree.insert(spacer, Some(root));
+        tree.insert(container, Some(root));
+        tree.insert(child, Some(container));
+        tree.set_style(
+            root,
+            &LayoutStyle {
+                flex_direction: FlexDirection::Column,
+                size: Some(Size { w: 100.0, h: 100.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        tree.set_style(
+            spacer,
+            &LayoutStyle {
+                size: Some(Size { w: 50.0, h: 30.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        tree.set_style(
+            container,
+            &LayoutStyle {
+                size: Some(Size { w: 50.0, h: 50.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        tree.set_style(
+            child,
+            &LayoutStyle {
+                size: Some(Size { w: 20.0, h: 20.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        tree.compute(root, Size { w: 100.0, h: 100.0 }).unwrap();
+
+        // Parent-relative: the child sits at (0,0) inside its container.
+        assert_eq!(tree.layout(child).origin.y, 0.0);
+        // Absolute: container is stacked below the 30px spacer, so the child's absolute y is 30.
+        let abs = tree.absolute_layout(child);
+        assert_eq!(abs.origin.y, 30.0, "absolute y sums the container's origin");
+        assert_eq!(abs.size.w, 20.0, "absolute bounds keep the node's own size");
+    }
+
+    #[test]
+    fn absolute_layout_should_return_default_for_unknown_node() {
+        // An unknown node is a silent zero rect (no panic), mirroring `layout`/`is_dirty`.
+        let tree = LayoutTree::new();
+        assert_eq!(tree.absolute_layout(node(99)), Rect::default());
     }
 }
