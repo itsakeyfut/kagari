@@ -211,6 +211,22 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
         self.value.get()
     }
 
+    /// The current value **without** subscribing — for imperative reads (e.g. reading the momentary
+    /// position) that must not create a reactive dependency.
+    pub fn get_untracked(&self) -> T {
+        self.value.get_untracked()
+    }
+
+    /// The current target the animation is heading toward — for retargeting by a relative delta
+    /// (accumulate on the destination, not the momentary value, so deltas don't drop mid-flight).
+    /// Falls back to the current value on a poisoned lock (never panics).
+    pub fn target(&self) -> T {
+        match self.inner.lock() {
+            Ok(inner) => inner.target,
+            Err(_) => self.value.get_untracked(),
+        }
+    }
+
     /// Retargets the animation. A spring keeps its velocity (interruptible, no jump); an easing tween
     /// restarts from the current value. Starting (from rest) registers a scheduler active source.
     pub fn set_target(&self, target: T) {
@@ -227,6 +243,52 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
             inner.animating = true;
             if let Some(active) = &self.active {
                 active.register();
+            }
+        }
+    }
+
+    /// Seeds the spring with an initial `velocity` (a fling / throw) and aims at `target`, registering
+    /// the active source. Unlike [`set_target`](Self::set_target), which preserves the running
+    /// velocity, this *sets* the velocity — a release velocity carries the motion forward before it
+    /// settles. A no-op for an easing spec (velocity is meaningless there; use `set_target`).
+    pub fn fling(&self, velocity: T, target: T) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if !matches!(inner.spec, AnimationSpec::Spring { .. }) {
+            return;
+        }
+        inner.target = target;
+        inner.velocity = velocity;
+        if !inner.animating {
+            inner.animating = true;
+            if let Some(active) = &self.active {
+                active.register();
+            }
+        }
+    }
+
+    /// Snaps immediately to `value` without animating: stops a running spring/tween, clears velocity,
+    /// deregisters the active source, and writes the value. For instant moves (e.g. restoring a saved
+    /// position) where an animation would be wrong.
+    pub fn snap_to(&self, value: T) {
+        let was_animating = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.target = value;
+            inner.velocity = value.sub(value); // zero in T-space
+            inner.start = value;
+            inner.elapsed = Duration::ZERO;
+            let was = inner.animating;
+            inner.animating = false;
+            was
+        };
+        // Write after releasing the lock so a subscribed effect can't re-enter and deadlock.
+        self.value.set(value);
+        if was_animating {
+            if let Some(active) = &self.active {
+                active.unregister();
             }
         }
     }
@@ -528,6 +590,53 @@ mod tests {
             "converges when elapsed reaches the duration"
         );
         assert_eq!(anim.get(), 10.0, "reaches the target exactly");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn animated_fling_should_carry_velocity_then_settle() {
+        let owner = Owner::new();
+        owner.set();
+
+        // Fling from 0 toward a target ahead, seeded with a positive velocity: the value carries
+        // forward (moves this frame) and settles exactly at the target on convergence.
+        let anim = Animated::new(0.0_f32, spring());
+        anim.fling(200.0, 50.0);
+        assert!(anim.tick(frame()), "still animating after the first tick");
+        assert!(
+            anim.get() > 0.0,
+            "the seeded velocity moves the value forward ({})",
+            anim.get()
+        );
+
+        let mut ticks = 0;
+        while anim.tick(frame()) {
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
+        assert_eq!(anim.get(), 50.0, "the fling settles at the target");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn animated_snap_to_should_stop_without_animating() {
+        let owner = Owner::new();
+        owner.set();
+
+        let sources = ActiveSources::new();
+        provide_context(sources.clone());
+        let anim = Animated::new(0.0_f32, spring());
+        anim.set_target(100.0);
+        assert_eq!(sources.count(), 1, "set_target starts an animation");
+
+        // snap_to jumps to the value immediately and deregisters — no further ticks animate.
+        anim.snap_to(42.0);
+        assert_eq!(anim.get(), 42.0, "snap_to writes the value immediately");
+        assert_eq!(sources.count(), 0, "snap_to deregisters the active source");
+        assert!(!anim.tick(frame()), "snapped: no animation to advance");
+        assert_eq!(anim.get(), 42.0, "the value stays put after snapping");
 
         drop(owner);
     }

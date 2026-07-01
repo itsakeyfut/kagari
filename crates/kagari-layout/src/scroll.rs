@@ -9,6 +9,11 @@ use kagari_base::{Point, Size};
 /// Minimum overlay-scrollbar thumb length (logical px) so a tiny thumb stays grabbable.
 const MIN_THUMB: f32 = 16.0;
 
+/// Time constant (seconds) for the inertial fling projection: a fling of `velocity` px/sec is
+/// projected `velocity · FLING_TAU` px ahead before it settles. Tunable — the inertial-scroll physics
+/// tuning is post-MVP (specs §4.3); this pairs with a near-critically-damped scroll spring.
+const FLING_TAU: f32 = 0.1;
+
 /// A scroll viewport's state: the current `offset` and the laid-out `content` extent. The container
 /// (viewport) size is passed per call since it comes fresh from layout each frame.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -54,6 +59,22 @@ pub fn thumb(viewport: f32, content: f32, offset: f32, track: f32) -> Option<(f3
         0.0
     };
     Some((pos, len))
+}
+
+/// The projected rest offset of an inertial fling (#176): `offset + velocity · FLING_TAU`, clamped per
+/// axis to `[0, max_offset]` so the fling never rests past the content. The scroll spring eases into
+/// this target seeded with `velocity`, so the motion carries forward before settling. `velocity` is in
+/// logical px/sec. Pure geometry (Element/GPU-free), shared by `ScrollHandle::fling`.
+pub fn fling_target(offset: Point, velocity: Point, content: Size, viewport: Size) -> Point {
+    let projected = Point::new(
+        offset.x + velocity.x * FLING_TAU,
+        offset.y + velocity.y * FLING_TAU,
+    );
+    ScrollState {
+        offset: projected,
+        content,
+    }
+    .clamp(viewport)
 }
 
 /// The half-open index range `[start, end)` of fixed-height rows intersecting the viewport (#61),
@@ -124,6 +145,44 @@ mod tests {
         assert!(
             thumb(100.0, 100.0, 0.0, 100.0).is_none(),
             "content equal to the viewport shows no thumb"
+        );
+    }
+
+    #[test]
+    fn fling_target_should_project_and_clamp() {
+        // content 300 in a 100 viewport → max offset 200. A downward fling of 500 px/sec projects
+        // 0 + 500·0.1 = 50 px ahead (within bounds); a hard 5000 projects 500 → clamps to 200.
+        let content = Size::new(100.0, 300.0);
+        let viewport = Size::new(100.0, 100.0);
+        assert_eq!(
+            fling_target(
+                Point::new(0.0, 0.0),
+                Point::new(0.0, 500.0),
+                content,
+                viewport
+            ),
+            Point::new(0.0, 50.0),
+            "a gentle fling projects offset + velocity·tau, within bounds"
+        );
+        assert_eq!(
+            fling_target(
+                Point::new(0.0, 0.0),
+                Point::new(0.0, 5000.0),
+                content,
+                viewport
+            ),
+            Point::new(0.0, 200.0),
+            "a hard fling clamps to the max offset (no rest past the content)"
+        );
+        assert_eq!(
+            fling_target(
+                Point::new(0.0, 20.0),
+                Point::new(0.0, -1000.0),
+                content,
+                viewport
+            ),
+            Point::new(0.0, 0.0),
+            "an upward fling past the top clamps to 0"
         );
     }
 

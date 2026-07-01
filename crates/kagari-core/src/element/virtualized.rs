@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(rows0.len(), 7);
 
         // Scroll down 60px (3 rows): visible range 0..7 → 1..10. Between-frames write (RK-009).
-        handle.scroll_to(Point::new(0.0, 60.0));
+        handle.jump_to(Point::new(0.0, 60.0));
         assert!(
             vl.is_dirty(),
             "the offset write flags the visible range dirty"
@@ -265,7 +265,7 @@ mod tests {
         owner.set();
 
         let handle = ScrollHandle::new();
-        handle.scroll_to(Point::new(0.0, 60.0));
+        handle.jump_to(Point::new(0.0, 60.0));
         let mut env = Env::new();
         let mut vl = virtualized_list(20.0, 1000, Size { w: 100.0, h: 200.0 }, &handle, |_i| {
             div().size(Size { w: 100.0, h: 20.0 }).background(green())
@@ -318,7 +318,7 @@ mod tests {
         owner.set();
 
         let handle = ScrollHandle::new();
-        handle.scroll_to(Point::new(0.0, 20000.0));
+        handle.jump_to(Point::new(0.0, 20000.0));
         let mut env = Env::new();
         let mut vl = virtualized_list(20.0, 1000, Size { w: 100.0, h: 100.0 }, &handle, |_i| {
             div().size(Size { w: 100.0, h: 20.0 }).background(green())
@@ -367,7 +367,7 @@ mod tests {
         let index0_node = env.arena.get(id).unwrap().children[0];
 
         // Scroll down far enough (offset 200 → window 8..17) that index 0 leaves the window.
-        handle.scroll_to(Point::new(0.0, 200.0));
+        handle.jump_to(Point::new(0.0, 200.0));
         vl.reconcile(&mut env.cx());
         assert!(
             !env.arena.contains(index0_node),
@@ -375,7 +375,7 @@ mod tests {
         );
 
         // Scroll back to the top: index 0 re-enters and is rebuilt with a fresh node.
-        handle.scroll_to(Point::new(0.0, 0.0));
+        handle.jump_to(Point::new(0.0, 0.0));
         vl.reconcile(&mut env.cx());
         let reentered = env.arena.get(id).unwrap().children[0];
         assert_ne!(
@@ -434,7 +434,7 @@ mod tests {
         owner.set();
 
         let handle = ScrollHandle::new();
-        handle.scroll_to(Point::new(0.0, 70.0));
+        handle.jump_to(Point::new(0.0, 70.0));
         let mut env = Env::new();
         let mut vl = virtualized_list(20.0, 1000, Size { w: 100.0, h: 200.0 }, &handle, |_i| {
             div().size(Size { w: 100.0, h: 20.0 }).background(green())

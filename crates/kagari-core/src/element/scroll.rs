@@ -3,35 +3,45 @@
 //! scrollbars reflect the content/viewport ratio; [`ScrollHandle`] drives the offset imperatively.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
-use kagari_layout::scroll::{ScrollState, thumb};
+use kagari_layout::scroll::{ScrollState, fling_target, thumb};
 use kagari_layout::{Display, LayoutStyle, Overflow};
 use kagari_render::{Background, Border, Quad, RoundedRect};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use crate::anim::{Animated, AnimationSpec};
 use crate::arena::Node;
-use crate::reactive::prelude::*;
-use crate::reactive::{Prop, RwSignal, create_effect, rx};
+use crate::reactive::{Prop, create_effect, rx};
 
 /// Overlay-scrollbar thumb thickness (logical px).
 const SCROLLBAR_THICKNESS: f32 = 6.0;
 
-/// A clone-shared handle to a [`Scroll`]'s offset (#60): the reactive `Signal<Point>` behind
-/// [`Scroll::offset`], for imperative control (`scroll_to` / `scroll_by`) and reactive reads.
+/// The scroll spring (#176): near-critically-damped (2·√120 ≈ 21.9) so `scroll_to` and flings settle
+/// smoothly without a visible bounce. Tunable — the inertial-scroll physics tuning is post-MVP.
+const SCROLL_SPRING: AnimationSpec = AnimationSpec::Spring {
+    stiffness: 120.0,
+    damping: 22.0,
+};
+
+/// A clone-shared handle to a [`Scroll`]'s offset (#60): an [`Animated<Point>`](Animated) spring behind
+/// [`Scroll::offset`], for imperative control and reactive reads. Smooth by default (#176) —
+/// `scroll_to` animates, `fling` throws with a release velocity, `jump_to` snaps instantly.
 ///
 /// Mirrors [`FocusHandle`](crate::event::FocusHandle). Constructing one needs a reactive owner (the
-/// app root, #36); in tests set an `Owner` first. Bind it with `scroll().offset(&handle)`.
+/// app root, #36); in tests set an `Owner` first. The frame clock drives [`tick`](Self::tick) while
+/// animating (the live drive lands with the deferred frame loop). Bind it with `scroll().offset(&handle)`.
 #[derive(Clone)]
 pub struct ScrollHandle {
-    offset: RwSignal<Point>,
+    offset: Animated<Point>,
 }
 
 impl ScrollHandle {
     /// A new handle at offset `(0, 0)`.
     pub fn new() -> Self {
         Self {
-            offset: RwSignal::new(Point::new(0.0, 0.0)),
+            offset: Animated::new(Point::new(0.0, 0.0), SCROLL_SPRING),
         }
     }
 
@@ -40,14 +50,37 @@ impl ScrollHandle {
         self.offset.get()
     }
 
-    /// Scrolls to an absolute offset (the container clamps it to the content at paint).
+    /// Animates to an absolute offset (the container clamps it to the content at paint). Smooth by
+    /// default (#176); for an instant move use [`jump_to`](Self::jump_to).
     pub fn scroll_to(&self, offset: Point) {
-        self.offset.set(offset);
+        self.offset.set_target(offset);
     }
 
-    /// Scrolls by a delta (e.g. one wheel notch); the container clamps the result at paint.
+    /// Animates by a delta (e.g. one wheel notch), retargeting from the current **target** so repeated
+    /// notches accumulate (rather than dropping deltas mid-flight); the container clamps at paint.
     pub fn scroll_by(&self, delta: Point) {
-        self.offset.update(|o| *o = *o + delta);
+        self.offset.set_target(self.offset.target() + delta);
+    }
+
+    /// Snaps to an absolute offset immediately, without animating — for restoring a saved scroll
+    /// position or any move where a smooth transition would be wrong.
+    pub fn jump_to(&self, offset: Point) {
+        self.offset.snap_to(offset);
+    }
+
+    /// Flings the scroll with a release `velocity` (logical px/sec): seeds the spring so the offset
+    /// carries forward and settles at the projected, content-clamped rest point (#176). `content` and
+    /// `viewport` come from the scroll's layout (the caller passes the last-measured extents).
+    pub fn fling(&self, velocity: Point, content: Size, viewport: Size) {
+        let target = fling_target(self.offset.get_untracked(), velocity, content, viewport);
+        self.offset.fling(velocity, target);
+    }
+
+    /// Advances the scroll animation by `dt`, returning `false` once it has settled. Driven by the
+    /// frame clock while animating (the live drive lands with the deferred frame loop); returns
+    /// `false` immediately when at rest.
+    pub fn tick(&self, dt: Duration) -> bool {
+        self.offset.tick(dt)
     }
 }
 
@@ -59,8 +92,9 @@ impl Default for ScrollHandle {
 
 impl From<&ScrollHandle> for Prop<Point> {
     fn from(handle: &ScrollHandle) -> Self {
-        // `RwSignal` is `Copy`; capture it so the reactive prop tracks the handle's offset.
-        let offset = handle.offset;
+        // `Animated<Point>` is a shared handle (Clone); capture a clone so the reactive prop tracks the
+        // offset — tick's between-frame writes re-run this and flag paint-damage.
+        let offset = handle.offset.clone();
         rx(move || offset.get())
     }
 }
@@ -329,6 +363,8 @@ mod tests {
     use crate::element::div;
     use crate::event::HitTest;
     use crate::paint::render_tree;
+    use crate::reactive::provide_context;
+    use crate::scheduler::ActiveSources;
     use kagari_layout::LayoutTree;
     use kagari_render::Scene;
     use kagari_style::Theme;
@@ -342,6 +378,10 @@ mod tests {
 
     fn green() -> Background {
         Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0))
+    }
+
+    fn frame() -> Duration {
+        Duration::from_secs_f32(1.0 / 60.0)
     }
 
     /// Builds `root`, computes layout at `viewport`, and paints — returning the scene, the layout
@@ -654,7 +694,7 @@ mod tests {
 
     #[test]
     fn scroll_handle_should_drive_offset() {
-        // `RwSignal::new` needs an owner; keep it alive for the whole test (RK-003).
+        // `Animated::new` needs an owner; keep it alive for the whole test (RK-003).
         let owner = Owner::new();
         owner.set();
 
@@ -664,17 +704,31 @@ mod tests {
             Point::new(0.0, 0.0),
             "starts at the origin"
         );
-        handle.scroll_to(Point::new(0.0, 30.0));
+
+        // jump_to is instant (no animation) — the offset moves immediately.
+        handle.jump_to(Point::new(0.0, 30.0));
         assert_eq!(
             handle.offset(),
             Point::new(0.0, 30.0),
-            "scroll_to sets the offset"
+            "jump_to snaps to the offset immediately"
         );
-        handle.scroll_by(Point::new(5.0, 10.0));
+
+        // scroll_to animates: the offset does not reach the target until the spring converges.
+        handle.scroll_to(Point::new(0.0, 80.0));
+        assert_ne!(
+            handle.offset(),
+            Point::new(0.0, 80.0),
+            "scroll_to does not snap"
+        );
+        let mut ticks = 0;
+        while handle.tick(frame()) {
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
         assert_eq!(
             handle.offset(),
-            Point::new(5.0, 40.0),
-            "scroll_by adds to the offset"
+            Point::new(0.0, 80.0),
+            "scroll_to settles at the target"
         );
 
         drop(owner);
@@ -726,10 +780,11 @@ mod tests {
             "frame 1: middle child at natural y"
         );
 
-        // Scroll between frames: the effect re-resolves the offset and flags paint-damage only —
-        // nothing becomes layout-dirty, so the relayout-free (paint-only) contract holds.
-        handle.scroll_to(Point::new(0.0, 25.0));
-        assert!(damage.is_dirty(), "the reactive offset write flags damage");
+        // Scroll between frames: jump_to writes the offset instantly (paint-only). The effect
+        // re-resolves the offset and flags paint-damage only — nothing becomes layout-dirty, so the
+        // relayout-free (paint-only) contract holds.
+        handle.jump_to(Point::new(0.0, 25.0));
+        assert!(damage.is_dirty(), "the offset write flags damage");
         assert!(
             damage.take_layout_dirty().is_empty(),
             "scrolling is paint-only — nothing is layout-dirty"
@@ -754,6 +809,192 @@ mod tests {
         assert_eq!(
             scene.quads[1].bounds.origin.y, 25.0,
             "frame 2: middle child scrolled up 25"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_to_should_animate_not_snap() {
+        // Requirement: scroll_to animates rather than snapping.
+        let owner = Owner::new();
+        owner.set();
+
+        let handle = ScrollHandle::new();
+        handle.scroll_to(Point::new(0.0, 60.0));
+
+        // First tick: moving but not yet at the target (animated, not snapped).
+        assert!(handle.tick(frame()), "still animating after one tick");
+        let mid = handle.offset();
+        assert!(
+            mid.y > 0.0 && mid.y < 60.0,
+            "mid-flight value is between the start and the target ({mid:?})"
+        );
+
+        let mut ticks = 0;
+        while handle.tick(frame()) {
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
+        assert_eq!(
+            handle.offset(),
+            Point::new(0.0, 60.0),
+            "scroll_to settles at the target"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_by_should_accumulate_on_the_target() {
+        // Two notches in the same frame (no tick between) must accumulate on the target — retargeting
+        // from the momentary value would drop the first delta.
+        let owner = Owner::new();
+        owner.set();
+
+        let handle = ScrollHandle::new();
+        handle.scroll_by(Point::new(0.0, 10.0));
+        handle.scroll_by(Point::new(0.0, 10.0));
+
+        let mut ticks = 0;
+        while handle.tick(frame()) {
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
+        assert_eq!(
+            handle.offset(),
+            Point::new(0.0, 20.0),
+            "two same-frame notches accumulate to 20 (not 10)"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_fling_should_decay_to_rest_paint_only() {
+        // Requirement: a pan fling decays smoothly to rest (spring), updating the offset paint-only.
+        let owner = Owner::new();
+        owner.set();
+
+        let handle = ScrollHandle::new();
+        let mut root = scroll()
+            .size(Size { w: 100.0, h: 100.0 })
+            .hide_scrollbar()
+            .offset(&handle)
+            .child(div().size(Size { w: 100.0, h: 50.0 }).background(green()))
+            .child(div().size(Size { w: 100.0, h: 50.0 }).background(green()))
+            .child(div().size(Size { w: 100.0, h: 50.0 }).background(green()))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage = Arc::new(DamageState::default());
+        let viewport = Size { w: 100.0, h: 100.0 };
+
+        // Frame 1 at rest: the middle child paints at its natural y = 50 (binds the offset effect).
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            None,
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        assert_eq!(
+            scene.quads[1].bounds.origin.y, 50.0,
+            "frame 1: middle child at natural y"
+        );
+
+        // Fling downward: content 150 tall in a 100 viewport → max offset 50; a hard fling projects
+        // past it and clamps to 50.
+        let content = Size { w: 100.0, h: 150.0 };
+        handle.fling(Point::new(0.0, 1000.0), content, viewport);
+
+        // Drive the spring to rest; each tick is paint-only (nothing becomes layout-dirty).
+        let mut ticks = 0;
+        while handle.tick(frame()) {
+            assert!(
+                damage.take_layout_dirty().is_empty(),
+                "each fling frame is paint-only — nothing is layout-dirty"
+            );
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
+        assert!(
+            ticks > 1,
+            "the fling animates over several frames (decays, not a snap)"
+        );
+        assert_eq!(
+            handle.offset(),
+            Point::new(0.0, 50.0),
+            "the fling settles at the clamped rest offset"
+        );
+
+        // Final frame at the settled offset 50: the first child (natural y 0..50) scrolls fully out
+        // of view (painted −50..0, culled), so the second child now rests at the viewport top (y 0).
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            None,
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        assert_eq!(scene.quads.len(), 2, "the first child scrolled out of view");
+        assert_eq!(
+            scene.quads[0].bounds.origin.y, 0.0,
+            "the second child rests at the viewport top (content scrolled up by the fling offset)"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_fling_should_stop_at_convergence() {
+        // Requirement: convergence stops the animation (no idle frames) — the scheduler active source
+        // registers on the fling and deregisters on rest.
+        let owner = Owner::new();
+        owner.set();
+
+        let sources = ActiveSources::new();
+        provide_context(sources.clone()); // the handle's `Animated` captures this from context
+        let handle = ScrollHandle::new();
+        assert_eq!(sources.count(), 0, "idle before a fling");
+
+        let content = Size { w: 100.0, h: 300.0 };
+        let viewport = Size { w: 100.0, h: 100.0 };
+        handle.fling(Point::new(0.0, 800.0), content, viewport);
+        assert_eq!(
+            sources.count(),
+            1,
+            "the fling registers an active source (continuous drive)"
+        );
+
+        let mut ticks = 0;
+        while handle.tick(frame()) {
+            ticks += 1;
+            assert!(ticks < 10_000);
+        }
+        assert_eq!(
+            sources.count(),
+            0,
+            "convergence deregisters — the app returns to on-demand (no idle frames)"
         );
 
         drop(owner);
