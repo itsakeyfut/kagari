@@ -15,6 +15,7 @@ pub mod renderer;
 pub mod scene;
 mod shadow;
 mod sprite;
+mod svg;
 mod underline;
 
 pub use assets::{AssetId, AssetLoader, AssetSource, LoadState};
@@ -25,3 +26,4 @@ pub use scene::{
     Background, Batch, Border, MonochromeSprite, PolychromeSprite, PrimitiveKind, Quad,
     RoundedRect, Scene, Shadow, Underline, UnderlineStyle,
 };
+pub use svg::IconId;
