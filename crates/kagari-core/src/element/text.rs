@@ -82,11 +82,17 @@ impl Element for Text {
             .rasterize_into(shaped, self.color, atlas, &mut cx.scene.glyphs);
         // Glyph sprites are emitted in text-local coordinates at order 0; offset by the laid-out
         // origin and stamp the traversal painter's order so the text draws above its background.
+        // Under a scroll ancestor, mask each glyph to the visible viewport (`rasterize_into` left
+        // them unclipped); unclipped text keeps that no-op mask.
+        let clip = cx.clip();
         let order = cx.next_order();
         for sprite in &mut cx.scene.glyphs[start..] {
             sprite.bounds.origin.x += bounds.origin.x;
             sprite.bounds.origin.y += bounds.origin.y;
             sprite.order = order;
+            if let Some(clip) = clip {
+                sprite.content_mask.rect = clip;
+            }
         }
     }
 

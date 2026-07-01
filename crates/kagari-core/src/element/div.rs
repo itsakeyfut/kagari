@@ -500,6 +500,9 @@ impl Element for Div {
             .shadow
             .and_then(|step| cx.theme.resolve_shadow(step))
         {
+            // The blur extends beyond the box, so the mask is unbounded — except under a scroll
+            // ancestor, where it is clipped to the visible viewport (identity when unclipped).
+            let shadow_mask = cx.clip_rect(Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4));
             let order = cx.next_order();
             cx.scene.shadows.push(Shadow {
                 bounds,
@@ -512,7 +515,7 @@ impl Element for Div {
                 spread: shadow.spread.0,
                 color: shadow.color,
                 content_mask: RoundedRect {
-                    rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
+                    rect: shadow_mask,
                     radii: Corners::default(),
                 },
                 order,
@@ -529,23 +532,29 @@ impl Element for Div {
             .map(|role| Background::Solid(cx.theme.resolve_color(role)))
             .or_else(|| self.current_bg());
         if let Some(bg) = bg {
-            let order = cx.next_order();
-            cx.scene.quads.push(Quad {
-                bounds,
-                corner_radii,
-                bg,
-                border: Border {
-                    widths: Edges::default(),
-                    color: Color::TRANSPARENT,
-                },
-                content_mask: RoundedRect {
-                    rect: bounds,
-                    radii: corner_radii,
-                },
-                // Painter's order from traversal order: the parent's quad takes a lower order than
-                // its children's primitives, so children draw on top.
-                order,
-            });
+            // Clip the fill to any scroll ancestor (identity when unclipped). A quad the clip fully
+            // culls (empty intersection) is skipped rather than emitted with a zero-area mask —
+            // but only when a clip is active, so an unclipped zero-size div still emits as before.
+            let mask = cx.clip_rect(bounds);
+            if cx.clip().is_none() || !mask.is_empty() {
+                let order = cx.next_order();
+                cx.scene.quads.push(Quad {
+                    bounds,
+                    corner_radii,
+                    bg,
+                    border: Border {
+                        widths: Edges::default(),
+                        color: Color::TRANSPARENT,
+                    },
+                    content_mask: RoundedRect {
+                        rect: mask,
+                        radii: corner_radii,
+                    },
+                    // Painter's order from traversal order: the parent's quad takes a lower order
+                    // than its children's primitives, so children draw on top.
+                    order,
+                });
+            }
         }
         // Record an interactive hit region (#48) before painting children, so children take larger
         // painter orders and sit in front (a child is picked over its parent). A node is recorded when
@@ -561,11 +570,14 @@ impl Element for Div {
         };
         if flags != InteractFlags::default() {
             if let Some(id) = self.id {
+                // Clip the hit region to any scroll ancestor so a scrolled-out node is not picked
+                // (empty clip → `contains` always false). Identity (`= bounds`) when unclipped.
+                let clip = cx.clip_rect(bounds);
                 let order = cx.next_order();
                 cx.record_hit(HitRegion {
                     node: id,
                     bounds,
-                    clip: bounds,
+                    clip,
                     order,
                     flags,
                 });
