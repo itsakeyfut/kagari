@@ -13,6 +13,21 @@ use crate::event::{
     Action, CaptureOp, CursorRegistry, Delivery, FocusRegistry, GestureEvent, HitRegion, HitTest,
     KeyEvent, MouseEvent,
 };
+use crate::overlay::OverlayRegistry;
+
+/// The painter-order base for overlay content (#62): above any realistic main-content primitive
+/// count, so an overlay always composites frontmost. The space above it is partitioned into per-slot
+/// bands so later-registered overlays draw over earlier ones.
+const OVERLAY_ORDER_BASE: u32 = 1 << 28;
+/// The painter-order span reserved per overlay slot (the primitive budget per overlay before bands
+/// would touch). Saturating arithmetic keeps extreme slot counts from panicking.
+const OVERLAY_SLOT_STRIDE: u32 = 1 << 16;
+
+/// One overlay's active painter-order namespace: `base` from its z-slot + a running `counter`.
+struct OverlayOrderState {
+    base: u32,
+    counter: u32,
+}
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
 /// paint prop's effect calls [`DamageSink::mark_paint_dirty`]); #35 implements the real
@@ -74,6 +89,13 @@ pub struct PaintCx<'a> {
     /// area (nested scrolls intersect). `None` is the default — Div/Text then emit unclipped, so
     /// non-scrolled output is unchanged.
     clip: Option<Rect>,
+    /// The frame's overlay registry (#62), if attached: an [`Overlay`](super::Overlay) registers into
+    /// it during paint. `None` skips registration (GPU-free tests without overlays).
+    overlay: Option<&'a mut OverlayRegistry>,
+    /// The active overlay painter-order namespaces (a stack for nested overlays). Empty = main
+    /// content; the top entry's high-order band is used by [`next_order`](Self::next_order) so an
+    /// overlay's subtree composites frontmost.
+    overlay_orders: Vec<OverlayOrderState>,
 }
 
 impl<'a> PaintCx<'a> {
@@ -95,7 +117,39 @@ impl<'a> PaintCx<'a> {
             theme,
             next_order: 0,
             clip: None,
+            overlay: None,
+            overlay_orders: Vec::new(),
         }
+    }
+
+    /// Attaches the frame's overlay registry (`render_tree` sets this): [`Overlay`](super::Overlay)
+    /// nodes register into it during the paint walk.
+    pub(crate) fn attach_overlay(&mut self, registry: &'a mut OverlayRegistry) {
+        self.overlay = Some(registry);
+    }
+
+    /// Registers an overlay node at `bounds` into the attached registry, returning its z-slot
+    /// (registration order), or `None` when no registry is attached (a lone overlay then falls back
+    /// to slot 0 — still frontmost, just no cross-overlay ordering).
+    pub(crate) fn overlay_register(&mut self, node: NodeId, bounds: Rect) -> Option<usize> {
+        self.overlay
+            .as_deref_mut()
+            .map(|reg| reg.register(node, bounds))
+    }
+
+    /// Enters an overlay's high painter-order band for `slot` (registration order): subsequent
+    /// [`next_order`](Self::next_order) values sort above all main content and above lower-slot
+    /// overlays. Nesting pushes a stack; pair with [`exit_overlay`](Self::exit_overlay).
+    pub(crate) fn enter_overlay(&mut self, slot: usize) {
+        let base =
+            OVERLAY_ORDER_BASE.saturating_add((slot as u32).saturating_mul(OVERLAY_SLOT_STRIDE));
+        self.overlay_orders
+            .push(OverlayOrderState { base, counter: 0 });
+    }
+
+    /// Leaves the current overlay order band, restoring the enclosing one (or the main counter).
+    pub(crate) fn exit_overlay(&mut self) {
+        self.overlay_orders.pop();
     }
 
     /// The active clip rect, or `None` when unclipped. Text glyphs read this to mask themselves to a
@@ -129,11 +183,29 @@ impl<'a> PaintCx<'a> {
         self.clip = clip;
     }
 
-    /// Returns the next painter's-order value (incrementing the counter).
+    /// Returns the next painter's-order value. Inside an overlay (`enter_overlay`) it draws from that
+    /// overlay's high-order band so the overlay composites frontmost; otherwise from the main
+    /// monotonic counter.
     pub fn next_order(&mut self) -> u32 {
-        let order = self.next_order;
-        self.next_order += 1;
-        order
+        match self.overlay_orders.last_mut() {
+            Some(oo) => {
+                // Each overlay owns a STRIDE-wide band; exceeding it would bleed into the next slot's
+                // band (z-collision, no panic — saturating). Realistic overlays (menus/tooltips) are
+                // far under the budget, so this only guards a pathological subtree in debug builds.
+                debug_assert!(
+                    oo.counter < OVERLAY_SLOT_STRIDE,
+                    "overlay subtree exceeded its per-slot painter-order budget; z bands may collide"
+                );
+                let order = oo.base.saturating_add(oo.counter);
+                oo.counter = oo.counter.saturating_add(1);
+                order
+            }
+            None => {
+                let order = self.next_order;
+                self.next_order = self.next_order.saturating_add(1);
+                order
+            }
+        }
     }
 
     /// Records an interactive [`HitRegion`] into the hit-test, if one is attached (#48). A no-op

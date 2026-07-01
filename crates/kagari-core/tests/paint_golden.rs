@@ -50,6 +50,7 @@ fn paint_scene(
         &mut text_system,
         Some(renderer.atlas_mut()),
         None, // hit-test recording is exercised by unit tests, not this golden
+        None, // no overlays in this golden
         &mut scene,
         viewport,
         &damage,
