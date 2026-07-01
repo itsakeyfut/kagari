@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::assets::{AssetLoader, checkerboard};
-use crate::atlas::Atlas;
+use crate::atlas::{Atlas, AtlasCoord};
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
 use crate::polychrome::PolychromeRenderer;
@@ -12,6 +12,7 @@ use crate::quad::QuadRenderer;
 use crate::scene::{Batch, PrimitiveKind, Scene};
 use crate::shadow::ShadowRenderer;
 use crate::sprite::SpriteRenderer;
+use crate::svg::{IconId, icon_key, rasterize_icon};
 use crate::underline::UnderlineRenderer;
 
 /// Owns the GPU resources for one window's rendering. The device/queue are shared
@@ -143,6 +144,38 @@ impl Renderer {
     /// drains finished decodes into the RGBA atlas at the start of each `render`.
     pub fn assets_mut(&mut self) -> &mut AssetLoader {
         &mut self.assets
+    }
+
+    /// The atlas coord for a bundled icon (#57) rasterized at `px` (logical size × scale_factor).
+    /// Glyph-style: rasterized synchronously into the RGBA atlas on a cache miss and cached by
+    /// `(icon, px)`, so the icon is available the frame it is requested; a different `px` re-rasterizes
+    /// crisply. The icon is monochrome white — tint it via the `PolychromeSprite::tint`. A rasterization
+    /// failure (not expected for a bundled icon) degrades to a transparent tile, never panics.
+    pub fn icon_coord(&mut self, icon: IconId, px: u32) -> AtlasCoord {
+        let key = icon_key(icon, px);
+        let coord = self.rgba_atlas.get_or_insert(key, (px, px), || {
+            rasterize_icon(icon, px)
+                .map(|d| d.rgba)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        ?error,
+                        ?icon,
+                        px,
+                        "icon rasterization failed; using transparent tile"
+                    );
+                    vec![0u8; (px as usize) * (px as usize) * 4]
+                })
+        });
+        // An icon larger than the atlas layer is skipped (degenerate coord) → it would draw nothing.
+        // Icons are small so this is out of normal range, but surface it rather than fail silently (RK-017).
+        if coord.max == [0.0, 0.0] {
+            tracing::warn!(
+                ?icon,
+                px,
+                "icon px exceeds the atlas layer; the icon will be blank"
+            );
+        }
+        coord
     }
 
     /// Render one frame: draw the scene's quads into the offscreen linear target,
