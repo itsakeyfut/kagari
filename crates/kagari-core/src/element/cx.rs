@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::{NodeId, Rect};
+use kagari_base::{NodeId, Rect, Size};
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
@@ -96,6 +96,9 @@ pub struct PaintCx<'a> {
     /// content; the top entry's high-order band is used by [`next_order`](Self::next_order) so an
     /// overlay's subtree composites frontmost.
     overlay_orders: Vec<OverlayOrderState>,
+    /// The window viewport size (logical px), for anchored overlay auto-flip / on-screen clamping
+    /// (#175). Set by `render_tree`; default zero (unused unless an overlay is anchored).
+    viewport: Size,
 }
 
 impl<'a> PaintCx<'a> {
@@ -119,7 +122,18 @@ impl<'a> PaintCx<'a> {
             clip: None,
             overlay: None,
             overlay_orders: Vec::new(),
+            viewport: Size { w: 0.0, h: 0.0 },
         }
+    }
+
+    /// Sets the window viewport size for anchored-overlay placement (#175); `render_tree` calls this.
+    pub(crate) fn set_viewport(&mut self, viewport: Size) {
+        self.viewport = viewport;
+    }
+
+    /// The window viewport size (for anchored overlay auto-flip / clamping).
+    pub(crate) fn viewport(&self) -> Size {
+        self.viewport
     }
 
     /// Attaches the frame's overlay registry (`render_tree` sets this): [`Overlay`](super::Overlay)

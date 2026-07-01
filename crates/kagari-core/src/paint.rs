@@ -80,6 +80,7 @@ pub fn render_tree(
         reg.clear();
     }
     let mut paint_cx = PaintCx::new(scene, layout, text, atlas, hit_test, theme);
+    paint_cx.set_viewport(viewport);
     if let Some(reg) = overlay {
         paint_cx.attach_overlay(reg);
     }
