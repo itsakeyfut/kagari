@@ -1,6 +1,8 @@
-//! Scroll geometry (#60): pure offset / clip / overlay-thumb math, shared by the core `Scroll`
-//! element and (later) the #61 virtualized container's visible-range calc. Element/GPU-free — just
-//! value types, so it is unit-testable in isolation.
+//! Scroll geometry (#60): pure offset / clip / overlay-thumb math plus the fixed-size
+//! visible-range calc (#61). Shared by the core `Scroll` and `VirtualizedList` elements.
+//! Element/GPU-free — just value types, so it is unit-testable in isolation.
+
+use std::ops::Range;
 
 use kagari_base::{Point, Size};
 
@@ -54,6 +56,31 @@ pub fn thumb(viewport: f32, content: f32, offset: f32, track: f32) -> Option<(f3
     Some((pos, len))
 }
 
+/// The half-open index range `[start, end)` of fixed-height rows intersecting the viewport (#61),
+/// widened by `buffer` rows each side and clamped to `0..=count`. `start = floor(offset_y / h)`,
+/// `end = ceil((offset_y + viewport_h) / h)`. An over-scrolled or negative offset yields an empty or
+/// tail range rather than an out-of-bounds one; a zero item height or empty list yields `0..0`.
+pub fn visible_range(
+    offset_y: f32,
+    viewport_h: f32,
+    item_height: f32,
+    count: usize,
+    buffer: usize,
+) -> Range<usize> {
+    if item_height <= 0.0 || count == 0 {
+        return 0..0;
+    }
+    let first = (offset_y / item_height).floor();
+    let last = ((offset_y + viewport_h.max(0.0)) / item_height).ceil();
+    // `f32 as usize` saturates (negative → 0, huge → usize::MAX) in Rust, so the clamps below are
+    // safe against extreme offsets.
+    let first = if first > 0.0 { first as usize } else { 0 };
+    let last = if last > 0.0 { last as usize } else { 0 };
+    let start = first.saturating_sub(buffer).min(count);
+    let end = last.saturating_add(buffer).min(count);
+    start..end.max(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +125,32 @@ mod tests {
             thumb(100.0, 100.0, 0.0, 100.0).is_none(),
             "content equal to the viewport shows no thumb"
         );
+    }
+
+    #[test]
+    fn visible_range_should_cover_viewport_with_buffer() {
+        // A 100 viewport of 20px rows shows 5 rows (0..5); the ±2 buffer widens it, clamped at the
+        // top to 0. offset 0 → floor 0, ceil(100/20)=5 → 0.saturating_sub(2)=0 .. 5+2=7.
+        assert_eq!(visible_range(0.0, 100.0, 20.0, 1000, 2), 0..7);
+    }
+
+    #[test]
+    fn visible_range_should_offset_the_window() {
+        // offset 200 → first = floor(200/20)=10, last = ceil(300/20)=15; ±2 buffer → 8..17.
+        assert_eq!(visible_range(200.0, 100.0, 20.0, 1000, 2), 8..17);
+    }
+
+    #[test]
+    fn visible_range_should_clamp_to_count() {
+        // Near the end of a 1000-row list, `end` clamps to `count` (no out-of-bounds index).
+        // offset 19980 → first=999, last=ceil(20080/20)=1004; start=997, end=1004→1000.
+        assert_eq!(visible_range(19980.0, 100.0, 20.0, 1000, 2), 997..1000);
+    }
+
+    #[test]
+    fn visible_range_should_be_empty_for_zero_items() {
+        assert_eq!(visible_range(0.0, 100.0, 20.0, 0, 2), 0..0);
+        // A zero item height is degenerate (no O(1) math) → empty, not a divide-by-zero.
+        assert_eq!(visible_range(0.0, 100.0, 0.0, 1000, 2), 0..0);
     }
 }
