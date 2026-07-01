@@ -16,6 +16,8 @@ etagere = { workspace = true }
 image = { workspace = true }
 # SVG parse + rasterization for named icons (#57); bundles usvg + tiny_skia.
 resvg = { workspace = true }
+# Path tessellation (fill/stroke → triangles) for the Path primitive (#58).
+lyon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -9,6 +9,7 @@ mod assets;
 mod atlas;
 mod color;
 pub mod error;
+mod path;
 mod polychrome;
 mod quad;
 pub mod renderer;
@@ -21,9 +22,10 @@ mod underline;
 pub use assets::{AssetId, AssetLoader, AssetSource, LoadState};
 pub use atlas::{Atlas, AtlasCoord};
 pub use error::RenderError;
+pub use path::PathBuilder;
 pub use renderer::Renderer;
 pub use scene::{
-    Background, Batch, Border, MonochromeSprite, PolychromeSprite, PrimitiveKind, Quad,
+    Background, Batch, Border, MonochromeSprite, PathPrim, PolychromeSprite, PrimitiveKind, Quad,
     RoundedRect, Scene, Shadow, Underline, UnderlineStyle,
 };
 pub use svg::IconId;
