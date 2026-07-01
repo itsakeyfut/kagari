@@ -11,7 +11,7 @@
 use std::any::{Any, TypeId};
 use std::path::PathBuf;
 
-use crate::element::EventCx;
+use crate::element::{AnyElement, EventCx, IntoElement};
 
 /// A type-erased drag payload — any `'static` value can be one. `as_any` gives a borrow for a
 /// non-consuming type check; `into_any` moves the value out of its box for a consuming downcast to
@@ -36,9 +36,11 @@ impl<T: Any> DragPayload for T {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDrop(pub Vec<PathBuf>);
 
-/// A drag source: produces a fresh boxed [`DragPayload`] when a drag begins.
+/// A drag source: produces a fresh boxed [`DragPayload`] when a drag begins, and optionally a
+/// drag-image element to float under the cursor while the drag is active (#172).
 pub struct DragSource {
     produce: Box<dyn FnMut() -> Box<dyn DragPayload>>,
+    make_drag_image: Option<Box<dyn FnMut() -> AnyElement>>,
 }
 
 impl DragSource {
@@ -46,12 +48,30 @@ impl DragSource {
     pub fn new<P: DragPayload>(mut produce: impl FnMut() -> P + 'static) -> Self {
         Self {
             produce: Box::new(move || Box::new(produce())),
+            make_drag_image: None,
         }
+    }
+
+    /// Attaches a drag-image element factory (#172): while a drag from this source is active, the live
+    /// drag flow (deferred) mounts the produced element as a cursor-tracked overlay. Builder form of
+    /// the DnD model; `Div::drag_image` is the element-level surface.
+    pub fn with_drag_image<E: IntoElement>(
+        mut self,
+        mut factory: impl FnMut() -> E + 'static,
+    ) -> Self {
+        self.make_drag_image = Some(Box::new(move || factory().into_element()));
+        self
     }
 
     /// Produces a payload for a new drag.
     pub fn payload(&mut self) -> Box<dyn DragPayload> {
         (self.produce)()
+    }
+
+    /// Produces this source's drag-image element, if one was attached (`None` otherwise). Consumed by
+    /// the deferred live drag flow to mount the floating drag-image at the cursor.
+    pub fn drag_image(&mut self) -> Option<AnyElement> {
+        self.make_drag_image.as_mut().map(|f| f())
     }
 }
 
@@ -186,6 +206,22 @@ mod tests {
             *got.borrow(),
             Some(42),
             "the source's payload reaches the target"
+        );
+    }
+
+    #[test]
+    fn drag_source_should_produce_drag_image() {
+        use crate::element::div;
+        // A source with an attached drag-image produces the element; one without yields None (#172).
+        let mut with = DragSource::new(|| Foo(1)).with_drag_image(div);
+        assert!(
+            with.drag_image().is_some(),
+            "a source with a drag-image produces it"
+        );
+        let mut without = DragSource::new(|| Foo(1));
+        assert!(
+            without.drag_image().is_none(),
+            "a source without a drag-image yields None"
         );
     }
 

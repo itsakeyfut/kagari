@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use kagari_base::{NodeId, Point, Rect, Size};
 use kagari_layout::{Display, LayoutStyle};
 
-use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
+use crate::reactive::{Prop, create_effect};
 
 /// An anchored overlay's side preference relative to its anchor element (#175).
 ///
@@ -85,21 +86,29 @@ impl AnchorHandle {
     }
 }
 
-/// Where an overlay's content is placed: an absolute window point, or anchored to an element.
+/// Where an overlay's content is placed: an absolute window point (from the reactive `position` prop),
+/// or anchored to an element.
 enum OverlayPlacement {
-    Absolute(Point),
+    /// An absolute window point, resolved from the [`Overlay::position`] prop into `resolved_position`.
+    Absolute,
     Anchored {
         anchor: AnchorHandle,
         placement: Placement,
     },
 }
 
-/// A portal overlay: its `child` is deferred-drawn at an absolute window `position`, above all
-/// normal content and clipped only to itself (escaping a parent clip / scroll). Built with
-/// [`overlay`]. Its own node takes no space in normal flow.
+/// A portal overlay: its `child` is deferred-drawn at an absolute window `position` (static or
+/// reactive — a reactive point lets it follow the cursor, e.g. a drag-image, #172), above all normal
+/// content and clipped only to itself (escaping a parent clip / scroll). Built with [`overlay`]. Its
+/// own node takes no space in normal flow.
 pub struct Overlay {
     child: Option<AnyElement>,
     placement: OverlayPlacement,
+    /// The absolute-placement position prop (static or reactive); taken + bound at build.
+    position: Option<Prop<Point>>,
+    /// Resolved absolute position: written by the bound effect (or once, for a static prop), read by
+    /// `paint`. Shared + `'static` so the effect can own a handle (mirrors `Scroll`'s `resolved_offset`).
+    resolved_position: Arc<Mutex<Option<Point>>>,
     id: Option<NodeId>,
     child_id: Option<NodeId>,
 }
@@ -109,16 +118,21 @@ pub struct Overlay {
 pub fn overlay(child: impl IntoElement) -> Overlay {
     Overlay {
         child: Some(child.into_element()),
-        placement: OverlayPlacement::Absolute(Point::new(0.0, 0.0)),
+        placement: OverlayPlacement::Absolute,
+        position: None,
+        resolved_position: Arc::new(Mutex::new(None)),
         id: None,
         child_id: None,
     }
 }
 
 impl Overlay {
-    /// Places the overlay content at an absolute window position (top-left).
-    pub fn position(mut self, position: Point) -> Self {
-        self.placement = OverlayPlacement::Absolute(position);
+    /// Places the overlay content at an absolute window position (top-left). Accepts a static
+    /// [`Point`] or a reactive point ([`rx`](crate::reactive::rx)/handle) — a reactive position lets
+    /// the overlay follow a moving point, e.g. a drag-image tracking the cursor (#172).
+    pub fn position(mut self, position: impl Into<Prop<Point>>) -> Self {
+        self.position = Some(position.into());
+        self.placement = OverlayPlacement::Absolute;
         self
     }
 
@@ -130,7 +144,47 @@ impl Overlay {
             anchor: anchor.clone(),
             placement,
         };
+        self.position = None;
         self
+    }
+
+    /// Resolves the reactive `position` prop into `resolved_position` (the absolute-placement analogue
+    /// of `Scroll`'s `bind_offset`). A static prop writes the cell once; a reactive prop registers a
+    /// synchronous effect (ADR 0001) that re-resolves and — only when the value changed — writes the
+    /// cell and flags **paint**-damage for `id`, so a moving position (a drag-image tracking the
+    /// cursor) repaints. Registered once at build; re-fires on external signal writes (RK-009).
+    fn bind_position(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.position.take() {
+            Some(Prop::Static(p)) => self.store_position(p),
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_position);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let p = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != Some(p) {
+                            *slot = Some(p);
+                            damage.mark_paint_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn store_position(&self, p: Point) {
+        if let Ok(mut slot) = self.resolved_position.lock() {
+            *slot = Some(p);
+        }
+    }
+
+    fn current_position(&self) -> Point {
+        self.resolved_position
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(Point::new(0.0, 0.0))
     }
 }
 
@@ -153,6 +207,7 @@ impl Element for Overlay {
                         ..LayoutStyle::default()
                     },
                 );
+                self.bind_position(&cx.damage, id);
                 id
             }
         };
@@ -174,14 +229,15 @@ impl Element for Overlay {
     fn paint(&mut self, _bounds: Rect, cx: &mut PaintCx) {
         // The overlay ignores its zero-size in-flow `bounds` and paints its child at the resolved
         // window position, deferred to the top painter-order and escaping any parent clip.
-        let (Some(child), Some(child_id)) = (self.child.as_mut(), self.child_id) else {
+        let Some(child_id) = self.child_id else {
             return;
         };
         let overlay_size = cx.layout.layout(child_id).size;
-        // Resolve the origin: an absolute point, or anchored to a target element's absolute bounds
-        // (auto-flip / on-screen clamp against the viewport). An unbound anchor falls back to (0, 0).
+        // Resolve the origin (immutable `&self`) BEFORE taking the child's `&mut` borrow: an absolute
+        // point (static or reactive, e.g. a cursor-tracked drag-image), or anchored to a target
+        // element's absolute bounds (auto-flip / on-screen clamp). An unbound anchor falls back to (0, 0).
         let origin = match &self.placement {
-            OverlayPlacement::Absolute(p) => *p,
+            OverlayPlacement::Absolute => self.current_position(),
             OverlayPlacement::Anchored { anchor, placement } => match anchor.node_id() {
                 Some(anchor_id) => resolve_placement(
                     cx.layout.absolute_layout(anchor_id),
@@ -191,6 +247,9 @@ impl Element for Overlay {
                 ),
                 None => Point::new(0.0, 0.0),
             },
+        };
+        let Some(child) = self.child.as_mut() else {
+            return;
         };
         let child_bounds = Rect {
             origin,
@@ -576,6 +635,157 @@ mod tests {
             1,
             "render_tree clears the registry each frame (no accumulation)"
         );
+    }
+
+    #[test]
+    fn overlay_position_should_follow_reactive_point() {
+        use crate::damage::DamageState;
+        use crate::paint::render_tree;
+        use crate::reactive::prelude::*;
+        use crate::reactive::{RwSignal, rx};
+        use reactive_graph::owner::Owner;
+
+        // A reactive-position overlay (the drag-image substrate, #172): as the cursor signal moves,
+        // the overlay repaints at the new point. Synchronous effect → hang-free (RK-005); the owner is
+        // held to the end (RK-003/008); the write is serial with the frame loop (RK-009).
+        let owner = Owner::new();
+        owner.set();
+
+        let cursor = RwSignal::new(Point::new(10.0, 20.0));
+        let mut root = div()
+            .child(
+                overlay(div().size(Size { w: 30.0, h: 30.0 }).background(green()))
+                    .position(rx(move || cursor.get())),
+            )
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut reg = OverlayRegistry::new();
+        let damage = std::sync::Arc::new(DamageState::default());
+        let theme = Theme::default();
+        let viewport = Size { w: 200.0, h: 200.0 };
+
+        // Frame 1: the overlay paints at the initial cursor (10, 20), in the high overlay band.
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            Some(&mut reg),
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        let front = scene
+            .quads
+            .iter()
+            .find(|q| q.order >= 1 << 28)
+            .expect("the overlay draws in the high band");
+        assert_eq!(
+            front.bounds.origin,
+            Point::new(10.0, 20.0),
+            "the overlay paints at the initial cursor"
+        );
+
+        // Move the cursor between frames: the bound effect re-resolves the position + flags damage.
+        cursor.set(Point::new(120.0, 90.0));
+        assert!(damage.is_dirty(), "moving the cursor flags paint-damage");
+
+        // Frame 2: the overlay follows the cursor to (120, 90) — paint-only, no relayout.
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            Some(&mut reg),
+            &mut scene,
+            viewport,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+        let front = scene
+            .quads
+            .iter()
+            .find(|q| q.order >= 1 << 28)
+            .expect("the overlay draws in the high band");
+        assert_eq!(
+            front.bounds.origin,
+            Point::new(120.0, 90.0),
+            "the overlay follows the cursor to its new point"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn overlay_reactive_position_effect_should_dispose_on_unmount() {
+        use crate::reactive::prelude::*;
+        use crate::reactive::{Owner, RwSignal, rx};
+
+        // A drag-image is mounted via dyn_if under a per-child owner; unmounting it (drop/cancel) must
+        // dispose its cursor-tracking position effect, so a removed drag-image leaves no effect writing
+        // to a dead node (RK-005/006). Synchronous effect → hang-free (RK-005).
+        let owner = Owner::new();
+        owner.set();
+
+        let cursor = RwSignal::new(Point::new(10.0, 20.0));
+        let theme = Theme::default();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: std::sync::Arc<dyn DamageSink> = std::sync::Arc::new(NoopDamage);
+
+        // Mount under a child owner (as dyn_if does for a conditionally-mounted drag-image).
+        let child_owner = owner.child();
+        let ov = child_owner.with(|| {
+            let mut ov =
+                overlay(div().size(Size { w: 20.0, h: 20.0 })).position(rx(move || cursor.get()));
+            ov.request_layout(&mut LayoutCx {
+                arena: &mut arena,
+                layout: &mut layout,
+                text: &mut text,
+                damage: std::sync::Arc::clone(&damage),
+                theme: &theme,
+                focus: None,
+                cursor: None,
+            });
+            ov
+        });
+
+        // Present: the effect resolved the initial cursor, and follows a live write while mounted.
+        assert_eq!(
+            ov.current_position(),
+            Point::new(10.0, 20.0),
+            "resolved to the initial cursor"
+        );
+        cursor.set(Point::new(50.0, 60.0));
+        assert_eq!(
+            ov.current_position(),
+            Point::new(50.0, 60.0),
+            "the live effect follows the cursor while mounted"
+        );
+
+        // Unmount: disposing the child owner drops the position effect, so later writes are inert.
+        child_owner.cleanup();
+        cursor.set(Point::new(90.0, 90.0));
+        assert_eq!(
+            ov.current_position(),
+            Point::new(50.0, 60.0),
+            "after unmount the disposed effect ignores cursor writes (no dangling update)"
+        );
+
+        drop(owner);
     }
 
     #[test]
