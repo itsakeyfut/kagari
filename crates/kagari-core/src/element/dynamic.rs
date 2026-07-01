@@ -81,6 +81,17 @@ where
         self.dirty.load(Ordering::SeqCst)
     }
 
+    /// The realized keyed children, for a virtualizing parent ([`VirtualizedList`](super::VirtualizedList))
+    /// to paint at custom offset-based positions — bypassing the taffy-driven [`Element::paint`].
+    /// Yields `(key, node_id, element)` in realized order; the child `Owner` is elided.
+    pub(crate) fn realized_children(
+        &mut self,
+    ) -> impl Iterator<Item = (&K, NodeId, &mut AnyElement)> {
+        self.children
+            .iter_mut()
+            .map(|(k, id, _, el)| (&*k, *id, el))
+    }
+
     /// Applies the staged items: a keyed diff against the current children. New keys are built
     /// under a fresh child [`Owner`]; gone keys have their owner cleaned up (disposing their
     /// effects) and their node removed; existing keys keep their node, owner, and element.
