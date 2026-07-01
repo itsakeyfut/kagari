@@ -8,11 +8,13 @@
 
 pub mod error;
 pub mod measure;
+pub mod scroll;
 pub mod style;
 pub mod tree;
 
 pub use error::LayoutError;
 pub use measure::{AvailableSize, MeasureFn};
+pub use scroll::ScrollState;
 pub use style::{
     AlignItems, Display, FlexDirection, FlexWrap, JustifyContent, LayoutStyle, Overflow,
 };

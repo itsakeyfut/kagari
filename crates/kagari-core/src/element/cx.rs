@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::NodeId;
+use kagari_base::{NodeId, Rect};
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
@@ -69,10 +69,15 @@ pub struct PaintCx<'a> {
     /// Monotonic painter's-order counter: each emitted primitive group takes the next value, so
     /// primitives draw back-to-front in tree-traversal order (parent before its children).
     next_order: u32,
+    /// The active clip rect (absolute), or `None` when unclipped. A [`Scroll`](super::Scroll) pushes
+    /// its viewport bounds here so descendants' primitives and hit regions are masked to the visible
+    /// area (nested scrolls intersect). `None` is the default — Div/Text then emit unclipped, so
+    /// non-scrolled output is unchanged.
+    clip: Option<Rect>,
 }
 
 impl<'a> PaintCx<'a> {
-    /// Creates a paint context with the painter's-order counter at zero.
+    /// Creates a paint context with the painter's-order counter at zero and no clip.
     pub fn new(
         scene: &'a mut Scene,
         layout: &'a LayoutTree,
@@ -89,7 +94,39 @@ impl<'a> PaintCx<'a> {
             hit_test,
             theme,
             next_order: 0,
+            clip: None,
         }
+    }
+
+    /// The active clip rect, or `None` when unclipped. Text glyphs read this to mask themselves to a
+    /// scroll viewport.
+    pub(crate) fn clip(&self) -> Option<Rect> {
+        self.clip
+    }
+
+    /// Intersects `rect` with the active clip — the identity when unclipped. An empty result means
+    /// `rect` is fully clipped away (the caller should then skip emitting the primitive).
+    pub(crate) fn clip_rect(&self, rect: Rect) -> Rect {
+        match self.clip {
+            None => rect,
+            Some(c) => rect.intersect(c).unwrap_or_default(),
+        }
+    }
+
+    /// Pushes an absolute clip, intersecting it with any active clip, and returns the previous clip
+    /// so a later [`set_clip`](Self::set_clip) restores it (a scroll wraps its child paint in this).
+    pub(crate) fn push_clip(&mut self, rect: Rect) -> Option<Rect> {
+        let prev = self.clip;
+        self.clip = Some(match prev {
+            None => rect,
+            Some(c) => c.intersect(rect).unwrap_or_default(),
+        });
+        prev
+    }
+
+    /// Restores a clip saved by [`push_clip`](Self::push_clip).
+    pub(crate) fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
     }
 
     /// Returns the next painter's-order value (incrementing the counter).
