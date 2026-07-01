@@ -388,7 +388,7 @@ impl Div {
     /// theme. size/margin tokens are not applied yet (LayoutStyle's `size` is a paired value and
     /// `margin` is not mapped to taffy — a follow-up).
     fn effective_layout(&self, theme: &Theme) -> LayoutStyle {
-        let mut ls = self.layout;
+        let mut ls = self.layout.clone();
         // The reactive/static fixed size (#146) is resolved into a shared cell; overlay it so a
         // changed reactive size flows into the `LayoutStyle` the dedup `set_style` compares.
         if let Some(size) = self.current_size() {
@@ -469,7 +469,8 @@ impl Element for Div {
         // layout tokens would stay stale after a reskin (paint tokens already re-resolve per frame).
         // The dedup keeps idle frames from re-marking taffy dirty.
         let resolved = self.effective_layout(cx.theme);
-        if self.applied_layout != Some(resolved) {
+        // `LayoutStyle` is no longer `Copy`; compare by ref so `resolved` can then be stored.
+        if self.applied_layout.as_ref() != Some(&resolved) {
             cx.layout.set_style(id, &resolved);
             self.applied_layout = Some(resolved);
         }

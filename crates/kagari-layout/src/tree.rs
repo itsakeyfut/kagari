@@ -202,7 +202,7 @@ fn definite(space: AvailableSpace) -> Option<f32> {
 mod tests {
     use super::*;
     use crate::measure::AvailableSize;
-    use crate::style::{FlexDirection, LayoutStyle};
+    use crate::style::{Display, FlexDirection, GridLine, GridPlacement, LayoutStyle, TrackSizing};
     use kagari_base::Size;
 
     fn node(raw: u64) -> NodeId {
@@ -377,6 +377,94 @@ mod tests {
         let abs = tree.absolute_layout(child);
         assert_eq!(abs.origin.y, 30.0, "absolute y sums the container's origin");
         assert_eq!(abs.size.w, 20.0, "absolute bounds keep the node's own size");
+    }
+
+    #[test]
+    fn grid_template_should_place_children_in_cells() {
+        // A 2x2 grid: two 50px columns and two 40px rows (100x80). Four default children auto-flow
+        // (Row) into the cells and stretch to fill them: (0,0), (50,0), (0,40), (50,40).
+        let mut tree = LayoutTree::new();
+        let root = node(1);
+        let cells = [node(2), node(3), node(4), node(5)];
+        tree.insert(root, None);
+        for &c in &cells {
+            tree.insert(c, Some(root));
+        }
+        tree.set_style(
+            root,
+            &LayoutStyle {
+                display: Display::Grid,
+                grid_template_columns: vec![TrackSizing::Px(50.0), TrackSizing::Px(50.0)],
+                grid_template_rows: vec![TrackSizing::Px(40.0), TrackSizing::Px(40.0)],
+                size: Some(Size { w: 100.0, h: 80.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        for &c in &cells {
+            tree.set_style(c, &LayoutStyle::default());
+        }
+        tree.compute(root, Size { w: 100.0, h: 80.0 }).unwrap();
+
+        let origins: Vec<(f32, f32)> = cells
+            .iter()
+            .map(|&c| {
+                let r = tree.layout(c);
+                (r.origin.x, r.origin.y)
+            })
+            .collect();
+        assert_eq!(
+            origins,
+            vec![(0.0, 0.0), (50.0, 0.0), (0.0, 40.0), (50.0, 40.0)],
+            "four children auto-flow row-by-row into the 2x2 cells"
+        );
+        assert_eq!(
+            tree.layout(cells[0]).size,
+            Size { w: 50.0, h: 40.0 },
+            "a cell child stretches to the column/row track size"
+        );
+    }
+
+    #[test]
+    fn grid_placement_should_position_item_by_line() {
+        // The same 2x2 grid, with one item explicitly placed at column line 2 / row line 2 — the
+        // bottom-right cell — independent of auto-flow.
+        let mut tree = LayoutTree::new();
+        let root = node(1);
+        let item = node(2);
+        tree.insert(root, None);
+        tree.insert(item, Some(root));
+        tree.set_style(
+            root,
+            &LayoutStyle {
+                display: Display::Grid,
+                grid_template_columns: vec![TrackSizing::Px(50.0), TrackSizing::Px(50.0)],
+                grid_template_rows: vec![TrackSizing::Px(40.0), TrackSizing::Px(40.0)],
+                size: Some(Size { w: 100.0, h: 80.0 }),
+                ..LayoutStyle::default()
+            },
+        );
+        tree.set_style(
+            item,
+            &LayoutStyle {
+                grid_column: GridLine {
+                    start: GridPlacement::Line(2),
+                    end: GridPlacement::Auto,
+                },
+                grid_row: GridLine {
+                    start: GridPlacement::Line(2),
+                    end: GridPlacement::Auto,
+                },
+                ..LayoutStyle::default()
+            },
+        );
+        tree.compute(root, Size { w: 100.0, h: 80.0 }).unwrap();
+
+        let r = tree.layout(item);
+        assert_eq!(
+            (r.origin.x, r.origin.y),
+            (50.0, 40.0),
+            "column line 2 / row line 2 places the item in the bottom-right cell"
+        );
     }
 
     #[test]
