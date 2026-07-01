@@ -277,6 +277,16 @@ impl Div {
         self
     }
 
+    /// Attaches a drag-image to this node's drag source (#172): while a drag from here is active, the
+    /// live drag flow (deferred) mounts `image` as a cursor-tracked overlay above all content. Call
+    /// after [`drag_source`](Self::drag_source); a no-op if no drag source is set.
+    pub fn drag_image<E: IntoElement>(mut self, image: impl FnMut() -> E + 'static) -> Self {
+        if let Some(source) = self.drag_source.take() {
+            self.drag_source = Some(source.with_drag_image(image));
+        }
+        self
+    }
+
     /// Makes this node a drop target (#52) accepting a payload of type `T`: a matching drop runs
     /// `on_drop` with the payload; other types are rejected. While a compatible drag hovers, the
     /// target can highlight (the live hover-feedback signal is wired with the live drag).
@@ -752,6 +762,26 @@ mod tests {
                 v.push(id);
             }
         }
+    }
+
+    #[test]
+    fn div_drag_image_should_attach_to_source() {
+        // `.drag_source().drag_image()` yields a source that produces the drag-image element (#172);
+        // `div` (the fn) is itself an `FnMut() -> Div` factory.
+        let mut d = div().drag_source(|| 7u32).drag_image(div);
+        assert!(
+            d.drag_source
+                .as_mut()
+                .and_then(|s| s.drag_image())
+                .is_some(),
+            "drag_image attaches to the node's drag source"
+        );
+        // Without a drag source first, drag_image is a documented no-op (no source, no panic).
+        let no_source = div().drag_image(div);
+        assert!(
+            no_source.drag_source.is_none(),
+            "drag_image without a drag_source is a no-op"
+        );
     }
 
     #[test]
