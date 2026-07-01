@@ -16,6 +16,7 @@ pub use error::LayoutError;
 pub use measure::{AvailableSize, MeasureFn};
 pub use scroll::ScrollState;
 pub use style::{
-    AlignItems, Display, FlexDirection, FlexWrap, JustifyContent, LayoutStyle, Overflow,
+    AlignItems, Display, FlexDirection, FlexWrap, GridAutoFlow, GridLine, GridPlacement,
+    JustifyContent, LayoutStyle, Overflow, TrackSizing,
 };
 pub use tree::LayoutTree;

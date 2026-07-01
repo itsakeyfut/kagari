@@ -5,8 +5,10 @@
 //! surface is kagari-owned enums and `kagari-base` value types only. The paint-side style
 //! (bg/color tokens) is the styling milestone's concern (/spec Q4).
 //!
-//! Grid: `Display::Grid` maps through to taffy, but explicit grid-template tracks / placement are
-//! a follow-up (keeping `LayoutStyle` `Copy`).
+//! Grid (#142): explicit grid-template tracks ([`TrackSizing`]), per-item placement
+//! ([`GridPlacement`]/[`GridLine`]), and auto-flow ([`GridAutoFlow`]) map onto taffy. `LayoutStyle` is
+//! no longer `Copy` (grid tracks are `Vec`); it is cloned/compared only on the build path (#43 dedup),
+//! never per-frame. MinMax / fit-content / named lines / subgrid are post-MVP.
 
 use kagari_base::{Edges, Px, Size};
 
@@ -74,8 +76,60 @@ pub enum Overflow {
     Scroll,
 }
 
-/// The layout intent of an element. Mapped to a `taffy::Style` by [`LayoutStyle::to_taffy`].
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// A grid track's size (one column or row). Maps onto a `taffy::TrackSizingFunction`. `Fr` is a flex
+/// fraction of the leftover space; a bare `Fr` track has an `auto` minimum (CSS semantics), since a
+/// grid track's minimum cannot itself be flexible. MinMax / fit-content are post-MVP.
+#[derive(Clone, PartialEq, Debug)]
+#[non_exhaustive]
+pub enum TrackSizing {
+    /// A fixed length in logical pixels.
+    Px(f32),
+    /// A fraction of the leftover free space (`fr` units).
+    Fr(f32),
+    /// Sized to fit its content.
+    Auto,
+}
+
+/// Where a grid item is placed along one axis (start or end line). Maps onto a `taffy::GridPlacement`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub enum GridPlacement {
+    /// Auto-placed by the container's [`GridAutoFlow`].
+    #[default]
+    Auto,
+    /// A specific grid line (1-based; negative counts from the end; 0 is treated as `Auto`).
+    Line(i16),
+    /// Span this many tracks from the opposite edge.
+    Span(u16),
+}
+
+/// A grid item's placement on one axis: the `start` and `end` lines. Maps onto a
+/// `taffy::Line<GridPlacement>`. Default is `Auto`/`Auto` (fully auto-placed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct GridLine {
+    pub start: GridPlacement,
+    pub end: GridPlacement,
+}
+
+/// How auto-placed grid items flow into the grid. Maps onto a `taffy::GridAutoFlow`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub enum GridAutoFlow {
+    /// Fill each row in turn, adding rows as needed (the default).
+    #[default]
+    Row,
+    /// Fill each column in turn, adding columns as needed.
+    Column,
+    /// `Row` with the dense back-filling algorithm.
+    RowDense,
+    /// `Column` with the dense back-filling algorithm.
+    ColumnDense,
+}
+
+/// The layout intent of an element. Mapped to a `taffy::Style` by the internal `to_taffy`. Not
+/// `Copy`: grid template tracks are `Vec`s, and the style is copied/compared only on the build path
+/// (`request_layout` + the #43 dedup), never in the per-frame paint loop.
+#[derive(Clone, PartialEq, Debug)]
 pub struct LayoutStyle {
     pub display: Display,
     pub flex_direction: FlexDirection,
@@ -91,6 +145,16 @@ pub struct LayoutStyle {
     pub align_items: Option<AlignItems>,
     pub justify_content: Option<JustifyContent>,
     pub overflow: Overflow,
+    /// Grid container: the column track sizes (empty = no explicit columns).
+    pub grid_template_columns: Vec<TrackSizing>,
+    /// Grid container: the row track sizes (empty = no explicit rows).
+    pub grid_template_rows: Vec<TrackSizing>,
+    /// Grid item: the row placement (start/end lines).
+    pub grid_row: GridLine,
+    /// Grid item: the column placement (start/end lines).
+    pub grid_column: GridLine,
+    /// Grid container: how auto-placed items flow.
+    pub grid_auto_flow: GridAutoFlow,
 }
 
 impl Default for LayoutStyle {
@@ -111,15 +175,20 @@ impl Default for LayoutStyle {
             align_items: None,
             justify_content: None,
             overflow: Overflow::default(),
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_row: GridLine::default(),
+            grid_column: GridLine::default(),
+            grid_auto_flow: GridAutoFlow::default(),
         }
     }
 }
 
 impl LayoutStyle {
     /// Maps this style onto a `taffy::Style`. `..Default::default()` fills the fields kagari does
-    /// not yet expose (grid template, margin, border, inset, …). Takes `self` by value
-    /// (`LayoutStyle` is `Copy`).
-    pub(crate) fn to_taffy(self) -> taffy::Style {
+    /// not yet expose (margin, border, inset, named grid lines, …). Takes `self` by reference
+    /// (`LayoutStyle` is no longer `Copy`).
+    pub(crate) fn to_taffy(&self) -> taffy::Style {
         taffy::Style {
             display: map_display(self.display),
             flex_direction: map_flex_direction(self.flex_direction),
@@ -146,8 +215,64 @@ impl LayoutStyle {
                 x: map_overflow(self.overflow),
                 y: map_overflow(self.overflow),
             },
+            grid_template_columns: self
+                .grid_template_columns
+                .iter()
+                .map(|t| taffy::GridTemplateComponent::Single(map_track(t)))
+                .collect(),
+            grid_template_rows: self
+                .grid_template_rows
+                .iter()
+                .map(|t| taffy::GridTemplateComponent::Single(map_track(t)))
+                .collect(),
+            grid_row: map_grid_line(self.grid_row),
+            grid_column: map_grid_line(self.grid_column),
+            grid_auto_flow: map_grid_auto_flow(self.grid_auto_flow),
             ..taffy::Style::default()
         }
+    }
+}
+
+/// Maps a [`TrackSizing`] onto a `taffy::TrackSizingFunction` (a min/max pair). A bare `Fr` track has
+/// an `auto` minimum (CSS: a track minimum cannot be flexible), the flex fraction being the maximum.
+fn map_track(track: &TrackSizing) -> taffy::TrackSizingFunction {
+    match track {
+        TrackSizing::Px(v) => taffy::MinMax {
+            min: taffy::MinTrackSizingFunction::length(*v),
+            max: taffy::MaxTrackSizingFunction::length(*v),
+        },
+        TrackSizing::Fr(v) => taffy::MinMax {
+            min: taffy::MinTrackSizingFunction::auto(),
+            max: taffy::MaxTrackSizingFunction::fr(*v),
+        },
+        TrackSizing::Auto => taffy::MinMax {
+            min: taffy::MinTrackSizingFunction::auto(),
+            max: taffy::MaxTrackSizingFunction::auto(),
+        },
+    }
+}
+
+fn map_placement(placement: GridPlacement) -> taffy::GridPlacement {
+    match placement {
+        GridPlacement::Auto => taffy::GridPlacement::Auto,
+        GridPlacement::Line(index) => taffy::style_helpers::line(index),
+        GridPlacement::Span(count) => taffy::style_helpers::span(count),
+    }
+}
+
+fn map_grid_line(line: GridLine) -> taffy::Line<taffy::GridPlacement> {
+    taffy::Line {
+        start: map_placement(line.start),
+        end: map_placement(line.end),
+    }
+}
+
+fn map_grid_auto_flow(flow: GridAutoFlow) -> taffy::GridAutoFlow {
+    match flow {
+        GridAutoFlow::Row => taffy::GridAutoFlow::Row,
+        GridAutoFlow::Column => taffy::GridAutoFlow::Column,
+        GridAutoFlow::RowDense => taffy::GridAutoFlow::RowDense,
+        GridAutoFlow::ColumnDense => taffy::GridAutoFlow::ColumnDense,
     }
 }
 
@@ -242,6 +367,42 @@ mod tests {
         assert_eq!(
             taffy_style.justify_content,
             Some(taffy::JustifyContent::SPACE_BETWEEN)
+        );
+    }
+
+    #[test]
+    fn layout_style_should_map_grid_tracks_and_placement_to_taffy() {
+        let style = LayoutStyle {
+            display: Display::Grid,
+            grid_template_columns: vec![TrackSizing::Px(50.0), TrackSizing::Fr(1.0)],
+            grid_template_rows: vec![TrackSizing::Auto],
+            grid_auto_flow: GridAutoFlow::Column,
+            grid_column: GridLine {
+                start: GridPlacement::Line(2),
+                end: GridPlacement::Span(2),
+            },
+            ..LayoutStyle::default()
+        };
+        let taffy_style = style.to_taffy();
+
+        assert_eq!(taffy_style.display, taffy::Display::Grid);
+        assert_eq!(taffy_style.grid_template_columns.len(), 2, "two columns");
+        assert_eq!(taffy_style.grid_template_rows.len(), 1, "one row");
+        assert_eq!(taffy_style.grid_auto_flow, taffy::GridAutoFlow::Column);
+        assert_eq!(
+            taffy_style.grid_column.start,
+            taffy::style_helpers::line::<taffy::GridPlacement>(2),
+            "explicit start line maps"
+        );
+        assert_eq!(
+            taffy_style.grid_column.end,
+            taffy::style_helpers::span::<taffy::GridPlacement>(2),
+            "span end maps"
+        );
+        assert_eq!(
+            taffy_style.grid_row.start,
+            taffy::GridPlacement::Auto,
+            "an unset axis stays auto"
         );
     }
 
