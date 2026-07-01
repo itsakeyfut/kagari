@@ -8,6 +8,7 @@
 
 use std::ops::Range;
 
+use bytemuck::{Pod, Zeroable};
 use kagari_base::{Color, Corners, Edges, Point, Rect};
 
 use crate::atlas::AtlasCoord;
@@ -123,13 +124,57 @@ pub struct Underline {
     pub order: u32,
 }
 
+/// A tessellated path vertex (#58): position + a feather AA pair + a flat premultiplied color and
+/// content-mask. Byte-matched to `path.wgsl`'s `PathVertex` (16×f32 = 64 bytes, no padding → `Pod`).
+///
+/// **Feather AA**: the fragment computes `coverage = clamp(cov_a - abs(cov_b), 0, 1)`, unifying fill and
+/// stroke. A fill sets `cov_a = 1` (interior) / ramps `1→0` across a 1px outline fringe with `cov_b = 0`;
+/// a stroke sets `cov_a = half_width + 0.5` (flat) and `cov_b = signed distance from the centerline`, so
+/// the coverage is solid to the nominal edge and ramps to 0 over the outer ~1px. `color`/mask are flat
+/// (identical on every vertex of a path). All values are logical px / linear premultiplied.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
+pub(crate) struct PathVertex {
+    pub(crate) position: [f32; 2],
+    pub(crate) cov_a: f32,
+    pub(crate) cov_b: f32,
+    pub(crate) color: [f32; 4],
+    pub(crate) mask_offset: [f32; 2],
+    pub(crate) mask_half: [f32; 2],
+    pub(crate) mask_radii: [f32; 4],
+}
+
+/// A resolved path primitive (#58): a tessellated triangle mesh (fill or stroke) with feathered AA, built
+/// by [`PathBuilder`](crate::PathBuilder). `indices` reference `vertices`; both pack into the frame's
+/// shared path vertex/index buffers by the renderer.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PathPrim {
+    pub(crate) vertices: Vec<PathVertex>,
+    pub(crate) indices: Vec<u32>,
+    /// Painter's-order key (CPU-side only — not uploaded to the GPU).
+    pub(crate) order: u32,
+}
+
+impl PathPrim {
+    /// Builds a path prim from tessellated geometry (used by `PathBuilder`).
+    pub(crate) fn new(vertices: Vec<PathVertex>, indices: Vec<u32>, order: u32) -> Self {
+        Self {
+            vertices,
+            indices,
+            order,
+        }
+    }
+}
+
 /// The kind of primitive a batch draws (one pipeline per kind). More kinds are
-/// added alongside their primitives (paths).
+/// added alongside their primitives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum PrimitiveKind {
     Shadow,
     Quad,
+    /// A tessellated fill/stroke path (#58).
+    Path,
     /// A colored-image sprite from the RGBA atlas (#55).
     Image,
     Sprite,
@@ -149,6 +194,7 @@ pub struct Batch {
 pub struct Scene {
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
+    pub paths: Vec<PathPrim>,
     pub images: Vec<PolychromeSprite>,
     pub glyphs: Vec<MonochromeSprite>,
     pub underlines: Vec<Underline>,
@@ -163,6 +209,7 @@ impl Scene {
     pub fn clear(&mut self) {
         self.shadows.clear();
         self.quads.clear();
+        self.paths.clear();
         self.images.clear();
         self.glyphs.clear();
         self.underlines.clear();
@@ -186,21 +233,24 @@ impl Scene {
     pub fn batches_into(&mut self, out: &mut Vec<Batch>) {
         self.shadows.sort_by_key(|s| s.order);
         self.quads.sort_by_key(|q| q.order);
+        self.paths.sort_by_key(|p| p.order);
         self.images.sort_by_key(|i| i.order);
         self.glyphs.sort_by_key(|g| g.order);
         self.underlines.sort_by_key(|u| u.order);
 
         out.clear();
-        let (mut si, mut qi, mut ii, mut gi, mut ui) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut si, mut qi, mut pi, mut ii, mut gi, mut ui) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         loop {
             // Each kind's next head as (order, kind-priority); pick the minimum. The
             // priorities are distinct, so the minimum is unique — equal `order` falls
-            // back to priority (Shadow < Quad < Image < Sprite < Underline).
+            // back to priority (Shadow < Quad < Path < Image < Sprite < Underline).
             let heads = [
                 self.shadows
                     .get(si)
                     .map(|s| (s.order, PrimitiveKind::Shadow)),
                 self.quads.get(qi).map(|q| (q.order, PrimitiveKind::Quad)),
+                self.paths.get(pi).map(|p| (p.order, PrimitiveKind::Path)),
                 self.images.get(ii).map(|i| (i.order, PrimitiveKind::Image)),
                 self.glyphs
                     .get(gi)
@@ -225,6 +275,11 @@ impl Scene {
                 PrimitiveKind::Quad => {
                     let i = qi as u32;
                     qi += 1;
+                    i
+                }
+                PrimitiveKind::Path => {
+                    let i = pi as u32;
+                    pi += 1;
                     i
                 }
                 PrimitiveKind::Image => {
@@ -256,16 +311,17 @@ impl Scene {
     }
 }
 
-/// Painter's-order priority for an equal-`order` tie: Shadow first (behind), then Quad,
-/// then Image, then Sprite (glyphs), then Underline (drawn last), per the renderer's frame
-/// flow — image content draws over its background quad, and text draws over images.
+/// Painter's-order priority for an equal-`order` tie: Shadow first (behind), then Quad, then Path, then
+/// Image, then Sprite (glyphs), then Underline (drawn last), per the renderer's frame flow — shapes draw
+/// over their background quad, image content over shapes, and text over images.
 fn kind_priority(kind: PrimitiveKind) -> u8 {
     match kind {
         PrimitiveKind::Shadow => 0,
         PrimitiveKind::Quad => 1,
-        PrimitiveKind::Image => 2,
-        PrimitiveKind::Sprite => 3,
-        PrimitiveKind::Underline => 4,
+        PrimitiveKind::Path => 2,
+        PrimitiveKind::Image => 3,
+        PrimitiveKind::Sprite => 4,
+        PrimitiveKind::Underline => 5,
     }
 }
 
@@ -481,6 +537,45 @@ mod tests {
                 PrimitiveKind::Quad,
                 PrimitiveKind::Image,
                 PrimitiveKind::Sprite,
+            ]
+        );
+    }
+
+    fn test_path(order: u32) -> PathPrim {
+        // Batching only reads `order`; the geometry is irrelevant here.
+        PathPrim::new(Vec::new(), Vec::new(), order)
+    }
+
+    #[test]
+    fn batches_should_sort_paths_into_painter_order() {
+        let mut scene = Scene::new();
+        scene.paths.push(test_path(3));
+        scene.paths.push(test_path(1));
+        scene.paths.push(test_path(2));
+        let batches = collect_batches(&mut scene);
+        let orders: Vec<u32> = scene.paths.iter().map(|p| p.order).collect();
+        assert_eq!(orders, vec![1, 2, 3]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].range, 0..3);
+        assert_eq!(batches[0].kind, PrimitiveKind::Path);
+    }
+
+    #[test]
+    fn batches_should_draw_path_between_quad_and_image_on_tie() {
+        // Equal order across quad/path/image → Quad, then Path, then Image (kind priority): a shape
+        // draws over its background quad, and image content over the shape.
+        let mut scene = Scene::new();
+        scene.images.push(test_image(5));
+        scene.paths.push(test_path(5));
+        scene.quads.push(test_quad(5));
+        let batches = collect_batches(&mut scene);
+        let kinds: Vec<PrimitiveKind> = batches.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PrimitiveKind::Quad,
+                PrimitiveKind::Path,
+                PrimitiveKind::Image,
             ]
         );
     }

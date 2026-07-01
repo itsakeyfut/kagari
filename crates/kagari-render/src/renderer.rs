@@ -7,6 +7,7 @@ use crate::assets::{AssetLoader, checkerboard};
 use crate::atlas::{Atlas, AtlasCoord};
 use crate::color::{OFFSCREEN_FORMAT, OffscreenTarget, OutputTransform};
 use crate::error::RenderError;
+use crate::path::PathRenderer;
 use crate::polychrome::PolychromeRenderer;
 use crate::quad::QuadRenderer;
 use crate::scene::{Batch, PrimitiveKind, Scene};
@@ -28,6 +29,7 @@ pub struct Renderer {
     output_bind: wgpu::BindGroup,
     shadow: ShadowRenderer,
     quad: QuadRenderer,
+    path: PathRenderer,
     sprite: SpriteRenderer,
     polychrome: PolychromeRenderer,
     underline: UnderlineRenderer,
@@ -101,6 +103,7 @@ impl Renderer {
             },
             placeholder,
         );
+        let path = PathRenderer::new(&device, OFFSCREEN_FORMAT);
         let sprite = SpriteRenderer::new(&device, OFFSCREEN_FORMAT);
         let polychrome = PolychromeRenderer::new(&device, OFFSCREEN_FORMAT);
         let underline = UnderlineRenderer::new(&device, OFFSCREEN_FORMAT);
@@ -116,6 +119,7 @@ impl Renderer {
             output_bind,
             shadow,
             quad,
+            path,
             sprite,
             polychrome,
             underline,
@@ -206,6 +210,8 @@ impl Renderer {
             .prepare(&self.device, &self.queue, scene, size, scale);
         self.quad
             .prepare(&self.device, &self.queue, scene, size, scale);
+        self.path
+            .prepare(&self.device, &self.queue, scene, size, scale);
         self.sprite
             .prepare(&self.device, &self.queue, scene, size, scale);
         self.polychrome
@@ -247,6 +253,7 @@ impl Renderer {
                 match batch.kind {
                     PrimitiveKind::Shadow => self.shadow.draw(&mut pass, batch),
                     PrimitiveKind::Quad => self.quad.draw(&mut pass, batch),
+                    PrimitiveKind::Path => self.path.draw(&mut pass, batch),
                     PrimitiveKind::Image => {
                         self.polychrome
                             .draw(&mut pass, batch, &self.rgba_atlas_bind)
@@ -292,6 +299,7 @@ impl Renderer {
         self.output_bind = self.output.bind(&self.device, &self.offscreen.view);
         self.shadow = ShadowRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.quad = QuadRenderer::new(&self.device, OFFSCREEN_FORMAT);
+        self.path = PathRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.sprite = SpriteRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.polychrome = PolychromeRenderer::new(&self.device, OFFSCREEN_FORMAT);
         self.underline = UnderlineRenderer::new(&self.device, OFFSCREEN_FORMAT);
