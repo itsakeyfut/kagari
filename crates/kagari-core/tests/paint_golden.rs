@@ -51,6 +51,8 @@ fn paint_scene(
         Some(renderer.atlas_mut()),
         None, // hit-test recording is exercised by unit tests, not this golden
         None, // no overlays in this golden
+        None, // no focus registry
+        None, // no cursor registry
         &mut scene,
         viewport,
         &damage,

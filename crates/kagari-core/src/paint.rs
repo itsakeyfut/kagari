@@ -17,7 +17,7 @@ use kagari_text::TextSystem;
 use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
-use crate::event::HitTest;
+use crate::event::{CursorRegistry, FocusRegistry, HitTest};
 use crate::overlay::OverlayRegistry;
 
 /// Builds, lays out, and paints `root` into `scene` for the given `viewport`.
@@ -25,7 +25,10 @@ use crate::overlay::OverlayRegistry;
 /// `scene` is cleared first (its capacity is retained for reuse). `atlas` receives rasterized
 /// glyphs; pass `None` for GPU-free Scene-structure tests (text emits no glyphs then). `hit_test`
 /// receives the frame's interactive regions (#48); pass `None` to skip hit recording (it is cleared
-/// first when present, mirroring `scene`).
+/// first when present, mirroring `scene`). `focus`/`cursor` receive `track_focus`/`cursor`
+/// associations at build (#49/#53, live wiring #177); pass `None` to skip registration. Unlike the
+/// per-frame `hit_test`, these are populated on the build-once pass, so the caller keeps them across
+/// frames (they are not cleared here).
 #[allow(clippy::too_many_arguments)]
 pub fn render_tree(
     root: &mut AnyElement,
@@ -35,6 +38,8 @@ pub fn render_tree(
     atlas: Option<&mut Atlas>,
     hit_test: Option<&mut HitTest>,
     overlay: Option<&mut OverlayRegistry>,
+    focus: Option<&mut FocusRegistry>,
+    cursor: Option<&mut CursorRegistry>,
     scene: &mut Scene,
     viewport: Size,
     damage: &Arc<DamageState>,
@@ -49,11 +54,10 @@ pub fn render_tree(
             text,
             damage: sink,
             theme,
-            // Live winit keyboard wiring (and a window FocusRegistry) lands with the first
-            // interactive consumer (#49 scope); nothing registers focus targets in the app path yet.
-            focus: None,
-            // Live cursor wiring (and a window CursorRegistry) lands with the same consumer (#53).
-            cursor: None,
+            // `track_focus`/`cursor` register into these on the build-once pass (#49/#53); the app
+            // supplies its per-window registries here (live wiring #177), tests pass `None`.
+            focus,
+            cursor,
         };
         root.request_layout(&mut layout_cx)
     };
@@ -127,7 +131,9 @@ mod tests {
             &mut text_system,
             None, // GPU-free: text emits no glyphs; we assert the div quad + its layout.
             None, // no hit-test recording here
-            None,
+            None, // no overlay
+            None, // no focus registry
+            None, // no cursor registry
             &mut scene,
             Size { w: 200.0, h: 100.0 },
             &damage,
@@ -174,7 +180,9 @@ mod tests {
             &mut text_system,
             None,
             None, // no hit-test recording here
-            None,
+            None, // no overlay
+            None, // no focus registry
+            None, // no cursor registry
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,
