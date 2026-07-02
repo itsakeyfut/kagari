@@ -29,7 +29,7 @@ pub use winit::keyboard::KeyCode;
 
 /// Active keyboard modifiers at the time of a mouse event. `#[non_exhaustive]`: delivered to
 /// handlers (not user-constructed), so more modifier state can be added without a breaking change.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Modifiers {
     pub ctrl: bool,

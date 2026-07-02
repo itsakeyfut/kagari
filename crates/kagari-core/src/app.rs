@@ -13,12 +13,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use kagari_base::{NodeId, Point, Size, WindowId};
 use kagari_layout::LayoutTree;
 use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -39,6 +40,7 @@ use crate::event::{
     dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
 use crate::paint::{paint_element_into, render_tree};
+use crate::persist::{PersistenceService, WindowGeometry};
 use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
@@ -156,6 +158,13 @@ pub struct App {
     pending: Vec<PendingWindow>,
     /// Next public window id.
     next_id: u32,
+    /// Monotonic count of windows created, used as the open-order index into
+    /// [`PersistedState::windows`](crate::persist::PersistedState) so restored geometry maps back to
+    /// the same slot (#68). Monotonic (not `windows.len()`) so a closed window doesn't shift indices.
+    windows_created: usize,
+    /// The persistence service (#68, §7.3): loaded at construction, provided as a context service, and
+    /// flushed on exit. Window geometry is captured into it; theme + keymap overrides are applied from it.
+    persist: PersistenceService,
     /// The app root reactive owner: each window's owner is a child of this, so App-provided context
     /// (theme/services, §1.8) is inherited by every window. Held for the app's lifetime (RK-008).
     root_owner: Owner,
@@ -181,6 +190,27 @@ pub struct App {
 /// Pointer travel (logical px) a press must exceed before a press-on-a-drag-source becomes a drag
 /// (rather than a click). Compared squared to avoid a sqrt (#178).
 const DRAG_THRESHOLD_PX: f32 = 4.0;
+
+/// How long after the last persisted-state change to wait before writing to disk (#68). Coalesces a
+/// burst of `Moved`/`Resized` events (e.g. a window drag) into one write once the burst settles.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Resolves the persisted theme id to a [`Theme`] at startup (#68). Only built-in `light`/`dark` are
+/// applied; an unknown id (a custom theme) is kept persisted but falls back to the default until a
+/// theme registry exists (post-MVP).
+fn initial_theme(id: Option<&str>) -> Theme {
+    match id {
+        Some("dark") => Theme::dark(),
+        Some("light") | None => Theme::light(),
+        Some(other) => {
+            tracing::warn!(
+                theme = other,
+                "unknown persisted theme id; using the default light theme (a theme registry is post-MVP)"
+            );
+            Theme::light()
+        }
+    }
+}
 
 /// Whether the pointer has travelled far enough from an armed press `start` to begin a drag (#178).
 /// Pure (squared distance vs [`DRAG_THRESHOLD_PX`]²) so the arm→active decision is unit-testable.
@@ -288,6 +318,9 @@ struct WindowState {
     // an assistive tech is active), and `window_event` feeds winit events to `adapter.process_event`.
     a11y: A11yTree,
     adapter: accesskit_winit::Adapter,
+    // The open-order index into the persisted `windows` (#68): geometry captured on Moved/Resized is
+    // written back to this slot, and the window's initial geometry was restored from it at creation.
+    persist_index: usize,
 }
 
 /// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
@@ -305,8 +338,16 @@ fn bind_window_theme_damage(theme: RwSignal<Arc<Theme>>, damage: Arc<DamageState
 impl App {
     /// Creates the app shell: the wgpu instance and the app root reactive owner + App-level theme
     /// context. **No GPU device is created here** — it is created lazily on the first window's
-    /// `resumed` (headless-safe: `App::new` needs no adapter).
+    /// `resumed` (headless-safe: `App::new` needs no adapter). Loads the persisted state (#68) from the
+    /// OS config dir; use [`with_persistence`](Self::with_persistence) to supply a custom service
+    /// (a custom location, or an in-memory one for tests).
     pub fn new() -> Result<Self, AppError> {
+        Self::with_persistence(PersistenceService::load())
+    }
+
+    /// Like [`new`](Self::new) but with a caller-supplied [`PersistenceService`] — for a custom config
+    /// location or an [`in_memory`](PersistenceService::in_memory) service (tests / persistence off).
+    pub fn with_persistence(persist: PersistenceService) -> Result<Self, AppError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             flags: wgpu::InstanceFlags::default(),
@@ -315,11 +356,13 @@ impl App {
             display: None,
         });
         // The app root owner scopes App-level context (theme/services) so every window (a child
-        // owner) inherits it. The theme is the App-level single source (§1.8).
+        // owner) inherits it. The theme is the App-level single source (§1.8); the persistence service
+        // is a context service (§1.8) so app code (recent files, etc.) shares it.
         let root_owner = Owner::new();
         let theme = root_owner.with(|| {
-            let theme = RwSignal::new(Arc::new(Theme::light()));
+            let theme = RwSignal::new(Arc::new(initial_theme(persist.snapshot().theme.as_deref())));
             provide_context(theme.read_only());
+            provide_context(persist.clone());
             theme
         });
         Ok(Self {
@@ -328,6 +371,8 @@ impl App {
             windows: HashMap::new(),
             pending: Vec::new(),
             next_id: 0,
+            windows_created: 0,
+            persist,
             root_owner,
             theme,
             proxy_cell: Arc::new(OnceLock::new()),
@@ -417,6 +462,42 @@ impl App {
                 tracing::debug!("accessibility deactivated");
             }
         }
+    }
+
+    /// Captures window `id`'s current outer position + inner size (logical px) into the persisted
+    /// state (#68) and arms the debounce, so [`about_to_wait`](Self::about_to_wait) writes it once the
+    /// change settles. Reads the window's authoritative geometry (rather than folding the event), so a
+    /// `Moved` and a `Resized` both produce a complete record.
+    fn capture_window_geometry(&mut self, id: WinitWindowId, event_loop: &ActiveEventLoop) {
+        let Some((index, geometry)) = self.windows.get(&id).map(|state| {
+            let scale = state.window.scale_factor() as f32;
+            let position = state
+                .window
+                .outer_position()
+                .map(|p| Point::new(p.x as f32 / scale, p.y as f32 / scale))
+                .unwrap_or_else(|_| Point::new(0.0, 0.0));
+            let inner = state.window.inner_size();
+            let size = Size {
+                w: inner.width as f32 / scale,
+                h: inner.height as f32 / scale,
+            };
+            (state.persist_index, WindowGeometry { position, size })
+        }) else {
+            return;
+        };
+        self.persist.with(|s| {
+            // Grow the Vec so this window's open-order slot exists (gaps filled with a zero geometry,
+            // overwritten when those windows report their own geometry).
+            if s.windows.len() <= index {
+                s.windows.resize_with(index + 1, || WindowGeometry {
+                    position: Point::new(0.0, 0.0),
+                    size: Size { w: 0.0, h: 0.0 },
+                });
+            }
+            s.windows[index] = geometry;
+        });
+        // Arm the debounce: wake the loop at the deadline so the write happens even when idle.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + PERSIST_DEBOUNCE));
     }
 
     /// Provides an App-level context value (a service, §1.8), inherited by every window's root view.
@@ -520,16 +601,25 @@ impl App {
         event_loop: &ActiveEventLoop,
         pending: PendingWindow,
     ) -> Result<(WinitWindowId, WindowId, WindowState), AppError> {
+        // Restore this window's persisted geometry (#68), keyed by open-order index. A persisted size
+        // overrides the requested `inner_size`; a persisted position is applied too. Absent → defaults.
+        let persist_index = self.windows_created;
+        let geometry = self.persist.snapshot().windows.get(persist_index).cloned();
+        let inner_size = geometry
+            .as_ref()
+            .map(|g| g.size)
+            .unwrap_or(pending.opts.inner_size);
+
         // Create the window initially hidden: the accesskit adapter must be built before the window
         // is first shown (`accesskit_winit` panics on an already-visible window, #67/RK-022). It is
         // made visible at the end of this function, once the adapter exists.
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title(pending.opts.title.clone())
             .with_visible(false)
-            .with_inner_size(LogicalSize::new(
-                pending.opts.inner_size.w,
-                pending.opts.inner_size.h,
-            ));
+            .with_inner_size(LogicalSize::new(inner_size.w, inner_size.h));
+        if let Some(g) = &geometry {
+            attrs = attrs.with_position(LogicalPosition::new(g.position.x, g.position.y));
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -598,6 +688,16 @@ impl App {
         // built while the window is still hidden).
         window.set_visible(true);
 
+        // The window's keymap: the framework defaults with the user's persisted overrides layered on (#68).
+        let mut keymap = Keymap::default();
+        self.persist
+            .snapshot()
+            .keymap_overrides
+            .merge_into(&mut keymap);
+
+        // One more window successfully created — advance the open-order index for the next one (#68).
+        self.windows_created += 1;
+
         Ok((
             winit_id,
             pending.id,
@@ -623,7 +723,8 @@ impl App {
                 cursor_state: CursorState::new(),
                 dispatch: DispatchState::default(),
                 gestures: GestureRecognizer::new(),
-                keymap: Keymap::default(),
+                keymap,
+                persist_index,
                 pointer: Point::new(0.0, 0.0),
                 modifiers: Modifiers::default(),
                 drag: DragState::Idle,
@@ -1302,6 +1403,11 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(state) = self.windows.get_mut(&id) {
             state.adapter.process_event(&state.window, &event);
         }
+        // Capture window geometry into the persisted state on move/resize (#68). Updates the in-memory
+        // slot + arms the debounce; the disk write happens in `about_to_wait` once the burst settles.
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+            self.capture_window_geometry(id, event_loop);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // Remove the closed window (dropping its surface then its shared-device Arc clone;
@@ -1389,12 +1495,31 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Recover from a lost GPU device before driving redraws (#64, specs §1.11/§2.9). The device-lost
         // callback (on a wgpu thread) sets this flag and wakes the loop via the #66 proxy; swap it back
         // to false and regenerate the device + rebuild every window once here on the UI thread.
         if self.device_lost.swap(false, Ordering::SeqCst) {
             self.recover_device();
+        }
+        // Debounced persistence write (#68): once a geometry change has settled for `PERSIST_DEBOUNCE`,
+        // write once; before then, ask the loop to wake at the deadline (`WaitUntil`) so the write
+        // still happens when the app is otherwise idle. Coalesces a burst of `Moved`/`Resized` events.
+        if self.persist.is_dirty() {
+            // Due when the debounce window has elapsed, or (defensively) when the change time is
+            // somehow absent — never leave a dirty state un-written until exit.
+            let due = self
+                .persist
+                .last_change()
+                .is_none_or(|last| last.elapsed() >= PERSIST_DEBOUNCE);
+            if due {
+                if let Err(e) = self.persist.save() {
+                    tracing::error!(error = %e, "failed to save persisted state");
+                }
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else if let Some(last) = self.persist.last_change() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(last + PERSIST_DEBOUNCE));
+            }
         }
         // Per-window hybrid driving (#36, §1.6): request a redraw only for windows that are dirty or
         // animating; an idle window stays idle. Iterates in place (no per-frame allocation, perf.md).
@@ -1409,6 +1534,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Final on-exit save of any pending persisted-state changes (#68, §7.3). Logged, not fatal.
+        self.persist.flush();
     }
 }
 
@@ -1464,8 +1594,9 @@ mod tests {
     #[test]
     fn app_open_window_should_mint_distinct_window_ids() {
         // `App::new` creates only the wgpu instance (no adapter/device), so this is headless-safe;
-        // `open_window` merely queues the window (created later in `resumed`).
-        let mut app = App::new().expect("app shell");
+        // `open_window` merely queues the window (created later in `resumed`). Use an in-memory
+        // persistence service so the test never touches the real OS config dir (#68).
+        let mut app = App::with_persistence(PersistenceService::in_memory()).expect("app shell");
         let a = app
             .open_window(WindowOptions::default(), div)
             .expect("first window id");

@@ -18,6 +18,7 @@ pub mod error;
 pub mod event;
 pub mod overlay;
 pub mod paint;
+pub mod persist;
 pub mod reactive;
 pub mod scheduler;
 
@@ -40,4 +41,7 @@ pub use event::{
 };
 pub use kagari_base::WindowId;
 pub use overlay::{OverlayEntry, OverlayRegistry};
+pub use persist::{
+    KeymapOverrides, OverrideBinding, PersistedState, PersistenceService, WindowGeometry,
+};
 pub use scheduler::{ActiveSources, Scheduler};

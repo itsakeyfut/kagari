@@ -16,7 +16,7 @@ use crate::event::{KeyCode, Modifiers};
 /// A named action dispatched to `on_action` handlers. Framework actions plus a `Named` escape for
 /// app-defined ones (avio-editor / Legend add their own without editing this enum). `#[non_exhaustive]`
 /// so framework actions can grow without a breaking change.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum Action {
     /// Move focus to the next focusable in tab order.
@@ -29,7 +29,7 @@ pub enum Action {
 
 /// A single key chord: a physical key plus the modifiers held. Multi-key chords (sequences) are
 /// post-MVP.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KeyChord {
     pub code: KeyCode,
     pub modifiers: Modifiers,
@@ -94,23 +94,31 @@ impl Keymap {
 
     /// Resolves `chord` in context `ctx`: among bindings whose chord matches and whose context is
     /// global or present in `ctx`, the **innermost** (smallest index in `ctx`) wins; global bindings
-    /// are least specific. Returns the matched action, if any.
+    /// are least specific. On equal specificity the **last-bound** wins, so a later `bind` (e.g. a
+    /// user override layered onto the defaults, #68) overrides an earlier same-context binding of the
+    /// same chord. Returns the matched action, if any.
     pub fn resolve(&self, chord: KeyChord, ctx: &KeyContext) -> Option<Action> {
         self.bindings
             .iter()
-            .filter(|b| {
+            .enumerate()
+            .filter(|(_, b)| {
                 b.chord == chord
                     && match &b.context {
                         None => true,
                         Some(c) => ctx.0.contains(c),
                     }
             })
-            // Innermost context = smallest index in `ctx`; global (`None`) ranks last.
-            .min_by_key(|b| match &b.context {
-                Some(c) => ctx.0.iter().position(|n| n == c).unwrap_or(usize::MAX),
-                None => usize::MAX,
+            // Innermost context = smallest index in `ctx`; global (`None`) ranks last. On a tie
+            // (same specificity), `Reverse(i)` makes the largest insertion index — the last-bound —
+            // win, so overrides appended after the defaults take effect (RK-023).
+            .min_by_key(|(i, b)| {
+                let specificity = match &b.context {
+                    Some(c) => ctx.0.iter().position(|n| n == c).unwrap_or(usize::MAX),
+                    None => usize::MAX,
+                };
+                (specificity, std::cmp::Reverse(*i))
             })
-            .map(|b| b.action.clone())
+            .map(|(_, b)| b.action.clone())
     }
 }
 
@@ -194,6 +202,21 @@ mod tests {
             km.resolve(chord, &KeyContext::default()),
             Some(Action::Named("global-save".into())),
             "with no active context, the global binding resolves"
+        );
+    }
+
+    #[test]
+    fn keymap_override_should_rebind_a_default() {
+        // A later bind on the same chord + context as an earlier one wins (last-wins tie-break), so a
+        // user override layered onto the framework defaults takes effect (#68 / RK-023). `Keymap::default`
+        // binds Tab → FocusNext globally; an appended override rebinds it.
+        let mut km = Keymap::default();
+        let tab = KeyChord::new(KeyCode::Tab, Modifiers::default());
+        km.bind(None::<&str>, tab, Action::Named("custom-tab".into()));
+        assert_eq!(
+            km.resolve(tab, &KeyContext::default()),
+            Some(Action::Named("custom-tab".into())),
+            "the appended override wins over the default binding of the same chord"
         );
     }
 }

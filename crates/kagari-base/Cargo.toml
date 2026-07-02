@@ -20,6 +20,8 @@ serde = ["dep:serde"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Round-trip the value types' serde impls in tests (used only with the `serde` feature).
+ron = { workspace = true }
 
 [lints]
 workspace = true

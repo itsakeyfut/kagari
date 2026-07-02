@@ -6,14 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-kagari-base = { workspace = true }
+# `serde` enables the value types' Serialize/Deserialize for persistence (#68).
+kagari-base = { workspace = true, features = ["serde"] }
 kagari-render = { workspace = true }
 kagari-layout = { workspace = true }
 kagari-style = { workspace = true }
 kagari-text = { workspace = true }
 reactive_graph = { workspace = true }
 slotmap = { workspace = true }
-winit = { workspace = true }
+# `serde` gives winit's `KeyCode` (and friends) Serialize/Deserialize for persisted keymap overrides (#68).
+winit = { workspace = true, features = ["serde"] }
+# Persistence (#68): RON (de)serialization of the persisted state + the OS config/data directory.
+serde = { workspace = true }
+ron = { workspace = true }
+directories = { workspace = true }
 # Accessibility (#67, specs §1.12): derive an accesskit tree from the element tree and sync it to the
 # OS via the winit adapter. `accesskit` stays internal (kagari-owned `Role`).
 accesskit = { workspace = true }
