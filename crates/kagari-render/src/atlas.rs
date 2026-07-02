@@ -119,6 +119,25 @@ impl Packer {
         self.lru
     }
 
+    /// Occupancy snapshot for diagnostics (#69): packed area (summed across active layers) over the
+    /// full texture-array capacity, plus live tile + page counts.
+    fn usage(&self) -> AtlasUsage {
+        let used_area: u64 = self
+            .layers
+            .iter()
+            .map(|l| l.allocated_space().max(0) as u64)
+            .sum();
+        let total_area =
+            u64::from(self.max_layers) * u64::from(self.layer_size) * u64::from(self.layer_size);
+        AtlasUsage {
+            used_area,
+            total_area,
+            tiles: self.cache.len(),
+            pages: self.layers.len() as u32,
+            max_pages: self.max_layers,
+        }
+    }
+
     /// The largest glyph extent that fits a layer once the gutter is added.
     fn inner_max(&self) -> u32 {
         self.layer_size.saturating_sub(2 * GUTTER)
@@ -232,6 +251,29 @@ impl Packer {
         );
         self.cpu.insert(key, bitmap);
         (Placement { coord, rect }, evicted)
+    }
+}
+
+/// A snapshot of atlas occupancy, for the debug overlay (#69). `used_area`/`total_area` are in
+/// texels² (packed area across active layers vs the whole texture-array capacity); `tiles` is the
+/// number of live cached tiles, `pages`/`max_pages` the active vs maximum layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AtlasUsage {
+    pub used_area: u64,
+    pub total_area: u64,
+    pub tiles: usize,
+    pub pages: u32,
+    pub max_pages: u32,
+}
+
+impl AtlasUsage {
+    /// The occupied fraction of the atlas's total capacity, in `0.0..=1.0` (0 when empty).
+    pub fn fraction(&self) -> f32 {
+        if self.total_area == 0 {
+            0.0
+        } else {
+            self.used_area as f32 / self.total_area as f32
+        }
     }
 }
 
@@ -360,6 +402,11 @@ impl Atlas {
     /// The atlas array view, for the sprite pipeline's bind group (#19).
     pub fn texture_view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+
+    /// An occupancy snapshot for the debug overlay (#69): packed area, tile count, and page usage.
+    pub fn usage(&self) -> AtlasUsage {
+        self.packer.usage()
     }
 
     /// Rebuild the GPU texture and re-upload every cached tile from the CPU bitmap

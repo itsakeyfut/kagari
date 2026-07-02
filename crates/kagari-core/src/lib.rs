@@ -13,6 +13,9 @@ pub mod app;
 pub mod arena;
 pub mod bridge;
 pub mod damage;
+/// Dev-build debug overlay (#69). Compiled out in release builds.
+#[cfg(debug_assertions)]
+pub mod debug;
 pub mod element;
 pub mod error;
 pub mod event;

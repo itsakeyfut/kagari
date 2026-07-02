@@ -110,6 +110,24 @@ impl DamageState {
         (!union.is_empty()).then_some(union)
     }
 
+    /// Each dirty node's **absolute** bounds (layout- and paint-dirty), skipping empty rects (a
+    /// removed / not-yet-laid-out `NodeId`). Unlike [`damage_rect`](Self::damage_rect) (the union),
+    /// this keeps per-node rects for the debug overlay's damage visualization (#69). A pending full
+    /// repaint ([`mark_all_dirty`](Self::mark_all_dirty)) tracks no specific nodes and is not
+    /// reflected here (the caller treats `is_dirty()` with an empty result as the whole viewport).
+    pub fn damage_rects(&self, arena: &Arena, layout: &LayoutTree) -> Vec<Rect> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .layout
+            .iter()
+            .chain(inner.paint.iter())
+            .map(|&id| absolute_bounds(arena, layout, id))
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+
     /// Clears all damage: the frame consumed it. The GPU repaints the whole window for now (§1.4);
     /// once a partial-redraw path lands, callers will read [`damage_rect`](Self::damage_rect) first.
     pub fn clear(&self) {
@@ -266,6 +284,29 @@ mod tests {
         );
         assert_eq!(rect.size.w, 30.0, "damage rect spans the leaf's width");
         assert_eq!(rect.size.h, 10.0, "damage rect spans the leaf's height");
+    }
+
+    #[test]
+    fn damage_rects_should_return_one_absolute_rect_per_dirty_node() {
+        let (arena, layout, spacer, leaf) = setup();
+        let damage = DamageState::default();
+
+        // Nothing dirty → no rects.
+        assert!(damage.damage_rects(&arena, &layout).is_empty());
+
+        // Two nodes (one of each kind) → two per-node absolute rects (not a union).
+        damage.mark_paint_dirty(spacer);
+        damage.mark_layout_dirty(leaf);
+        let rects = damage.damage_rects(&arena, &layout);
+        assert_eq!(
+            rects.len(),
+            2,
+            "one rect per dirty node, not a single union"
+        );
+        assert!(
+            rects.iter().any(|r| r.size.h == 10.0),
+            "the leaf's 30x10 rect is present"
+        );
     }
 
     #[test]

@@ -191,6 +191,10 @@ pub struct App {
 /// (rather than a click). Compared squared to avoid a sqrt (#178).
 const DRAG_THRESHOLD_PX: f32 = 4.0;
 
+/// The action name for the dev-only debug-overlay toggle (F12, #69).
+#[cfg(debug_assertions)]
+const DEBUG_OVERLAY_ACTION: &str = "kagari.debug.toggle-overlay";
+
 /// How long after the last persisted-state change to wait before writing to disk (#68). Coalesces a
 /// burst of `Moved`/`Resized` events (e.g. a window drag) into one write once the burst settles.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -321,6 +325,13 @@ struct WindowState {
     // The open-order index into the persisted `windows` (#68): geometry captured on Moved/Resized is
     // written back to this slot, and the window's initial geometry was restored from it at creation.
     persist_index: usize,
+    // Dev-build debug overlay (#69): `debug_overlay` is toggled by F12 (see `handle_action`); when on,
+    // `redraw` injects the diagnostic HUD after the frame. `frame_clock` tracks recent frame times for
+    // FPS/frame-time. Both are `cfg(debug_assertions)` — absent (zero cost) in release.
+    #[cfg(debug_assertions)]
+    debug_overlay: bool,
+    #[cfg(debug_assertions)]
+    frame_clock: crate::debug::FrameClock,
 }
 
 /// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
@@ -694,6 +705,13 @@ impl App {
             .snapshot()
             .keymap_overrides
             .merge_into(&mut keymap);
+        // Dev-only F12 → toggle the debug overlay (#69).
+        #[cfg(debug_assertions)]
+        keymap.bind(
+            None::<&str>,
+            KeyChord::new(KeyCode::F12, Modifiers::default()),
+            Action::Named(DEBUG_OVERLAY_ACTION.into()),
+        );
 
         // One more window successfully created — advance the open-order index for the next one (#68).
         self.windows_created += 1;
@@ -735,6 +753,10 @@ impl App {
                 degraded: false,
                 a11y: A11yTree::default(),
                 adapter,
+                #[cfg(debug_assertions)]
+                debug_overlay: false,
+                #[cfg(debug_assertions)]
+                frame_clock: crate::debug::FrameClock::new(),
             },
         ))
     }
@@ -1055,6 +1077,12 @@ impl WindowState {
         match action {
             Action::FocusNext => self.focus.focus_next(),
             Action::FocusPrev => self.focus.focus_prev(),
+            // Dev-only: F12 toggles the debug overlay (#69); repaint so it appears/disappears.
+            #[cfg(debug_assertions)]
+            Action::Named(ref name) if name.as_str() == DEBUG_OVERLAY_ACTION => {
+                self.debug_overlay = !self.debug_overlay;
+                self.damage.mark_all_dirty();
+            }
             _ => {
                 let focused = self.focus.focused_node();
                 dispatch_action(&mut self.root, &self.arena, focused, &action);
@@ -1195,7 +1223,27 @@ impl WindowState {
         // effect is the sole subscriber that turns a swap into damage, so the render path must not
         // subscribe).
         let theme = self.theme.get_untracked();
-        if let Err(e) = render_tree(
+
+        // Debug overlay (#69, dev-only): record this frame's time, and — while the overlay is on —
+        // capture the damage rects *before* `render_tree` clears them (using last frame's layout,
+        // which is fine for a diagnostic viz). A pending full repaint (no per-node rects) shows as the
+        // whole viewport (RK-012).
+        #[cfg(debug_assertions)]
+        self.frame_clock.record(Instant::now());
+        #[cfg(debug_assertions)]
+        let debug_damage = if self.debug_overlay {
+            let mut rects = self.damage.damage_rects(&self.arena, &self.layout);
+            if rects.is_empty() && self.damage.is_dirty() {
+                rects.push(kagari_base::Rect::from_xywh(
+                    0.0, 0.0, viewport.w, viewport.h,
+                ));
+            }
+            rects
+        } else {
+            Vec::new()
+        };
+
+        let root_id = match render_tree(
             &mut self.root,
             &mut self.arena,
             &mut self.layout,
@@ -1211,9 +1259,15 @@ impl WindowState {
             &self.damage,
             &theme,
         ) {
-            tracing::error!(error = %e, "layout/paint failed");
-            return;
-        }
+            Ok(root_id) => root_id,
+            Err(e) => {
+                tracing::error!(error = %e, "layout/paint failed");
+                return;
+            }
+        };
+        // `root_id` is only read by the (dev-only) debug overlay below.
+        #[cfg(not(debug_assertions))]
+        let _ = root_id;
 
         // Push the derived accessibility tree to the OS (#67). `update_if_active` is a no-op unless an
         // assistive tech has activated, so this is free when a11y is idle; it runs on the paint pass
@@ -1247,6 +1301,32 @@ impl WindowState {
                     }
                 }
             });
+        }
+
+        // Debug overlay injection (#69, dev-only): above all content, into the same scene, just before
+        // present. Gather diagnostics (atlas usage read into owned values before borrowing the atlas
+        // mutably for the HUD text), then inject damage/bounds quads + the FPS/atlas HUD.
+        #[cfg(debug_assertions)]
+        if self.debug_overlay {
+            let (mono_atlas, rgba_atlas) = self.renderer.atlas_usage();
+            let diagnostics = crate::debug::Diagnostics {
+                fps: self.frame_clock.fps(),
+                frame_ms: self.frame_clock.frame_ms(),
+                mono_atlas,
+                rgba_atlas,
+                damage_rects: debug_damage,
+                element_bounds: crate::debug::collect_element_bounds(
+                    &self.arena,
+                    &self.layout,
+                    root_id,
+                ),
+            };
+            crate::debug::paint_debug_overlay(
+                &mut self.scene,
+                &mut self.text,
+                Some(self.renderer.atlas_mut()),
+                &diagnostics,
+            );
         }
 
         if let Err(e) = self.renderer.render(
