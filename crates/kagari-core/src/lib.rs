@@ -10,6 +10,7 @@
 pub mod anim;
 pub mod app;
 pub mod arena;
+pub mod bridge;
 pub mod damage;
 pub mod element;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod scheduler;
 
 pub use anim::{Animatable, Animated, AnimationSpec, Easing};
 pub use app::{App, Decorations, WindowOptions};
+pub use bridge::UiProxy;
 pub use damage::DamageState;
 pub use element::{
     AnchorHandle, AnyElement, Element, IntoElement, Placement, ScrollHandle, div, overlay, scroll,

@@ -11,7 +11,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use kagari_base::{NodeId, Point, Size, WindowId};
 use kagari_layout::LayoutTree;
@@ -19,13 +19,14 @@ use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
 
 use kagari_style::Theme;
 
 use crate::arena::Arena;
+use crate::bridge::{UiEvent, UiProxy, run_ui_event};
 use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement};
 use crate::error::AppError;
@@ -40,16 +41,10 @@ use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
 
-/// The winit user event carrying a hot-reloaded theme to the UI thread (#44). The theme watcher runs
-/// on a background thread and posts this via the `EventLoopProxy`; [`App::user_event`] writes it into
-/// the App-level theme signal on the UI thread. Without `hot-reload` there is no user event.
-#[cfg(feature = "hot-reload")]
-struct ThemeReload(Theme);
-
-#[cfg(feature = "hot-reload")]
-type UserEvent = ThemeReload;
-#[cfg(not(feature = "hot-reload"))]
-type UserEvent = ();
+/// The winit user event: a [`UiEvent`] (boxed UI closure) posted from a background task via the
+/// bridge (#66). [`App::user_event`] runs it on the UI thread under the app root owner. The hot-reload
+/// theme watcher (#44) is one consumer — it posts a closure that swaps the App-level theme signal.
+type UserEvent = UiEvent;
 
 /// Extracts a human-readable message from a caught panic payload (#65). Panics carry `&str`
 /// (`panic!("literal")`) or `String` (`panic!("{}", …)`); anything else falls back.
@@ -167,6 +162,10 @@ pub struct App {
     /// The app root reactive owner: each window's owner is a child of this, so App-provided context
     /// (theme/services, §1.8) is inherited by every window. Held for the app's lifetime (RK-008).
     root_owner: Owner,
+    /// The background→UI bridge's deferred proxy cell (#66): [`ui_proxy`](Self::ui_proxy) hands out
+    /// [`UiProxy`]s wrapping this before the loop exists; [`run`](Self::run) populates it with the
+    /// event loop's `EventLoopProxy` so posted closures reach the UI thread's `user_event`.
+    proxy_cell: Arc<OnceLock<EventLoopProxy<UiEvent>>>,
     /// The App-level theme (single source, §1.8). Each window holds a `Copy` of this signal; a swap
     /// (hot-reload) re-runs every window's theme→damage effect, so all windows reskin.
     theme: RwSignal<Arc<Theme>>,
@@ -324,11 +323,20 @@ impl App {
             next_id: 0,
             root_owner,
             theme,
+            proxy_cell: Arc::new(OnceLock::new()),
             #[cfg(feature = "hot-reload")]
             theme_path: None,
             #[cfg(feature = "hot-reload")]
             theme_watcher: None,
         })
+    }
+
+    /// Returns a cloneable, `Send` [`UiProxy`] for the background→UI bridge (#66): move a clone into a
+    /// background task (on the consumer's runtime) and call [`UiProxy::spawn`] to run a closure on the
+    /// UI thread (to update signals, one-way). May be called before [`run`](Self::run); closures posted
+    /// before the loop starts are dropped.
+    pub fn ui_proxy(&self) -> UiProxy {
+        UiProxy::new(Arc::clone(&self.proxy_cell))
     }
 
     /// Provides an App-level context value (a service, §1.8), inherited by every window's root view.
@@ -380,6 +388,9 @@ impl App {
             .build()
             .map_err(|e| AppError::WindowCreate(e.to_string()))?;
         event_loop.set_control_flow(ControlFlow::Wait);
+        // Populate the bridge's proxy cell so any `UiProxy` handed out before `run` (via `ui_proxy`)
+        // goes live and can post closures to `user_event` (#66).
+        let _ = self.proxy_cell.set(event_loop.create_proxy());
         #[cfg(feature = "hot-reload")]
         self.spawn_theme_watcher(&event_loop);
         event_loop
@@ -395,8 +406,11 @@ impl App {
             return;
         };
         let proxy = event_loop.create_proxy();
-        match kagari_style::ThemeWatcher::new(path, move |theme| {
-            let _ = proxy.send_event(ThemeReload(theme));
+        // The watcher runs on a background thread; unify it onto the #66 bridge by posting a UI
+        // closure that swaps the App-level theme signal (Copy + Send) on the UI thread (#44/#66).
+        let theme = self.theme;
+        match kagari_style::ThemeWatcher::new(path, move |reloaded| {
+            let _ = proxy.send_event(Box::new(move || theme.set(Arc::new(reloaded))));
         }) {
             Ok(watcher) => self.theme_watcher = Some(watcher),
             Err(e) => tracing::warn!(error = %e, "failed to start theme hot-reload watcher"),
@@ -1194,13 +1208,15 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        // A theme hot-reload posted from the watcher thread (#44). Writing the App-level signal on
-        // the UI thread re-runs every window's theme→damage effect → all windows reskin next frame.
-        #[cfg(feature = "hot-reload")]
-        {
-            let ThemeReload(theme) = _event;
-            self.theme.set(Arc::new(theme));
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        // Run a background-posted UI closure on the UI thread under the app root owner (#66): its
+        // signal writes are tracked and their synchronous effects flag damage → redraw next frame.
+        // The hot-reload watcher's theme swap arrives this way, re-running every window's theme→damage
+        // effect so all windows reskin. Guard it with the panic boundary (#65) — a panic in the
+        // (consumer-supplied) closure is caught + logged so it can't abort the app. It is app-level
+        // (not tied to a window), so there is nothing to degrade; just survive.
+        if run_guarded(|| run_ui_event(&self.root_owner, event)).is_err() {
+            tracing::error!("a background UI closure panicked; dropped (app kept alive)");
         }
     }
 
