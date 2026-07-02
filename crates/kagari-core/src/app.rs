@@ -1,33 +1,40 @@
-//! Minimal app shell: a single winit window with wgpu init that clears and presents.
+//! App shell (#63): an [`App`] owns the shared GPU (adapter/device/queue), the app root reactive
+//! owner, the App-level theme (single source), and the winit event loop; each window owns its
+//! surface, root view, renderer, and per-window scene/scheduler/damage plus a per-window child
+//! reactive owner. App→N windows (specs §1.13); MVP ships a single window.
 //!
-//! This is the Phase-1 skeleton. The shared device lives on `App` (gpu.md §1); the
-//! richer element/reactive API and multi-window support arrive in Phase 3 (specs §1.13).
+//! The shared device is created **lazily on the first window's `resumed`** (an adapter needs a
+//! compatible surface; a wgpu device is surface-agnostic, so the first window's device serves all
+//! windows) and `Arc`-shared into each window's renderer. The glyph/image atlases stay per-window
+//! (sharing them is #191); FontDb sharing is #192. Design confirmed by a Tier-2 arch review.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use kagari_base::Size;
+use kagari_base::{Size, WindowId};
 use kagari_layout::LayoutTree;
 use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::{Ime, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
 
-use kagari_style::{ColorRole, Styled, Theme};
+use kagari_style::Theme;
 
 use crate::arena::Arena;
 use crate::damage::DamageState;
-use crate::element::{AnyElement, IntoElement, div, text};
+use crate::element::{AnyElement, IntoElement};
 use crate::error::AppError;
 use crate::paint::render_tree;
 use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
 
-/// The winit user event carrying a hot-reloaded theme to the UI thread (#44). The theme watcher
-/// runs on a background thread and posts this via the `EventLoopProxy`; [`App::user_event`] writes
-/// it into the reactive theme signal on the UI thread. Without `hot-reload` there is no user event.
+/// The winit user event carrying a hot-reloaded theme to the UI thread (#44). The theme watcher runs
+/// on a background thread and posts this via the `EventLoopProxy`; [`App::user_event`] writes it into
+/// the App-level theme signal on the UI thread. Without `hot-reload` there is no user event.
 #[cfg(feature = "hot-reload")]
 struct ThemeReload(Theme);
 
@@ -36,11 +43,89 @@ type UserEvent = ThemeReload;
 #[cfg(not(feature = "hot-reload"))]
 type UserEvent = ();
 
-/// The application shell. Owns the shared wgpu instance and, once resumed, the
-/// single window's GPU state.
+/// The shared GPU: the wgpu adapter + device + queue, created once (lazily on the first window) and
+/// `Arc`-cloned into every window's renderer (specs §1.13). Device-loss recovery (#64) regenerates
+/// this one holder and fans out to each window's renderer.
+struct Gpu {
+    adapter: wgpu::Adapter,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+}
+
+/// How a window is decorated. MVP is native (OS-drawn) decorations; custom client-side decorations
+/// (CSD) are post-MVP (§1.14) — `#[non_exhaustive]` so a `Custom` mode can be added without a break.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub enum Decorations {
+    /// OS-drawn native decorations (title bar, resize border).
+    #[default]
+    Native,
+}
+
+/// Options for a new window. `#[non_exhaustive]`: fields (min/max size, position, transparency, …) can
+/// be added without a breaking change. Build from [`Default`] + the setters.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WindowOptions {
+    /// The window title.
+    pub title: String,
+    /// The initial inner (client-area) size in logical pixels.
+    pub inner_size: Size,
+    /// Native vs custom decorations (MVP: `Native`).
+    pub decorations: Decorations,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        Self {
+            title: "kagari".to_string(),
+            inner_size: Size { w: 800.0, h: 600.0 },
+            decorations: Decorations::Native,
+        }
+    }
+}
+
+impl WindowOptions {
+    /// Sets the window title.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Sets the initial inner size (logical px).
+    pub fn inner_size(mut self, size: Size) -> Self {
+        self.inner_size = size;
+        self
+    }
+}
+
+/// A window queued by [`App::open_window`] before the loop runs; created in `resumed` (winit 0.30
+/// requires window creation there). The root closure is `FnOnce`: it builds the element tree once,
+/// under the window's child owner + the App context (the retained model rebuilds via signals, §1.3).
+struct PendingWindow {
+    id: WindowId,
+    opts: WindowOptions,
+    root: Box<dyn FnOnce() -> AnyElement>,
+}
+
+/// The application shell. Owns the shared GPU, the app root reactive owner, the App-level theme
+/// (single source), and the winit event loop; windows are created in `resumed`.
 pub struct App {
     instance: wgpu::Instance,
-    window: Option<WindowState>,
+    /// The shared GPU, created lazily on the first window's `resumed` (then reused for all windows).
+    gpu: Option<Gpu>,
+    /// Live windows, keyed by winit's per-event `WindowId` (the identity events arrive under).
+    windows: HashMap<WinitWindowId, WindowState>,
+    /// Windows queued by `open_window`, drained in `resumed`.
+    pending: Vec<PendingWindow>,
+    /// Next public window id.
+    next_id: u32,
+    /// The app root reactive owner: each window's owner is a child of this, so App-provided context
+    /// (theme/services, §1.8) is inherited by every window. Held for the app's lifetime (RK-008).
+    root_owner: Owner,
+    /// The App-level theme (single source, §1.8). Each window holds a `Copy` of this signal; a swap
+    /// (hot-reload) re-runs every window's theme→damage effect, so all windows reskin.
+    theme: RwSignal<Arc<Theme>>,
     /// The theme RON file to watch for dev hot-reload (#44), set via [`App::watch_theme`].
     #[cfg(feature = "hot-reload")]
     theme_path: Option<std::path::PathBuf>,
@@ -50,65 +135,48 @@ pub struct App {
 }
 
 struct WindowState {
-    // `Arc<Window>` lets wgpu hold a `Surface<'static>` via the safe `create_surface`
-    // path — no hand-written raw-window-handle lifetime and no `unsafe`.
+    // `Arc<Window>` lets wgpu hold a `Surface<'static>` via the safe `create_surface` path — no
+    // hand-written raw-window-handle lifetime and no `unsafe` (RK-002).
     window: Arc<Window>,
+    // Field order: `surface` before `device` so a dropped window releases its surface before its
+    // shared-device Arc clone (device-loss / close drop order, #64).
     surface: wgpu::Surface<'static>,
-    // `device` is kept for surface reconfigure; the queue is owned by the renderer.
+    // A clone of the shared device, kept for surface reconfigure on resize.
     device: Arc<wgpu::Device>,
     config: wgpu::SurfaceConfiguration,
     renderer: kagari_render::Renderer,
-    // The render scene, rebuilt each frame by the paint walk; its buffers are reused.
     scene: kagari_render::Scene,
-    // Element-tree paint-pass state (#34): the retained arena, the layout tree, the text
-    // system (shaping + glyph rasterization), the root element, and the damage sink (#35).
     arena: Arena,
     layout: LayoutTree,
     text: TextSystem,
     root: AnyElement,
     damage: Arc<DamageState>,
-    // The root reactive owner (#43, RK-008): established before the element tree is built so
-    // context/effects (theme, reactive props) bind to a stable scope that lives for the window's
-    // lifetime. Held only to keep them alive — `set()` stores a Weak (RK-003).
+    // The per-window child owner (of the App root, RK-006/008): built-once tree effects (theme,
+    // reactive props) bind here and dispose when the window closes. Held to keep them alive.
     _owner: Owner,
-    // The current theme, held in the root reactive context (#43, specs §1.8). Read each frame to
-    // resolve tokens; writing the signal reskins every token and flags full damage (swap API: #44).
+    // A `Copy` handle to the App-level theme signal (single source): read each frame to resolve
+    // tokens. Writing happens App-side (hot-reload); the per-window theme→damage effect reskins.
     theme: RwSignal<Arc<Theme>>,
-    // Hybrid frame scheduler (#36): tracks active sources for continuous driving; `about_to_wait`
-    // gates `request_redraw` on damage/active state so the app is idle when nothing changes.
     scheduler: Scheduler,
-    // Whether the OS IME is currently composing into this window (set by
-    // `Ime::Enabled`/`Disabled`). Gates preedit/commit forwarding.
     ime_enabled: bool,
 }
 
-/// The demo root element: a colored panel containing a line of text.
-fn demo_root() -> AnyElement {
-    // Use a semantic token (not a static color) so a theme swap / hot-reload (#43/#44) visibly
-    // reskins the panel as the theme's `Surface` role changes.
-    div()
-        .bg(ColorRole::Surface)
-        .child(text("Hello, kagari"))
-        .into_element()
-}
-
-/// Wires `theme` into the root reactive context and turns every swap into a full repaint.
-///
-/// Descendants receive a read-only handle via `provide_context`, so token resolution can read the
-/// current theme (specs §1.8). The effect subscribes to the theme: any swap re-runs it (synchronous
-/// `ImmediateEffect`, ADR 0001) and flags full paint-damage, so the scheduler wakes and the next
-/// frame re-resolves every token. Must be called with the root `Owner` current (RK-008).
-fn provide_root_theme(theme: RwSignal<Arc<Theme>>, damage: Arc<DamageState>) {
-    provide_context(theme.read_only());
+/// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
+/// this and flags **this window's** full repaint (synchronous `ImmediateEffect`, ADR 0001). Called
+/// under the window's child owner so it disposes on close (RK-006). Must run with an owner current.
+fn bind_window_theme_damage(theme: RwSignal<Arc<Theme>>, damage: Arc<DamageState>) {
     create_effect(move || {
-        // Read to subscribe; the App reads the resolved value each frame, so the only job here is
-        // to turn a swap into damage.
+        // Subscribe to the theme; the frame loop reads the resolved value, so the only job here is
+        // to turn a swap into this window's damage.
         let _ = theme.get();
         damage.mark_all_dirty();
     });
 }
 
 impl App {
+    /// Creates the app shell: the wgpu instance and the app root reactive owner + App-level theme
+    /// context. **No GPU device is created here** — it is created lazily on the first window's
+    /// `resumed` (headless-safe: `App::new` needs no adapter).
     pub fn new() -> Result<Self, AppError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -117,9 +185,22 @@ impl App {
             backend_options: wgpu::BackendOptions::default(),
             display: None,
         });
+        // The app root owner scopes App-level context (theme/services) so every window (a child
+        // owner) inherits it. The theme is the App-level single source (§1.8).
+        let root_owner = Owner::new();
+        let theme = root_owner.with(|| {
+            let theme = RwSignal::new(Arc::new(Theme::light()));
+            provide_context(theme.read_only());
+            theme
+        });
         Ok(Self {
             instance,
-            window: None,
+            gpu: None,
+            windows: HashMap::new(),
+            pending: Vec::new(),
+            next_id: 0,
+            root_owner,
+            theme,
             #[cfg(feature = "hot-reload")]
             theme_path: None,
             #[cfg(feature = "hot-reload")]
@@ -127,16 +208,48 @@ impl App {
         })
     }
 
-    /// Watches a theme RON file for dev hot-reload (#44): editing the file while the app runs
-    /// reloads the theme and reskins the UI with no recompile. Requires the `hot-reload` feature.
+    /// Provides an App-level context value (a service, §1.8), inherited by every window's root view.
+    /// Call before `run`; values are visible to windows opened afterward (each window's owner is a
+    /// child of the app root owner).
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.root_owner.with(|| provide_context(value));
+    }
+
+    /// Queues a window to open with `opts`, its root view built by `root` (once, when the window is
+    /// created in `resumed`). Returns the public [`WindowId`]. MVP: call before [`run`](Self::run)
+    /// (dynamic open after the loop starts is post-MVP).
+    pub fn open_window<R: IntoElement>(
+        &mut self,
+        opts: WindowOptions,
+        root: impl FnOnce() -> R + 'static,
+    ) -> Result<WindowId, AppError> {
+        let id = WindowId::from_raw(self.next_id);
+        self.next_id += 1;
+        self.pending.push(PendingWindow {
+            id,
+            opts,
+            root: Box::new(move || root().into_element()),
+        });
+        Ok(id)
+    }
+
+    /// Watches a theme RON file for dev hot-reload (#44). Requires the `hot-reload` feature.
     #[cfg(feature = "hot-reload")]
     pub fn watch_theme(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.theme_path = Some(path.into());
         self
     }
 
-    /// Run the winit event loop until the window closes.
+    /// Runs the winit event loop until the last window closes. Returns a startup/loop error (rather
+    /// than diverging) so `main` can surface a nonzero exit.
     pub fn run(mut self) -> Result<(), AppError> {
+        // Apply the initial theme (the watched file if set) to the App-level single source before the
+        // loop starts (no window/effect exists yet, so this just sets the value).
+        #[cfg(feature = "hot-reload")]
+        {
+            let initial = self.initial_theme();
+            self.theme.set(Arc::new(initial));
+        }
         let event_loop = EventLoop::<UserEvent>::with_user_event()
             .build()
             .map_err(|e| AppError::WindowCreate(e.to_string()))?;
@@ -148,9 +261,8 @@ impl App {
             .map_err(|e| AppError::WindowCreate(e.to_string()))
     }
 
-    /// Spawns the theme-file watcher (if [`watch_theme`](Self::watch_theme) set a path), wired to
-    /// post each reload to the UI thread via the winit `EventLoopProxy`. The watcher handle is kept
-    /// on `self` for the app's lifetime; a setup error degrades to a warning (no hot-reload).
+    /// Spawns the theme-file watcher (if [`watch_theme`](Self::watch_theme) set a path), wired to post
+    /// each reload to the UI thread via the winit `EventLoopProxy`. A setup error degrades to a warning.
     #[cfg(feature = "hot-reload")]
     fn spawn_theme_watcher(&mut self, event_loop: &EventLoop<UserEvent>) {
         let Some(path) = self.theme_path.clone() else {
@@ -158,7 +270,6 @@ impl App {
         };
         let proxy = event_loop.create_proxy();
         match kagari_style::ThemeWatcher::new(path, move |theme| {
-            // Off-thread: only post to the UI thread. The signal write happens in `user_event`.
             let _ = proxy.send_event(ThemeReload(theme));
         }) {
             Ok(watcher) => self.theme_watcher = Some(watcher),
@@ -166,10 +277,9 @@ impl App {
         }
     }
 
-    /// The theme to start with: the watched file loaded once (if set), else the built-in light
-    /// theme (#45). A read/parse failure keeps light and warns — the watcher retries on the next edit.
+    /// The theme to start with: the watched file loaded once (if set), else the built-in light theme.
+    #[cfg(feature = "hot-reload")]
     fn initial_theme(&self) -> Theme {
-        #[cfg(feature = "hot-reload")]
         if let Some(path) = &self.theme_path {
             match kagari_style::load_theme_file(path) {
                 Ok(theme) => return theme,
@@ -181,70 +291,89 @@ impl App {
         Theme::light()
     }
 
-    fn create_window_state(&self, event_loop: &ActiveEventLoop) -> Result<WindowState, AppError> {
+    /// Creates one window (winit window + surface + renderer + root view), creating the shared GPU
+    /// lazily on the first window. Returns the winit id, the public id, and the window state.
+    fn create_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        pending: PendingWindow,
+    ) -> Result<(WinitWindowId, WindowId, WindowState), AppError> {
+        let attrs = WindowAttributes::default()
+            .with_title(pending.opts.title.clone())
+            .with_inner_size(LogicalSize::new(
+                pending.opts.inner_size.w,
+                pending.opts.inner_size.h,
+            ));
         let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default().with_title("kagari"))
+                .create_window(attrs)
                 .map_err(|e| AppError::WindowCreate(e.to_string()))?,
         );
+        let winit_id = window.id();
         let surface = self
             .instance
             .create_surface(window.clone())
             .map_err(|e| AppError::DeviceInit(e.to_string()))?;
-        let (device, queue, config) =
-            pollster::block_on(init_gpu(&self.instance, &surface, window.inner_size()))?;
-        let device = Arc::new(device);
-        let queue = Arc::new(queue);
-        surface.configure(&device, &config);
 
-        // Allow the OS IME for this window. No focus system yet, so the window is the
-        // sole focus target; focus-driven enable/disable arrives with the focus layer.
+        // Lazily create the shared GPU on the first window; reuse it for all subsequent windows.
+        if self.gpu.is_none() {
+            self.gpu = Some(pollster::block_on(create_gpu(&self.instance, &surface))?);
+        }
+        let (device, queue) = {
+            let gpu = self.gpu.as_ref().expect("gpu created above");
+            (Arc::clone(&gpu.device), Arc::clone(&gpu.queue))
+        };
+        let config = {
+            let gpu = self.gpu.as_ref().expect("gpu created above");
+            surface_config(&surface, &gpu.adapter, window.inner_size())?
+        };
+        surface.configure(&device, &config);
         window.set_ime_allowed(true);
 
-        // The queue is moved into the renderer; the app shell keeps only `device`.
         let renderer = kagari_render::Renderer::new(
-            device.clone(),
+            Arc::clone(&device),
             queue,
             (config.width, config.height),
             config.format,
         );
 
-        // Establish the root reactive owner before building the element tree so context/effects
-        // (theme, reactive props) bind to a stable scope that lives with the window (RK-008).
-        let owner = Owner::new();
-        owner.set();
-
+        // Build the root view under a per-window child owner (of the app root) so App context
+        // (theme/services) is inherited and the window's effects dispose on close (RK-006/008).
+        let child_owner = self.root_owner.child();
+        let theme = self.theme;
         let damage = Arc::new(DamageState::default());
-        // The theme lives in the root reactive context (#43, specs §1.8). Start on the watched file
-        // (#44) if one was set, else the built-in light theme (#45). Writing this signal reskins
-        // every token; the hot-reload watcher writes it on each file change.
-        let theme = RwSignal::new(Arc::new(self.initial_theme()));
-        provide_root_theme(theme, Arc::clone(&damage));
-        let root = demo_root();
+        let root = child_owner.with(|| {
+            bind_window_theme_damage(theme, Arc::clone(&damage));
+            (pending.root)()
+        });
 
-        Ok(WindowState {
-            window,
-            surface,
-            device,
-            config,
-            renderer,
-            scene: kagari_render::Scene::new(),
-            arena: Arena::new(),
-            layout: LayoutTree::new(),
-            text: TextSystem::new(FontDb::new()),
-            root,
-            damage,
-            _owner: owner,
-            theme,
-            scheduler: Scheduler::new(),
-            ime_enabled: false,
-        })
+        Ok((
+            winit_id,
+            pending.id,
+            WindowState {
+                window,
+                surface,
+                device,
+                config,
+                renderer,
+                scene: kagari_render::Scene::new(),
+                arena: Arena::new(),
+                layout: LayoutTree::new(),
+                text: TextSystem::new(FontDb::new()),
+                root,
+                damage,
+                _owner: child_owner,
+                theme,
+                scheduler: Scheduler::new(),
+                ime_enabled: false,
+            },
+        ))
     }
 }
 
-/// Map a winit IME event to kagari-text's abstract `ImeEvent`. `Enabled`/`Disabled`
-/// are state transitions (handled by the caller), so they produce no `ImeEvent`. This
-/// is the seam that keeps winit types out of kagari-text (design.md).
+/// Map a winit IME event to kagari-text's abstract `ImeEvent`. `Enabled`/`Disabled` are state
+/// transitions (handled by the caller), so they produce no `ImeEvent`. Keeps winit types out of
+/// kagari-text (design.md).
 fn map_ime_event(ime: Ime) -> Option<ImeEvent> {
     match ime {
         Ime::Preedit(text, cursor) => Some(ImeEvent::Preedit { text, cursor }),
@@ -253,17 +382,10 @@ fn map_ime_event(ime: Ime) -> Option<ImeEvent> {
     }
 }
 
-/// Whether `key` is an IME-owned toggle/conversion key (henkan/muhenkan, hankaku/
-/// zenkaku, kana, …). Such keys must never be consumed as an app shortcut — the OS IME
-/// owns them — so the (future) keymap dispatches only when this is `false`. Gating is
-/// unconditional (not on `ime_enabled`) because the on/off toggle keys are pressed
-/// while the IME is *off* to turn it on; gating would re-introduce the Zed defects in
-/// specs §5.2 (#40321 / #40592 / #40638 / #40300). Classified on the physical key,
-/// which is independent of the current IME state.
+/// Whether `key` is an IME-owned toggle/conversion key. Such keys must never be consumed as an app
+/// shortcut — the OS IME owns them — so the (future) keymap dispatches only when this is `false`.
+/// Classified on the physical key (independent of IME state); see specs §5.2 (Zed #40321/#40592/…).
 fn ime_owns_key(key: PhysicalKey) -> bool {
-    // winit's physical `KeyCode` (W3C UI Events `code`) names the Japanese IME keys as
-    // Convert(変換) / NonConvert(無変換) / KanaMode, plus Lang1..Lang5
-    // (kana / eisu / katakana / hiragana / **zenkaku-hankaku toggle**) and Hiragana/Katakana.
     use KeyCode::{
         Convert, Hiragana, KanaMode, Katakana, Lang1, Lang2, Lang3, Lang4, Lang5, NonConvert,
     };
@@ -284,19 +406,17 @@ fn ime_owns_key(key: PhysicalKey) -> bool {
     )
 }
 
-/// Route a key event. IME-owned toggle/conversion keys are passed through to the OS IME
-/// and never consumed as an app shortcut (Zed §5.2: #40321/#40592/#40638/#40300); other
-/// keys are where the app keymap will dispatch actions (none yet — Phase 3).
+/// Route a key event. IME-owned toggle/conversion keys are passed through to the OS IME and never
+/// consumed as a shortcut; other keys are where the app keymap will dispatch (live wiring is #177).
 fn route_key_event(event: &KeyEvent) {
     if ime_owns_key(event.physical_key) {
         tracing::trace!(key = ?event.physical_key, "ime-owned key passed through");
     }
-    // TODO(keymap): dispatch app actions for non-IME keys here once the keymap lands.
 }
 
 impl WindowState {
-    /// Handle a winit IME event: track enable state, report the caret area on enable,
-    /// and forward preedit/commit (as `ImeEvent`) to the text layer when enabled.
+    /// Handle a winit IME event: track enable state, report the caret area on enable, and forward
+    /// preedit/commit (as `ImeEvent`) to the text layer when enabled.
     fn on_ime(&mut self, ime: Ime) {
         match &ime {
             Ime::Enabled => {
@@ -308,9 +428,8 @@ impl WindowState {
         }
         if let Some(ev) = map_ime_event(ime) {
             if self.ime_enabled {
-                // #25 routes this to the focused TextBuffer (preedit render / commit).
-                // Log only the event shape, never the composed text: IME content is
-                // user input (may include passwords) and must not land in logs.
+                // #25 routes this to the focused TextBuffer. Log only the event shape, never the
+                // composed text (IME content is user input, may include passwords).
                 let (kind, text_len) = match &ev {
                     ImeEvent::Preedit { text, .. } => ("preedit", text.len()),
                     ImeEvent::Commit(text) => ("commit", text.len()),
@@ -320,10 +439,9 @@ impl WindowState {
         }
     }
 
-    /// Report the IME candidate-window area to the OS. A default until #25 drives it
-    /// from the real caret rect (the text/caret state does not exist yet).
+    /// Report the IME candidate-window area to the OS. A default until #25 drives it from the caret.
     fn report_ime_caret_area(&self) {
-        use winit::dpi::{LogicalPosition, LogicalSize};
+        use winit::dpi::LogicalPosition;
         self.window
             .set_ime_cursor_area(LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 16.0));
     }
@@ -347,15 +465,13 @@ impl WindowState {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let scale = self.window.scale_factor() as f32;
 
-        // Build the scene from the element tree: build-once + layout + paint (#34). Scene
-        // coordinates are logical, so the layout viewport is the physical size over `scale`.
         let viewport = Size {
             w: self.config.width as f32 / scale,
             h: self.config.height as f32 / scale,
         };
-        // Read the current theme from the reactive context for this frame (#43). Untracked: the
-        // dedicated swap effect (`provide_root_theme`) is the sole subscriber that turns a swap
-        // into damage, so the render path must not subscribe.
+        // Read the current App-level theme for this frame (untracked: the per-window theme→damage
+        // effect is the sole subscriber that turns a swap into damage, so the render path must not
+        // subscribe).
         let theme = self.theme.get_untracked();
         if let Err(e) = render_tree(
             &mut self.root,
@@ -363,8 +479,6 @@ impl WindowState {
             &mut self.layout,
             &mut self.text,
             Some(self.renderer.atlas_mut()),
-            // Live winit→dispatch wiring (and a `WindowState` hit-test) lands with the first
-            // interactive consumer (#48 scope decision); nothing reads a recorded hit-test yet.
             None,
             None,
             &mut self.scene,
@@ -376,8 +490,6 @@ impl WindowState {
             return;
         }
 
-        // The renderer composites the scene into its offscreen linear target and
-        // runs the output-transform pass into this swapchain frame.
         if let Err(e) = self.renderer.render(
             &mut self.scene,
             &view,
@@ -390,11 +502,12 @@ impl WindowState {
     }
 }
 
-async fn init_gpu(
+/// Creates the shared GPU (adapter + device + queue) against the first window's surface. The device
+/// is surface-agnostic, so it serves all windows; each surface picks its own format later.
+async fn create_gpu(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'static>,
-    size: winit::dpi::PhysicalSize<u32>,
-) -> Result<(wgpu::Device, wgpu::Queue, wgpu::SurfaceConfiguration), AppError> {
+) -> Result<Gpu, AppError> {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -417,8 +530,21 @@ async fn init_gpu(
         .await
         .map_err(|e| AppError::DeviceInit(e.to_string()))?;
 
-    let caps = surface.get_capabilities(&adapter);
-    // Prefer an sRGB swapchain format so the HW performs the linear->sRGB encode (#10, Q2).
+    Ok(Gpu {
+        adapter,
+        device: Arc::new(device),
+        queue: Arc::new(queue),
+    })
+}
+
+/// Builds a surface configuration for `surface` against the shared `adapter`, choosing an sRGB
+/// swapchain format so the HW performs the linear→sRGB encode (#10). Per-surface (formats can differ).
+fn surface_config(
+    surface: &wgpu::Surface<'static>,
+    adapter: &wgpu::Adapter,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> Result<wgpu::SurfaceConfiguration, AppError> {
+    let caps = surface.get_capabilities(adapter);
     let format = caps
         .formats
         .iter()
@@ -431,8 +557,7 @@ async fn init_gpu(
         .first()
         .copied()
         .unwrap_or(wgpu::CompositeAlphaMode::Auto);
-
-    let config = wgpu::SurfaceConfiguration {
+    Ok(wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
         width: size.width.max(1),
@@ -441,74 +566,91 @@ async fn init_gpu(
         alpha_mode,
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
-    };
-    Ok((device, queue, config))
+    })
 }
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
+        // Drain queued windows (created here per winit 0.30). On a spurious re-resume there is
+        // nothing pending, so this is a no-op.
+        let pending = std::mem::take(&mut self.pending);
+        for pw in pending {
+            match self.create_window(event_loop, pw) {
+                Ok((winit_id, public_id, state)) => {
+                    state.window.request_redraw();
+                    self.windows.insert(winit_id, state);
+                    tracing::info!(window = public_id.raw(), "window created");
+                }
+                Err(e) => {
+                    // Per-window failure: log and skip, keeping other windows alive (§1.11).
+                    tracing::error!(error = %e, "failed to create window; skipping");
+                }
+            }
         }
-        match self.create_window_state(event_loop) {
-            Ok(state) => {
-                state.window.request_redraw();
-                self.window = Some(state);
-                tracing::info!("window created");
-            }
-            Err(e) => {
-                // resumed() can't return Result; degrade by logging and exiting (specs §1.11).
-                tracing::error!(error = %e, "failed to initialize window/GPU; exiting");
-                event_loop.exit();
-            }
+        // Nothing to display — no window was opened, or every requested window failed to init — so
+        // exit (a windowless app is fatal, §1.13). A spurious re-resume keeps existing windows, so
+        // this only fires when the map is truly empty.
+        if self.windows.is_empty() {
+            tracing::error!("no window to display; exiting");
+            event_loop.exit();
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = self.window.as_mut() else {
-            return;
-        };
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WinitWindowId,
+        event: WindowEvent,
+    ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                state.config.width = size.width.max(1);
-                state.config.height = size.height.max(1);
-                state.surface.configure(&state.device, &state.config);
-                state.window.request_redraw();
+            WindowEvent::CloseRequested => {
+                // Remove the closed window (dropping its surface then its shared-device Arc clone;
+                // dropping its `_owner` disposes the window's reactive effects, ARK-002).
+                self.windows.remove(&id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
             }
-            WindowEvent::RedrawRequested => state.redraw(),
-            WindowEvent::Ime(ime) => state.on_ime(ime),
-            WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
-            _ => {}
+            other => {
+                let Some(state) = self.windows.get_mut(&id) else {
+                    return;
+                };
+                match other {
+                    WindowEvent::Resized(size) => {
+                        state.config.width = size.width.max(1);
+                        state.config.height = size.height.max(1);
+                        state.surface.configure(&state.device, &state.config);
+                        state.window.request_redraw();
+                    }
+                    WindowEvent::RedrawRequested => state.redraw(),
+                    WindowEvent::Ime(ime) => state.on_ime(ime),
+                    WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
+                    _ => {}
+                }
+            }
         }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        // A theme hot-reload posted from the watcher thread (#44). Writing the signal on the UI
-        // thread re-runs the #43 swap effect → full damage → `about_to_wait` requests a redraw.
-        // Without `hot-reload`, `UserEvent` is `()` and nothing posts, so `_event` is unused.
+        // A theme hot-reload posted from the watcher thread (#44). Writing the App-level signal on
+        // the UI thread re-runs every window's theme→damage effect → all windows reskin next frame.
         #[cfg(feature = "hot-reload")]
         {
             let ThemeReload(theme) = _event;
-            if let Some(state) = self.window.as_ref() {
-                state.theme.set(Arc::new(theme));
-            }
+            self.theme.set(Arc::new(theme));
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let Some(state) = self.window.as_ref() else {
-            return;
-        };
-        // Hybrid driving (#36, §1.6): request a redraw only when something changed (#35 damage)
-        // or an active source is animating; otherwise the loop stays in `ControlFlow::Wait` and
-        // the app is idle (no redraw, no GPU work). `request_redraw` is the gate — `redraw()`
-        // itself always paints, so OS-expose / first-frame / resize repaints are unaffected.
-        if should_redraw(
-            state.damage.is_dirty(),
-            state.scheduler.has_active_sources(),
-        ) {
-            state.window.request_redraw();
+        // Per-window hybrid driving (#36, §1.6): request a redraw only for windows that are dirty or
+        // animating; an idle window stays idle. Iterates in place (no per-frame allocation, perf.md).
+        for state in self.windows.values() {
+            if should_redraw(
+                state.damage.is_dirty(),
+                state.scheduler.has_active_sources(),
+            ) {
+                state.window.request_redraw();
+            }
         }
     }
 }
@@ -516,10 +658,10 @@ impl ApplicationHandler<UserEvent> for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::element::div;
 
     #[test]
     fn winit_ime_should_map_to_ime_event() {
-        // Preedit/Commit carry through; Enabled/Disabled are state-only (no ImeEvent).
         assert_eq!(
             map_ime_event(Ime::Preedit("あ".to_string(), Some((0, 3)))),
             Some(ImeEvent::Preedit {
@@ -537,52 +679,96 @@ mod tests {
 
     #[test]
     fn ime_owned_key_should_not_be_handled() {
-        // IME toggle/conversion keys are owned by the OS IME — the app must not consume
-        // them as shortcuts. These cover the Zed-defect scenarios (§5.2).
         for code in [
-            KeyCode::Lang5,      // zenkaku/hankaku toggle (#40592/#40638/#40300)
-            KeyCode::Convert,    // henkan
-            KeyCode::NonConvert, // muhenkan (#40321)
+            KeyCode::Lang5,
+            KeyCode::Convert,
+            KeyCode::NonConvert,
             KeyCode::KanaMode,
             KeyCode::Katakana,
-            KeyCode::Lang1, // kana
+            KeyCode::Lang1,
         ] {
             assert!(
                 ime_owns_key(PhysicalKey::Code(code)),
                 "{code:?} should be IME-owned"
             );
         }
-        // Ordinary keys are not IME-owned, so the app keymap may bind them.
         assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::KeyA)));
         assert!(!ime_owns_key(PhysicalKey::Code(KeyCode::Enter)));
     }
 
     #[test]
-    fn root_theme_swap_should_flag_full_damage_and_update_context() {
+    fn window_options_default_should_be_native() {
+        let opts = WindowOptions::default();
+        assert_eq!(opts.decorations, Decorations::Native);
+        assert_eq!(opts.title, "kagari");
+        assert_eq!(opts.inner_size, Size { w: 800.0, h: 600.0 });
+    }
+
+    #[test]
+    fn app_open_window_should_mint_distinct_window_ids() {
+        // `App::new` creates only the wgpu instance (no adapter/device), so this is headless-safe;
+        // `open_window` merely queues the window (created later in `resumed`).
+        let mut app = App::new().expect("app shell");
+        let a = app
+            .open_window(WindowOptions::default(), div)
+            .expect("first window id");
+        let b = app
+            .open_window(WindowOptions::default().title("second"), div)
+            .expect("second window id");
+        assert_ne!(a, b, "each window gets a distinct public id");
+        assert_eq!(app.pending.len(), 2, "both windows are queued for creation");
+    }
+
+    #[test]
+    fn window_theme_effect_should_dispose_on_owner_drop() {
+        // A window's theme→damage effect must stop firing once its child owner is dropped — window
+        // close drops `WindowState._owner`, and `Owner`'s drop disposes the effect (ARK-002; no leak,
+        // no damage flagged on a closed window). Synchronous + owner held to the end (RK-003/005/006).
+        let parent = Owner::new();
+        parent.set();
+
+        let child = parent.child();
+        let damage = Arc::new(DamageState::default());
+        let theme = RwSignal::new(Arc::new(Theme::light()));
+        child.with(|| bind_window_theme_damage(theme, Arc::clone(&damage)));
+        damage.clear();
+
+        // Close the window: dropping its child owner disposes the effect.
+        drop(child);
+        theme.set(Arc::new(Theme::dark()));
+        assert!(
+            !damage.is_dirty(),
+            "a closed window's disposed effect no longer flags damage"
+        );
+
+        drop(parent);
+    }
+
+    #[test]
+    fn window_theme_effect_should_flag_damage_on_swap_and_expose_context() {
         use crate::reactive::{ReadSignal, use_context};
 
-        // Synchronous `ImmediateEffect`, so this is hang-free under the default harness; keep the
-        // owner alive for the whole test since `set` stores only a Weak (RK-003/005).
+        // Synchronous `ImmediateEffect` → hang-free; keep the owner alive (set stores a Weak, RK-003/005).
         let owner = Owner::new();
         owner.set();
 
         let damage = Arc::new(DamageState::default());
         let theme = RwSignal::new(Arc::new(Theme::light()));
-        provide_root_theme(theme, Arc::clone(&damage));
+        // App-side: provide the read-only theme handle into context (what `App::new` does).
+        provide_context(theme.read_only());
+        // Per-window: bind the theme→damage effect (what `create_window` does under the child owner).
+        bind_window_theme_damage(theme, Arc::clone(&damage));
 
-        // The effect runs once on creation → an initial full repaint is flagged.
+        assert!(damage.is_dirty(), "binding flags an initial full repaint");
+        damage.clear();
+        assert!(!damage.is_dirty());
+
+        theme.set(Arc::new(Theme::dark()));
         assert!(
             damage.is_dirty(),
-            "wiring the theme flags an initial full repaint"
+            "a theme swap flags this window's full damage"
         );
-        damage.clear();
-        assert!(!damage.is_dirty(), "clear resets the full-damage flag");
 
-        // A swap re-runs the effect synchronously → full damage again (reskin trigger).
-        theme.set(Arc::new(Theme::dark()));
-        assert!(damage.is_dirty(), "a theme swap flags full damage");
-
-        // Descendants resolve the swapped theme through the read-only context handle.
         let ctx = use_context::<ReadSignal<Arc<Theme>>>().expect("theme provided in context");
         assert_eq!(
             ctx.get_untracked(),

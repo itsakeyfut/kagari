@@ -20,10 +20,11 @@ pub mod reactive;
 pub mod scheduler;
 
 pub use anim::{Animatable, Animated, AnimationSpec, Easing};
-pub use app::App;
+pub use app::{App, Decorations, WindowOptions};
 pub use damage::DamageState;
 pub use element::{
-    AnchorHandle, Placement, ScrollHandle, div, overlay, scroll, text, virtualized_list,
+    AnchorHandle, AnyElement, Element, IntoElement, Placement, ScrollHandle, div, overlay, scroll,
+    text, virtualized_list,
 };
 pub use error::AppError;
 pub use event::{
@@ -33,5 +34,6 @@ pub use event::{
     MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key,
     dispatch_mouse,
 };
+pub use kagari_base::WindowId;
 pub use overlay::{OverlayEntry, OverlayRegistry};
 pub use scheduler::{ActiveSources, Scheduler};
