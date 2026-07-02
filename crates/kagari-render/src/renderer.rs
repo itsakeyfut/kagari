@@ -138,6 +138,11 @@ impl Renderer {
         &mut self.atlas
     }
 
+    /// Occupancy snapshots of both atlases (mono glyph, RGBA image) for the debug overlay (#69).
+    pub fn atlas_usage(&self) -> (crate::atlas::AtlasUsage, crate::atlas::AtlasUsage) {
+        (self.atlas.usage(), self.rgba_atlas.usage())
+    }
+
     /// The RGBA image atlas — the image/SVG loaders (#56/#57) insert decoded tiles here
     /// and the polychrome pipeline samples it (#55).
     pub fn rgba_atlas_mut(&mut self) -> &mut Atlas {

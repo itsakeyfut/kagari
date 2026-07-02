@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::{Point, Rect, Size};
+use kagari_base::{NodeId, Point, Rect, Size};
 use kagari_layout::{LayoutError, LayoutTree};
 use kagari_render::{Atlas, Scene};
 use kagari_text::TextSystem;
@@ -52,7 +52,7 @@ pub fn render_tree(
     viewport: Size,
     damage: &Arc<DamageState>,
     theme: &kagari_style::Theme,
-) -> Result<(), LayoutError> {
+) -> Result<NodeId, LayoutError> {
     let root_id = {
         // `Arc<DamageState>` coerces to the `Arc<dyn DamageSink>` the build context holds.
         let sink: Arc<dyn DamageSink> = Arc::clone(damage) as Arc<dyn DamageSink>;
@@ -112,7 +112,9 @@ pub fn render_tree(
     // `is_dirty`/`damage_rect` to gate redraws and drive partial redraw; such a consumer must run
     // before this `clear` (and before the layout-dirty drain above) to see the full damage set.
     damage.clear();
-    Ok(())
+    // Return the root node id so the shell can walk the tree (e.g. the debug overlay's element
+    // bounds, #69). `render_tree` remains an idempotent build-once + paint pass otherwise.
+    Ok(root_id)
 }
 
 /// Paints one detached `element` into an **existing** `scene` (without clearing it) with its top-left

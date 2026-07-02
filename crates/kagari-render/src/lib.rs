@@ -20,7 +20,7 @@ mod svg;
 mod underline;
 
 pub use assets::{AssetId, AssetLoader, AssetSource, LoadState};
-pub use atlas::{Atlas, AtlasCoord};
+pub use atlas::{Atlas, AtlasCoord, AtlasUsage};
 pub use error::RenderError;
 pub use path::PathBuilder;
 pub use renderer::Renderer;
