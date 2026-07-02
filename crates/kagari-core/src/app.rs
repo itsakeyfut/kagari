@@ -677,6 +677,10 @@ impl App {
             // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
             // window's child owner (RK-005/008); it disposes when the window closes.
             let focus = FocusRegistry::new();
+            // Provide a clone into the window's context (#218) before building the root view, so a
+            // widget's `use_focus_handle()` mints into this same registry (shared inner) and joins its
+            // tab order / `focused_node` resolution. Disposed with the child owner on close (RK-006/008).
+            provide_context(focus.clone());
             let root = (pending.root)();
             (root, focus)
         });
