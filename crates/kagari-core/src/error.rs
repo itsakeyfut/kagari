@@ -9,4 +9,6 @@ pub enum AppError {
     WindowCreate(String),
     #[error("render error: {0}")]
     Render(#[from] kagari_render::RenderError),
+    #[error("persistence error: {0}")]
+    Persist(String),
 }

@@ -73,6 +73,24 @@ impl fmt::Debug for SharedString {
     }
 }
 
+// Serialize as a plain string (no enum tag), so RON/JSON round-trip cleanly (a persisted theme id or
+// action name is just `"..."`, #68). Deserialization always yields the `Shared` variant — the
+// `Static` fast path is for `&'static str` literals, which a deserialized value can't be.
+#[cfg(feature = "serde")]
+impl serde::Serialize for SharedString {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for SharedString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(SharedString::from(s))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +123,17 @@ mod tests {
     fn shared_string_should_display_inner_text() {
         let s: SharedString = "world".to_string().into();
         assert_eq!(format!("{s}"), "world");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn shared_string_should_roundtrip_as_plain_string() {
+        // Serializes without an enum tag and round-trips by content (a Static and its deserialized
+        // Shared counterpart compare equal), so persisted ids/names are just `"..."`.
+        let original: SharedString = "theme-dark".into();
+        let encoded = ron::to_string(&original).expect("serialize");
+        assert_eq!(encoded, "\"theme-dark\"", "serialized as a bare string");
+        let back: SharedString = ron::from_str(&encoded).expect("deserialize");
+        assert_eq!(back, original, "round-trips by content");
     }
 }
