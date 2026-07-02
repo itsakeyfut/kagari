@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::Size;
+use kagari_base::{Point, Rect, Size};
 use kagari_layout::{LayoutError, LayoutTree};
 use kagari_render::{Atlas, Scene};
 use kagari_text::TextSystem;
@@ -19,6 +19,12 @@ use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
 use crate::event::{CursorRegistry, FocusRegistry, HitTest};
 use crate::overlay::OverlayRegistry;
+
+/// A synthetic, fixed overlay order-band for the shell's drag-image (#178) — **not** a real overlay
+/// registration index. Chosen high enough that its band (`OVERLAY_ORDER_BASE + slot*STRIDE`, cx.rs)
+/// composites above all main content and normal overlays (registered at low indices), while still
+/// leaving a full per-slot budget below `u32` saturation. Assumes no real overlay reaches this index.
+const DRAG_IMAGE_ORDER_SLOT: usize = 60_000;
 
 /// Builds, lays out, and paints `root` into `scene` for the given `viewport`.
 ///
@@ -95,6 +101,49 @@ pub fn render_tree(
     // `is_dirty`/`damage_rect` to gate redraws and drive partial redraw; such a consumer must run
     // before this `clear` (and before the layout-dirty drain above) to see the full damage set.
     damage.clear();
+    Ok(())
+}
+
+/// Paints one detached `element` into an **existing** `scene` (without clearing it) with its top-left
+/// at `origin`, above all main content and overlays (a high overlay order band) and **not** hit-tested
+/// — the shell's cursor-tracked drag-image (#178). Builds + lays the element out in its own
+/// `arena`/`layout` (fresh per drag), so it is independent of the main tree. Call after `render_tree`.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_element_into(
+    element: &mut AnyElement,
+    arena: &mut Arena,
+    layout: &mut LayoutTree,
+    text: &mut TextSystem,
+    atlas: Option<&mut Atlas>,
+    scene: &mut Scene,
+    origin: Point,
+    viewport: Size,
+    damage: &Arc<DamageState>,
+    theme: &kagari_style::Theme,
+) -> Result<(), LayoutError> {
+    let root_id = {
+        let sink: Arc<dyn DamageSink> = Arc::clone(damage) as Arc<dyn DamageSink>;
+        let mut layout_cx = LayoutCx {
+            arena,
+            layout,
+            text,
+            damage: sink,
+            theme,
+            focus: None,
+            cursor: None,
+        };
+        element.request_layout(&mut layout_cx)
+    };
+    layout.compute(root_id, viewport)?;
+    let size = layout.layout(root_id).size;
+    let bounds = Rect { origin, size };
+    // `None` hit-test: the drag-image is visual only and must not intercept pointer events (drop
+    // targets under it stay reachable). The overlay band puts it above all normal primitives.
+    let mut paint_cx = PaintCx::new(scene, layout, text, atlas, None, theme);
+    paint_cx.set_viewport(viewport);
+    paint_cx.enter_overlay(DRAG_IMAGE_ORDER_SLOT);
+    element.paint(bounds, &mut paint_cx);
+    paint_cx.exit_overlay();
     Ok(())
 }
 

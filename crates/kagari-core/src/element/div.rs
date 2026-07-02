@@ -12,9 +12,9 @@ use super::{
 };
 use crate::arena::Node;
 use crate::event::{
-    Action, ActionHandler, CursorIcon, DragPayload, DragSource, DropTarget, FocusHandle, FocusId,
-    GestureEvent, GestureHandler, HitRegion, InteractFlags, KeyEvent, KeyHandler, KeyListenerKind,
-    ListenerKind, MouseEvent, MouseHandler,
+    Action, ActionHandler, CursorIcon, DragHandler, DragPayload, DragSource, DropTarget,
+    FocusHandle, FocusId, GestureEvent, GestureHandler, HitRegion, InteractFlags, KeyEvent,
+    KeyHandler, KeyListenerKind, ListenerKind, MouseEvent, MouseHandler,
 };
 use crate::reactive::{Prop, create_effect};
 
@@ -68,6 +68,10 @@ pub struct Div {
     drag_source: Option<DragSource>,
     /// Drop target (#52): accepts a payload of a specific type and runs its handler.
     drop_target: Option<DropTarget>,
+    /// Drag-over listeners (#178): run while an accepting drag hovers this drop target (hover feedback).
+    drag_over_handlers: Vec<DragHandler>,
+    /// Drag-leave listeners (#178): run when a hovering drag leaves this drop target.
+    drag_leave_handlers: Vec<DragHandler>,
     /// The cursor declared by [`cursor`](Self::cursor) (#53), registered with the cursor registry at
     /// build (this node → icon) so pointer-move resolution can pick it. `None` declares nothing.
     cursor: Option<CursorIcon>,
@@ -96,6 +100,8 @@ pub fn div() -> Div {
         gesture_handlers: Vec::new(),
         drag_source: None,
         drop_target: None,
+        drag_over_handlers: Vec::new(),
+        drag_leave_handlers: Vec::new(),
         cursor: None,
         anchor_handle: None,
     }
@@ -270,16 +276,16 @@ impl Div {
         self
     }
 
-    /// Makes this node a drag source (#52): a drag starting here carries the payload produced by
-    /// `payload`. The live mouse-driven drag is wired later; the node becomes hit-testable now.
+    /// Makes this node a drag source (#52): a press here that moves past the drag threshold begins a
+    /// drag carrying the payload produced by `payload` (live flow #178). The node is hit-testable.
     pub fn drag_source<P: DragPayload>(mut self, payload: impl FnMut() -> P + 'static) -> Self {
         self.drag_source = Some(DragSource::new(payload));
         self
     }
 
     /// Attaches a drag-image to this node's drag source (#172): while a drag from here is active, the
-    /// live drag flow (deferred) mounts `image` as a cursor-tracked overlay above all content. Call
-    /// after [`drag_source`](Self::drag_source); a no-op if no drag source is set.
+    /// shell paints `image` as a cursor-tracked overlay above all content (#178). Call after
+    /// [`drag_source`](Self::drag_source); a no-op if no drag source is set.
     pub fn drag_image<E: IntoElement>(mut self, image: impl FnMut() -> E + 'static) -> Self {
         if let Some(source) = self.drag_source.take() {
             self.drag_source = Some(source.with_drag_image(image));
@@ -288,13 +294,29 @@ impl Div {
     }
 
     /// Makes this node a drop target (#52) accepting a payload of type `T`: a matching drop runs
-    /// `on_drop` with the payload; other types are rejected. While a compatible drag hovers, the
-    /// target can highlight (the live hover-feedback signal is wired with the live drag).
+    /// `on_drop` with the payload; other types are rejected. While a compatible drag hovers, its
+    /// [`on_drag_over`](Self::on_drag_over)/[`on_drag_leave`](Self::on_drag_leave) fire for hover
+    /// feedback (live flow #178).
     pub fn drop_target<T: 'static>(
         mut self,
         on_drop: impl FnMut(T, &mut EventCx) + 'static,
     ) -> Self {
         self.drop_target = Some(DropTarget::new(on_drop));
+        self
+    }
+
+    /// Runs `handler` while an **accepting** drag hovers this drop target (#178) — the live drag flow
+    /// delivers drag-over only when the in-flight payload's type matches [`drop_target`](Self::drop_target).
+    /// Use it to raise hover feedback (e.g. set a signal that highlights the target).
+    pub fn on_drag_over(mut self, handler: impl FnMut(&mut EventCx) + 'static) -> Self {
+        self.drag_over_handlers.push(Box::new(handler));
+        self
+    }
+
+    /// Runs `handler` when a hovering drag leaves this drop target (#178) — the counterpart of
+    /// [`on_drag_over`](Self::on_drag_over), for clearing hover feedback.
+    pub fn on_drag_leave(mut self, handler: impl FnMut(&mut EventCx) + 'static) -> Self {
+        self.drag_leave_handlers.push(Box::new(handler));
         self
     }
 
@@ -708,6 +730,70 @@ impl Element for Div {
                     cx.set_current(id);
                     for handler in self.gesture_handlers.iter_mut() {
                         handler(gesture, cx);
+                    }
+                }
+            }
+            Event::DragStart => {
+                // Filtered to the source node (#178): descend to it, then it produces its payload +
+                // drag-image into the cx for the driver to take.
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.should_fire(id) {
+                    if let Some(source) = self.drag_source.as_mut() {
+                        cx.produce_drag(source.payload(), source.drag_image());
+                    }
+                }
+            }
+            Event::DragOver { payload } => {
+                // Filtered to the hovered node (#178): if this is a drop target accepting the payload
+                // type, mark acceptance (hover feedback) and run the drag-over listeners.
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.should_fire(id)
+                    && self
+                        .drop_target
+                        .as_ref()
+                        .is_some_and(|t| t.accepts_type(*payload))
+                {
+                    cx.accept_drag();
+                    cx.set_current(id);
+                    for handler in self.drag_over_handlers.iter_mut() {
+                        handler(cx);
+                    }
+                }
+            }
+            Event::DragLeave => {
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    for handler in self.drag_leave_handlers.iter_mut() {
+                        handler(cx);
+                    }
+                }
+            }
+            Event::Drop => {
+                // Filtered to the drop node (#178): take the owned payload from the cx and deliver it.
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+                if cx.should_fire(id) {
+                    if let Some(target) = self.drop_target.as_mut() {
+                        if let Some(payload) = cx.take_drop_payload() {
+                            cx.set_current(id);
+                            target.try_drop(payload, cx);
+                        }
                     }
                 }
             }

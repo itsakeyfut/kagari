@@ -8,10 +8,12 @@
 //! windows) and `Arc`-shared into each window's renderer. The glyph/image atlases stay per-window
 //! (sharing them is #191); FontDb sharing is #192. Design confirmed by a Tier-2 arch review.
 
+use std::any::TypeId;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use kagari_base::{Point, Size, WindowId};
+use kagari_base::{NodeId, Point, Size, WindowId};
 use kagari_layout::LayoutTree;
 use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
@@ -28,11 +30,12 @@ use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement};
 use crate::error::AppError;
 use crate::event::{
-    Action, CursorIcon, CursorRegistry, CursorState, DispatchState, FocusRegistry,
-    GestureRecognizer, HitTest, KeyChord, KeyContext, KeyEvent, Keymap, Modifiers, MouseButton,
-    MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key, dispatch_mouse,
+    Action, CursorIcon, CursorRegistry, CursorState, DispatchState, DragPayload, FileDrop,
+    FocusRegistry, GestureRecognizer, HitTest, KeyChord, KeyContext, KeyEvent, Keymap, Modifiers,
+    MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_drag_leave, dispatch_drag_over,
+    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
-use crate::paint::render_tree;
+use crate::paint::{paint_element_into, render_tree};
 use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
@@ -139,6 +142,55 @@ pub struct App {
     theme_watcher: Option<kagari_style::ThemeWatcher>,
 }
 
+/// Pointer travel (logical px) a press must exceed before a press-on-a-drag-source becomes a drag
+/// (rather than a click). Compared squared to avoid a sqrt (#178).
+const DRAG_THRESHOLD_PX: f32 = 4.0;
+
+/// Whether the pointer has travelled far enough from an armed press `start` to begin a drag (#178).
+/// Pure (squared distance vs [`DRAG_THRESHOLD_PX`]²) so the arm→active decision is unit-testable.
+fn past_drag_threshold(start: Point, current: Point) -> bool {
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    dx * dx + dy * dy > DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX
+}
+
+/// The drag hover transition when the topmost drop target under the pointer changes from `over`
+/// (which was `accepted`) to `raw` (#178): returns `(leave, query)` — the node to send `drag-leave`
+/// to (only a *previously-accepting* target, so a non-accepting target that never got `drag-over`
+/// isn't spuriously left) and the node to query for acceptance (`raw`, or `None` off all targets).
+/// Pure so the leave-only-if-accepted rule is unit-testable independent of the live window; the
+/// caller invokes it only when `raw != over`.
+fn hover_transition(
+    raw: Option<NodeId>,
+    over: Option<NodeId>,
+    accepted: bool,
+) -> (Option<NodeId>, Option<NodeId>) {
+    let leave = if accepted { over } else { None };
+    (leave, raw)
+}
+
+/// An in-flight drag (#178): the produced payload, its concrete [`TypeId`] (for hover-accept checks),
+/// the drop target currently under the cursor (`over`), and whether that target accepts the payload.
+struct ActiveDrag {
+    payload: Box<dyn DragPayload>,
+    payload_type: TypeId,
+    over: Option<NodeId>,
+    accepted: bool,
+}
+
+/// The window's drag state machine (#178): idle → armed (pressed on a source) → active (past the
+/// threshold) → drop/cancel.
+enum DragState {
+    Idle,
+    /// A press landed on a drag source; a drag begins if the pointer travels past the threshold.
+    Armed {
+        source: NodeId,
+        start: Point,
+    },
+    /// A drag is live: hit-testing drop targets, tracking hover, following the cursor with the image.
+    Active(ActiveDrag),
+}
+
 struct WindowState {
     // `Arc<Window>` lets wgpu hold a `Surface<'static>` via the safe `create_surface` path — no
     // hand-written raw-window-handle lifetime and no `unsafe` (RK-002).
@@ -179,6 +231,17 @@ struct WindowState {
     pointer: Point,
     // The modifiers held, tracked from `ModifiersChanged` (winit key/mouse events don't carry them).
     modifiers: Modifiers,
+    // Live drag-and-drop (#178). `drag` is the state machine; `drag_image` is the shell-owned
+    // cursor-tracked image (built once at drag start from the source's `drag_image()`), painted above
+    // all content each frame at the pointer into its own `drag_image_arena`/`drag_image_layout`.
+    drag: DragState,
+    drag_image: Option<AnyElement>,
+    drag_image_arena: Arena,
+    drag_image_layout: LayoutTree,
+    // A per-drag child owner (of the window owner) scoping the drag-image's build-once reactive-prop
+    // effects, so a reactive drag-image's effects dispose when the drag ends rather than accumulating
+    // on the long-lived window owner (RK-005/006/020). `None` when no drag is active.
+    drag_owner: Option<Owner>,
 }
 
 /// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
@@ -399,6 +462,11 @@ impl App {
                 keymap: Keymap::default(),
                 pointer: Point::new(0.0, 0.0),
                 modifiers: Modifiers::default(),
+                drag: DragState::Idle,
+                drag_image: None,
+                drag_image_arena: Arena::new(),
+                drag_image_layout: LayoutTree::new(),
+                drag_owner: None,
             },
         ))
     }
@@ -558,6 +626,25 @@ impl WindowState {
     fn on_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>, scale: f32) {
         self.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
         self.gestures.set_cursor(self.pointer);
+
+        // A live drag owns the pointer: track drop targets + the image instead of normal move/hover.
+        if matches!(self.drag, DragState::Active(_)) {
+            self.drag_move();
+            return;
+        }
+        // An armed drag becomes active once the pointer travels past the threshold (squared compare).
+        // Copy the start point out first so the `&self.drag` borrow ends before `begin_drag` (&mut).
+        let armed_start = match &self.drag {
+            DragState::Armed { start, .. } => Some(*start),
+            _ => None,
+        };
+        if let Some(start) = armed_start {
+            if past_drag_threshold(start, self.pointer) {
+                self.begin_drag();
+                return;
+            }
+        }
+
         let ev = MouseEvent {
             kind: MouseKind::Move,
             pos: self.pointer,
@@ -583,22 +670,53 @@ impl WindowState {
     /// position). The persisted [`DispatchState`] maintains pointer capture across a drag.
     fn on_mouse_input(&mut self, state: ElementState, button: winit::event::MouseButton) {
         let button = map_mouse_button(button);
-        let kind = match state {
-            ElementState::Pressed => MouseKind::Down(button),
-            ElementState::Released => MouseKind::Up(button),
-        };
-        let ev = MouseEvent {
-            kind,
-            pos: self.pointer,
-            modifiers: self.modifiers,
-        };
-        dispatch_mouse(
-            &mut self.root,
-            &self.arena,
-            &self.hit_test,
-            &ev,
-            &mut self.dispatch,
-        );
+        match state {
+            ElementState::Pressed => {
+                let ev = MouseEvent {
+                    kind: MouseKind::Down(button),
+                    pos: self.pointer,
+                    modifiers: self.modifiers,
+                };
+                dispatch_mouse(
+                    &mut self.root,
+                    &self.arena,
+                    &self.hit_test,
+                    &ev,
+                    &mut self.dispatch,
+                );
+                // Arm a drag if the press landed on a drag source (left button, not already dragging).
+                if button == MouseButton::Left && matches!(self.drag, DragState::Idle) {
+                    if let Some(source) = self.hit_test.pick_where(self.pointer, |f| f.drag_source)
+                    {
+                        self.drag = DragState::Armed {
+                            source,
+                            start: self.pointer,
+                        };
+                    }
+                }
+            }
+            ElementState::Released => {
+                // A live drag consumes the release (drop over an accepting target, else a no-op end).
+                if matches!(self.drag, DragState::Active(_)) {
+                    self.end_drag(true);
+                    return;
+                }
+                // A press that never passed the threshold was a click, not a drag: disarm.
+                self.drag = DragState::Idle;
+                let ev = MouseEvent {
+                    kind: MouseKind::Up(button),
+                    pos: self.pointer,
+                    modifiers: self.modifiers,
+                };
+                dispatch_mouse(
+                    &mut self.root,
+                    &self.arena,
+                    &self.hit_test,
+                    &ev,
+                    &mut self.dispatch,
+                );
+            }
+        }
     }
 
     /// Handle a scroll: dispatch the raw wheel to `on_wheel` **and** the recognized gesture (pan, or
@@ -641,6 +759,14 @@ impl WindowState {
         let PhysicalKey::Code(code) = event.physical_key else {
             return; // An unidentified physical key: nothing to route.
         };
+        // Esc cancels a live drag (#178) and consumes the key — before keymap/focus routing.
+        if code == KeyCode::Escape
+            && event.state.is_pressed()
+            && matches!(self.drag, DragState::Active(_))
+        {
+            self.end_drag(false);
+            return;
+        }
         let kev = KeyEvent {
             code,
             modifiers: self.modifiers,
@@ -672,6 +798,105 @@ impl WindowState {
     fn on_cursor_left(&mut self) {
         if let Some(icon) = self.cursor_state.apply(CursorIcon::Default) {
             self.window.set_cursor(map_cursor_icon(icon));
+        }
+    }
+
+    /// Begin an active drag from an armed source (#178): ask the source to produce its payload +
+    /// drag-image (`dispatch_drag_start`), then track it. A source that produces nothing disarms.
+    fn begin_drag(&mut self) {
+        let source = match &self.drag {
+            DragState::Armed { source, .. } => *source,
+            _ => return,
+        };
+        let Some((payload, image)) = dispatch_drag_start(&mut self.root, &self.arena, source)
+        else {
+            self.drag = DragState::Idle;
+            return;
+        };
+        // Deref to the inner payload for its concrete `TypeId` (RK-015: `Box<dyn DragPayload>` itself
+        // impls `DragPayload`, so `payload.as_any()` would resolve to the box).
+        let payload_type = (*payload).as_any().type_id();
+        self.drag_image = image;
+        // Fresh arena/layout per drag so the previous drag's nodes don't accumulate.
+        self.drag_image_arena = Arena::new();
+        self.drag_image_layout = LayoutTree::new();
+        // Per-drag child owner: the drag-image's build-once reactive-prop effects scope here and are
+        // disposed in `end_drag`, so they don't accumulate on the long-lived window owner (RK-006/020).
+        self.drag_owner = Some(self._owner.child());
+        self.drag = DragState::Active(ActiveDrag {
+            payload,
+            payload_type,
+            over: None,
+            accepted: false,
+        });
+        // No signal write happens here, so flag damage explicitly to paint the image next frame.
+        self.damage.mark_all_dirty();
+    }
+
+    /// Track the pointer during an active drag (#178): follow drop targets, firing `on_drag_over` on
+    /// entering an accepting target and `on_drag_leave` on leaving it, and repaint the drag-image.
+    fn drag_move(&mut self) {
+        let (payload_type, over, accepted) = match &self.drag {
+            DragState::Active(d) => (d.payload_type, d.over, d.accepted),
+            _ => return,
+        };
+        let raw = self.hit_test.pick_where(self.pointer, |f| f.drop_target);
+        if raw != over {
+            let (leave, query) = hover_transition(raw, over, accepted);
+            // Leave the previous target (only if it had accepted — i.e. `on_drag_over` had fired).
+            if let Some(old) = leave {
+                dispatch_drag_leave(&mut self.root, &self.arena, old);
+            }
+            let new_accepted = match query {
+                Some(t) => dispatch_drag_over(&mut self.root, &self.arena, t, payload_type),
+                None => false,
+            };
+            if let DragState::Active(d) = &mut self.drag {
+                d.over = raw;
+                d.accepted = new_accepted;
+            }
+        }
+        // The pointer moved; repaint so the drag-image tracks it.
+        self.damage.mark_all_dirty();
+    }
+
+    /// End an active drag (#178): on `commit` (mouse-up) over an accepting target, deliver the payload
+    /// (`try_drop`); always clear the target's hover feedback and drop the drag-image. `commit = false`
+    /// is a cancel (Esc). A mouse-up off any accepting target passes `commit = true` but delivers
+    /// nothing (`over`/`accepted` gate it), so it is a no-op end.
+    fn end_drag(&mut self, commit: bool) {
+        if let DragState::Active(d) = std::mem::replace(&mut self.drag, DragState::Idle) {
+            if let Some(target) = d.over {
+                if d.accepted {
+                    if commit {
+                        dispatch_drop(&mut self.root, &self.arena, target, d.payload);
+                    }
+                    dispatch_drag_leave(&mut self.root, &self.arena, target);
+                }
+            }
+        }
+        // Dispose the per-drag owner so the drag-image's reactive effects are torn down, not leaked
+        // onto the window owner (RK-006/020).
+        if let Some(owner) = self.drag_owner.take() {
+            owner.cleanup();
+        }
+        // Release any pointer grab a drag source took on mouse-down: a live drag consumes the
+        // mouse-up (it never reaches `dispatch_mouse`'s Up path, which would otherwise clear this),
+        // so clear it here to avoid misrouting later moves to a stale captured node.
+        self.dispatch.captured = None;
+        self.drag_image = None;
+        self.damage.mark_all_dirty();
+    }
+
+    /// An OS file drop (winit `DroppedFile`): deliver a [`FileDrop`] to the topmost file-accepting drop
+    /// target under the pointer (#178). winit sends one path per event; each is delivered on its own.
+    fn on_dropped_file(&mut self, path: PathBuf) {
+        if let Some(target) = self.hit_test.pick_where(self.pointer, |f| f.drop_target) {
+            let payload: Box<dyn DragPayload> = Box::new(FileDrop(vec![path]));
+            // Unlike begin/move/end_drag, no explicit `mark_all_dirty`: the drop handler's signal
+            // writes flag damage via their synchronous effects; a handler that changes nothing
+            // visible (e.g. only logs) needs no repaint.
+            dispatch_drop(&mut self.root, &self.arena, target, payload);
         }
     }
 
@@ -719,6 +944,30 @@ impl WindowState {
         ) {
             tracing::error!(error = %e, "layout/paint failed");
             return;
+        }
+
+        // Paint the cursor-tracked drag-image on top of the main tree (#178), into the same scene.
+        // Built under the per-drag owner so any reactive props register there and dispose when the
+        // drag ends, rather than leaking onto the window owner (RK-006/008/020).
+        if let Some(owner) = self.drag_owner.clone() {
+            owner.with(|| {
+                if let Some(image) = self.drag_image.as_mut() {
+                    if let Err(e) = paint_element_into(
+                        image,
+                        &mut self.drag_image_arena,
+                        &mut self.drag_image_layout,
+                        &mut self.text,
+                        Some(self.renderer.atlas_mut()),
+                        &mut self.scene,
+                        self.pointer,
+                        viewport,
+                        &self.damage,
+                        &theme,
+                    ) {
+                        tracing::error!(error = %e, "drag-image paint failed");
+                    }
+                }
+            });
         }
 
         if let Err(e) = self.renderer.render(
@@ -872,6 +1121,7 @@ impl ApplicationHandler<UserEvent> for App {
                     } => state.on_mouse_input(btn_state, button),
                     WindowEvent::MouseWheel { delta, .. } => state.on_mouse_wheel(delta, scale),
                     WindowEvent::PinchGesture { delta, .. } => state.on_pinch(delta),
+                    WindowEvent::DroppedFile(path) => state.on_dropped_file(path),
                     WindowEvent::KeyboardInput { event, .. } => state.on_keyboard(&event),
                     _ => {}
                 }
@@ -1098,6 +1348,33 @@ mod tests {
         let chord = key_chord(&ev);
         assert_eq!(chord.code, KeyCode::KeyS);
         assert_eq!(chord.modifiers, mods);
+    }
+
+    #[test]
+    fn drag_threshold_should_activate_only_past_distance() {
+        let start = Point::new(10.0, 10.0);
+        assert!(
+            !past_drag_threshold(start, Point::new(11.0, 11.0)),
+            "a tiny move stays armed (a click, not a drag)"
+        );
+        assert!(
+            past_drag_threshold(start, Point::new(20.0, 20.0)),
+            "moving past the threshold begins a drag"
+        );
+    }
+
+    #[test]
+    fn hover_transition_should_leave_only_a_previously_accepted_target() {
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        // Entering a target from empty: nothing to leave; query the new one.
+        assert_eq!(hover_transition(Some(a), None, false), (None, Some(a)));
+        // Accepting target a → another target b: leave a, query b.
+        assert_eq!(hover_transition(Some(b), Some(a), true), (Some(a), Some(b)));
+        // Non-accepting target a → b: do NOT leave a (it never received drag-over); query b.
+        assert_eq!(hover_transition(Some(b), Some(a), false), (None, Some(b)));
+        // Accepting target a → off all targets: leave a, nothing to query.
+        assert_eq!(hover_transition(None, Some(a), true), (Some(a), None));
     }
 
     /// A key event for `code` with default modifiers.

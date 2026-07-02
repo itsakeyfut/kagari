@@ -13,11 +13,13 @@
 //! ordering (and future `_capture` variants / gesture & DnD interception). Live winit→dispatch
 //! wiring is deferred to the first interactive consumer; [`dispatch_mouse`] is the headless entry.
 
+use std::any::TypeId;
+
 use kagari_base::{NodeId, Point};
 
 use crate::arena::Arena;
 use crate::element::{AnyElement, Event, EventCx};
-use crate::event::HitTest;
+use crate::event::{DragPayload, HitTest};
 
 /// Physical key identity (#49). Re-exported from winit (W3C UI Events `code`): kagari is desktop-only
 /// and winit is a permanent dependency, so the standard `KeyCode` is used directly rather than
@@ -420,6 +422,95 @@ pub fn dispatch_gesture(
             &Event::Gesture(*ev),
         );
     }
+}
+
+/// Delivers [`Event::DragStart`] to the drag source `node`, returning the `(payload, drag-image)` it
+/// produced (or `None` if `node` is not a drag source). The live drag driver (#178) calls this once,
+/// when a press-and-move passes the drag threshold. Delivered only to `node` (filtered), so a
+/// drag-source ancestor on the path does not also produce.
+pub fn dispatch_drag_start(
+    root: &mut AnyElement,
+    arena: &Arena,
+    node: NodeId,
+) -> Option<(Box<dyn DragPayload>, Option<AnyElement>)> {
+    let path = ancestor_path(arena, node);
+    let only = [node];
+    let mut cx = EventCx::new(
+        arena,
+        Delivery::Filtered {
+            path: &path,
+            only: &only,
+        },
+    );
+    root.handle_event(&Event::DragStart, &mut cx);
+    cx.take_produced()
+}
+
+/// Delivers [`Event::DragOver`] (carrying the in-flight payload's [`TypeId`]) to the drop target
+/// `node`, returning whether it accepts (a matching type). An accepting target also runs its
+/// `on_drag_over` handler (hover feedback). Filtered to `node`.
+pub fn dispatch_drag_over(
+    root: &mut AnyElement,
+    arena: &Arena,
+    node: NodeId,
+    payload_ty: TypeId,
+) -> bool {
+    let path = ancestor_path(arena, node);
+    let only = [node];
+    let mut cx = EventCx::new(
+        arena,
+        Delivery::Filtered {
+            path: &path,
+            only: &only,
+        },
+    );
+    root.handle_event(
+        &Event::DragOver {
+            payload: payload_ty,
+        },
+        &mut cx,
+    );
+    cx.drag_accepted()
+}
+
+/// Delivers [`Event::DragLeave`] to the drop target `node` (runs its `on_drag_leave` handler) as the
+/// drag moves off it. Filtered to `node`.
+pub fn dispatch_drag_leave(root: &mut AnyElement, arena: &Arena, node: NodeId) {
+    let path = ancestor_path(arena, node);
+    let only = [node];
+    deliver(
+        root,
+        arena,
+        Delivery::Filtered {
+            path: &path,
+            only: &only,
+        },
+        &Event::DragLeave,
+    );
+}
+
+/// Delivers [`Event::Drop`] carrying the owned `payload` to the drop target `node`, returning whether
+/// the target consumed it (a matching `try_drop`). The driver calls this on mouse-up over an accepting
+/// target. Filtered to `node`.
+pub fn dispatch_drop(
+    root: &mut AnyElement,
+    arena: &Arena,
+    node: NodeId,
+    payload: Box<dyn DragPayload>,
+) -> bool {
+    let path = ancestor_path(arena, node);
+    let only = [node];
+    let mut cx = EventCx::new(
+        arena,
+        Delivery::Filtered {
+            path: &path,
+            only: &only,
+        },
+    );
+    cx.set_drop_payload(payload);
+    root.handle_event(&Event::Drop, &mut cx);
+    // The target took the payload iff the drop landed (a matching drop target ran `try_drop`).
+    cx.take_drop_payload().is_none()
 }
 
 #[cfg(test)]
@@ -966,5 +1057,82 @@ mod tests {
             "entered B on crossing"
         );
         assert!(!log.contains(&"leave b".to_string()), "B was never left");
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Foo(u32);
+    #[derive(Debug)]
+    struct Bar;
+
+    #[test]
+    fn dispatch_drag_start_should_produce_source_payload() {
+        let (mut root, arena, id) = build(div().drag_source(|| Foo(7)));
+        let (payload, image) =
+            dispatch_drag_start(&mut root, &arena, id).expect("a drag source produces a payload");
+        assert!(image.is_none(), "no drag-image was attached");
+        // The TypeId derives through the box to the inner concrete type, not the box (RK-015) — this
+        // is what the live drag flow uses for hover-accept checks.
+        assert_eq!(
+            (*payload).as_any().type_id(),
+            TypeId::of::<Foo>(),
+            "TypeId is the inner payload's, not Box<dyn DragPayload>'s"
+        );
+        let foo = payload
+            .into_any()
+            .downcast::<Foo>()
+            .expect("payload is Foo");
+        assert_eq!(*foo, Foo(7), "the source's produced payload is delivered");
+    }
+
+    #[test]
+    fn dispatch_drag_start_should_produce_drag_image_when_attached() {
+        let (mut root, arena, id) = build(div().drag_source(|| Foo(1)).drag_image(div));
+        let (_payload, image) =
+            dispatch_drag_start(&mut root, &arena, id).expect("a drag source produces a payload");
+        assert!(
+            image.is_some(),
+            "the attached drag-image is produced on DragStart"
+        );
+    }
+
+    #[test]
+    fn dispatch_drag_over_should_accept_matching_type_and_reject_wrong() {
+        let (mut root, arena, id) = build(div().drop_target::<Foo>(|_f: Foo, _cx| {}));
+        assert!(
+            dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>()),
+            "a matching payload type is accepted"
+        );
+        assert!(
+            !dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Bar>()),
+            "a wrong payload type is rejected"
+        );
+    }
+
+    #[test]
+    fn dispatch_drop_should_deliver_to_matching_target() {
+        let got: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+        let g = Rc::clone(&got);
+        let (mut root, arena, id) =
+            build(div().drop_target::<Foo>(move |f: Foo, _cx| *g.borrow_mut() = Some(f.0)));
+        assert!(
+            dispatch_drop(&mut root, &arena, id, Box::new(Foo(9))),
+            "the matching target consumed the payload"
+        );
+        assert_eq!(*got.borrow(), Some(9), "the handler received the payload");
+    }
+
+    #[test]
+    fn on_drag_over_and_leave_handlers_should_fire() {
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let (lo, ll) = (Rc::clone(&log), Rc::clone(&log));
+        let (mut root, arena, id) = build(
+            div()
+                .drop_target::<Foo>(|_f: Foo, _cx| {})
+                .on_drag_over(move |_cx| lo.borrow_mut().push("over"))
+                .on_drag_leave(move |_cx| ll.borrow_mut().push("leave")),
+        );
+        dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>());
+        dispatch_drag_leave(&mut root, &arena, id);
+        assert_eq!(*log.borrow(), vec!["over", "leave"]);
     }
 }

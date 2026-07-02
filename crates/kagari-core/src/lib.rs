@@ -31,8 +31,8 @@ pub use event::{
     Action, CursorIcon, CursorRegistry, CursorState, DispatchState, DragPayload, DragSource,
     DropTarget, FileDrop, FocusHandle, FocusId, FocusRegistry, GestureEvent, GestureRecognizer,
     HitRegion, HitTest, InteractFlags, KeyChord, KeyCode, KeyContext, KeyEvent, Keymap, Modifiers,
-    MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key,
-    dispatch_mouse,
+    MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_drag_leave, dispatch_drag_over,
+    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
 pub use kagari_base::WindowId;
 pub use overlay::{OverlayEntry, OverlayRegistry};
