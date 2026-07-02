@@ -11,12 +11,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kagari_base::{Size, WindowId};
+use kagari_base::{Point, Size, WindowId};
 use kagari_layout::LayoutTree;
 use kagari_text::{FontDb, ImeEvent, TextSystem};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{Ime, KeyEvent, WindowEvent};
+use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
@@ -27,6 +27,11 @@ use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement};
 use crate::error::AppError;
+use crate::event::{
+    Action, CursorIcon, CursorRegistry, CursorState, DispatchState, FocusRegistry,
+    GestureRecognizer, HitTest, KeyChord, KeyContext, KeyEvent, Keymap, Modifiers, MouseButton,
+    MouseEvent, MouseKind, dispatch_action, dispatch_gesture, dispatch_key, dispatch_mouse,
+};
 use crate::paint::render_tree;
 use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
@@ -159,6 +164,21 @@ struct WindowState {
     theme: RwSignal<Arc<Theme>>,
     scheduler: Scheduler,
     ime_enabled: bool,
+    // Per-window interactive state, persisted across frames (live winit input wiring, #177).
+    // `hit_test` is re-recorded every paint; `focus`/`cursor_reg` are populated on the build-once
+    // pass (they are not cleared per frame). `dispatch` keeps pointer capture across a drag.
+    hit_test: HitTest,
+    focus: FocusRegistry,
+    cursor_reg: CursorRegistry,
+    cursor_state: CursorState,
+    dispatch: DispatchState,
+    gestures: GestureRecognizer,
+    keymap: Keymap,
+    // The last known pointer position (logical px, window coords), tracked from `CursorMoved` and
+    // used for `MouseInput`/`MouseWheel` (which carry no position) and gesture targeting.
+    pointer: Point,
+    // The modifiers held, tracked from `ModifiersChanged` (winit key/mouse events don't carry them).
+    modifiers: Modifiers,
 }
 
 /// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
@@ -342,9 +362,13 @@ impl App {
         let child_owner = self.root_owner.child();
         let theme = self.theme;
         let damage = Arc::new(DamageState::default());
-        let root = child_owner.with(|| {
+        let (root, focus) = child_owner.with(|| {
             bind_window_theme_damage(theme, Arc::clone(&damage));
-            (pending.root)()
+            // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
+            // window's child owner (RK-005/008); it disposes when the window closes.
+            let focus = FocusRegistry::new();
+            let root = (pending.root)();
+            (root, focus)
         });
 
         Ok((
@@ -366,6 +390,15 @@ impl App {
                 theme,
                 scheduler: Scheduler::new(),
                 ime_enabled: false,
+                hit_test: HitTest::new(),
+                focus,
+                cursor_reg: CursorRegistry::new(),
+                cursor_state: CursorState::new(),
+                dispatch: DispatchState::default(),
+                gestures: GestureRecognizer::new(),
+                keymap: Keymap::default(),
+                pointer: Point::new(0.0, 0.0),
+                modifiers: Modifiers::default(),
             },
         ))
     }
@@ -406,12 +439,86 @@ fn ime_owns_key(key: PhysicalKey) -> bool {
     )
 }
 
-/// Route a key event. IME-owned toggle/conversion keys are passed through to the OS IME and never
-/// consumed as a shortcut; other keys are where the app keymap will dispatch (live wiring is #177).
-fn route_key_event(event: &KeyEvent) {
-    if ime_owns_key(event.physical_key) {
-        tracing::trace!(key = ?event.physical_key, "ime-owned key passed through");
+/// Logical-pixel scroll distance per wheel "line" (winit `LineDelta`), roughly a text line height.
+const WHEEL_LINE_PX: f32 = 16.0;
+
+/// Maps winit's modifier state to kagari's [`Modifiers`] (tracked from `ModifiersChanged`, since
+/// winit key/mouse events don't carry modifiers).
+fn map_modifiers(state: winit::keyboard::ModifiersState) -> Modifiers {
+    Modifiers {
+        ctrl: state.control_key(),
+        shift: state.shift_key(),
+        alt: state.alt_key(),
+        meta: state.super_key(),
     }
+}
+
+/// Maps a winit mouse button to kagari's [`MouseButton`]. Total: extra buttons (`Back`/`Forward`/
+/// `Other`) fold into [`MouseButton::Other`] with a platform index.
+fn map_mouse_button(button: winit::event::MouseButton) -> MouseButton {
+    use winit::event::MouseButton as W;
+    match button {
+        W::Left => MouseButton::Left,
+        W::Right => MouseButton::Right,
+        W::Middle => MouseButton::Middle,
+        W::Back => MouseButton::Other(3),
+        W::Forward => MouseButton::Other(4),
+        W::Other(n) => MouseButton::Other(n),
+    }
+}
+
+/// Maps kagari's [`CursorIcon`] to winit's, at the window boundary so the winit type never leaks
+/// through the public builder (design.md §1). Exhaustive over kagari's variants (adding one is a
+/// compile error here — intended).
+fn map_cursor_icon(icon: CursorIcon) -> winit::window::CursorIcon {
+    use winit::window::CursorIcon as W;
+    match icon {
+        CursorIcon::Default => W::Default,
+        CursorIcon::Pointer => W::Pointer,
+        CursorIcon::Text => W::Text,
+        CursorIcon::Crosshair => W::Crosshair,
+        CursorIcon::Grab => W::Grab,
+        CursorIcon::Grabbing => W::Grabbing,
+        CursorIcon::ColResize => W::ColResize,
+        CursorIcon::RowResize => W::RowResize,
+        CursorIcon::EwResize => W::EwResize,
+        CursorIcon::NsResize => W::NsResize,
+    }
+}
+
+/// Converts a winit scroll delta to a logical-pixel `(dx, dy)`. Line deltas (mouse wheels) scale by
+/// [`WHEEL_LINE_PX`]; pixel deltas (precision touchpads) are physical, so divide by `scale`.
+fn scroll_delta(delta: MouseScrollDelta, scale: f32) -> (f32, f32) {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (x * WHEEL_LINE_PX, y * WHEEL_LINE_PX),
+        MouseScrollDelta::PixelDelta(p) => (p.x as f32 / scale, p.y as f32 / scale),
+    }
+}
+
+/// The [`KeyChord`] for a resolved key event: its physical code + the modifiers held.
+fn key_chord(ev: &KeyEvent) -> KeyChord {
+    KeyChord::new(ev.code, ev.modifiers)
+}
+
+/// The routing decision for a key event (#177 Q2, keymap-first-consume).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum KeyRoute {
+    /// A chord bound in the keymap (on press): consumed as this `Action`, not delivered as a key.
+    Consume(Action),
+    /// Deliver the raw key to the focused node (unbound key, or any release).
+    Deliver,
+}
+
+/// Decides how a key event routes: a keymap-bound chord **on press** is consumed as an `Action`;
+/// unbound keys and all releases are delivered to the focused node. Pure (no dispatch) so the
+/// keymap-first-consume policy is unit-testable independent of the live window.
+fn route_key(keymap: &Keymap, ev: &KeyEvent) -> KeyRoute {
+    if ev.pressed {
+        if let Some(action) = keymap.resolve(key_chord(ev), &KeyContext::default()) {
+            return KeyRoute::Consume(action);
+        }
+    }
+    KeyRoute::Deliver
 }
 
 impl WindowState {
@@ -444,6 +551,128 @@ impl WindowState {
         use winit::dpi::LogicalPosition;
         self.window
             .set_ime_cursor_area(LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 16.0));
+    }
+
+    /// Handle a pointer move: update the tracked position + gesture cursor, dispatch a `Move` (hover
+    /// diff + capture), then resolve the cursor and apply it only when it changes (#53).
+    fn on_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>, scale: f32) {
+        self.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
+        self.gestures.set_cursor(self.pointer);
+        let ev = MouseEvent {
+            kind: MouseKind::Move,
+            pos: self.pointer,
+            modifiers: self.modifiers,
+        };
+        dispatch_mouse(
+            &mut self.root,
+            &self.arena,
+            &self.hit_test,
+            &ev,
+            &mut self.dispatch,
+        );
+
+        let resolved = self
+            .cursor_reg
+            .resolve(&self.hit_test, &self.arena, self.pointer);
+        if let Some(icon) = self.cursor_state.apply(resolved) {
+            self.window.set_cursor(map_cursor_icon(icon));
+        }
+    }
+
+    /// Handle a mouse button press/release at the tracked pointer (winit `MouseInput` carries no
+    /// position). The persisted [`DispatchState`] maintains pointer capture across a drag.
+    fn on_mouse_input(&mut self, state: ElementState, button: winit::event::MouseButton) {
+        let button = map_mouse_button(button);
+        let kind = match state {
+            ElementState::Pressed => MouseKind::Down(button),
+            ElementState::Released => MouseKind::Up(button),
+        };
+        let ev = MouseEvent {
+            kind,
+            pos: self.pointer,
+            modifiers: self.modifiers,
+        };
+        dispatch_mouse(
+            &mut self.root,
+            &self.arena,
+            &self.hit_test,
+            &ev,
+            &mut self.dispatch,
+        );
+    }
+
+    /// Handle a scroll: dispatch the raw wheel to `on_wheel` **and** the recognized gesture (pan, or
+    /// zoom with ctrl) to `on_gesture` — independent opt-in channels (#177 Q1).
+    fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, scale: f32) {
+        let (dx, dy) = scroll_delta(delta, scale);
+        let wheel = MouseEvent {
+            kind: MouseKind::Wheel { dx, dy },
+            pos: self.pointer,
+            modifiers: self.modifiers,
+        };
+        dispatch_mouse(
+            &mut self.root,
+            &self.arena,
+            &self.hit_test,
+            &wheel,
+            &mut self.dispatch,
+        );
+
+        let gesture = self.gestures.recognize_scroll(dx, dy, self.modifiers);
+        let target = self.hit_test.pick(self.pointer);
+        dispatch_gesture(&mut self.root, &self.arena, target, &gesture);
+    }
+
+    /// Handle a native touchpad magnify (winit `PinchGesture`): a zoom gesture about the cursor.
+    fn on_pinch(&mut self, delta: f64) {
+        let gesture = self.gestures.recognize_magnify(delta as f32);
+        let target = self.hit_test.pick(self.pointer);
+        dispatch_gesture(&mut self.root, &self.arena, target, &gesture);
+    }
+
+    /// Route a keyboard event: IME-owned keys pass through to the OS IME (RK-002); otherwise the pure
+    /// [`route_key`] decision (keymap-first-consume, #177 Q2) says whether to consume the chord as an
+    /// `Action` or deliver the raw key to the focused node.
+    fn on_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        if ime_owns_key(event.physical_key) {
+            tracing::trace!(key = ?event.physical_key, "ime-owned key passed through");
+            return;
+        }
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return; // An unidentified physical key: nothing to route.
+        };
+        let kev = KeyEvent {
+            code,
+            modifiers: self.modifiers,
+            pressed: event.state.is_pressed(),
+            repeat: event.repeat,
+        };
+        match route_key(&self.keymap, &kev) {
+            KeyRoute::Consume(action) => self.handle_action(action),
+            KeyRoute::Deliver => {
+                dispatch_key(&mut self.root, &self.arena, self.focus.focused_node(), &kev)
+            }
+        }
+    }
+
+    /// Apply a keymap-resolved action: framework focus navigation is handled directly; an app-named
+    /// action bubbles to `on_action` handlers along the focus chain.
+    fn handle_action(&mut self, action: Action) {
+        match action {
+            Action::FocusNext => self.focus.focus_next(),
+            Action::FocusPrev => self.focus.focus_prev(),
+            _ => {
+                let focused = self.focus.focused_node();
+                dispatch_action(&mut self.root, &self.arena, focused, &action);
+            }
+        }
+    }
+
+    /// The pointer left the window: revert to the default cursor.
+    fn on_cursor_left(&mut self) {
+        if let Some(icon) = self.cursor_state.apply(CursorIcon::Default) {
+            self.window.set_cursor(map_cursor_icon(icon));
+        }
     }
 
     fn redraw(&mut self) {
@@ -479,8 +708,10 @@ impl WindowState {
             &mut self.layout,
             &mut self.text,
             Some(self.renderer.atlas_mut()),
-            None,
-            None,
+            Some(&mut self.hit_test),
+            None, // a window overlay registry (menus/tooltips live hit-testing) is out of #177 scope
+            Some(&mut self.focus),
+            Some(&mut self.cursor_reg),
             &mut self.scene,
             viewport,
             &self.damage,
@@ -615,6 +846,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(state) = self.windows.get_mut(&id) else {
                     return;
                 };
+                let scale = state.window.scale_factor() as f32;
                 match other {
                     WindowEvent::Resized(size) => {
                         state.config.width = size.width.max(1);
@@ -624,7 +856,23 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     WindowEvent::RedrawRequested => state.redraw(),
                     WindowEvent::Ime(ime) => state.on_ime(ime),
-                    WindowEvent::KeyboardInput { event, .. } => route_key_event(&event),
+                    WindowEvent::ModifiersChanged(m) => state.modifiers = map_modifiers(m.state()),
+                    // Clear tracked modifiers on focus loss: winit doesn't guarantee a
+                    // `ModifiersChanged` when focus leaves (e.g. Alt+Tab), so a held modifier would
+                    // otherwise stay stuck and leak into the next click/key.
+                    WindowEvent::Focused(false) => state.modifiers = Modifiers::default(),
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.on_cursor_moved(position, scale)
+                    }
+                    WindowEvent::CursorLeft { .. } => state.on_cursor_left(),
+                    WindowEvent::MouseInput {
+                        state: btn_state,
+                        button,
+                        ..
+                    } => state.on_mouse_input(btn_state, button),
+                    WindowEvent::MouseWheel { delta, .. } => state.on_mouse_wheel(delta, scale),
+                    WindowEvent::PinchGesture { delta, .. } => state.on_pinch(delta),
+                    WindowEvent::KeyboardInput { event, .. } => state.on_keyboard(&event),
                     _ => {}
                 }
             }
@@ -777,5 +1025,113 @@ mod tests {
         );
 
         drop(owner);
+    }
+
+    #[test]
+    fn map_modifiers_should_translate_winit_state() {
+        use winit::keyboard::ModifiersState;
+        let m = map_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+        assert!(m.ctrl && m.shift, "ctrl+shift are set");
+        assert!(!m.alt && !m.meta, "alt/meta are not");
+        assert_eq!(
+            map_modifiers(ModifiersState::empty()),
+            Modifiers::default(),
+            "no modifiers maps to the default"
+        );
+    }
+
+    #[test]
+    fn map_mouse_button_should_map_common_and_extra() {
+        use winit::event::MouseButton as W;
+        assert_eq!(map_mouse_button(W::Left), MouseButton::Left);
+        assert_eq!(map_mouse_button(W::Right), MouseButton::Right);
+        assert_eq!(map_mouse_button(W::Middle), MouseButton::Middle);
+        // Extra buttons fold into `Other` with a platform index.
+        assert_eq!(map_mouse_button(W::Back), MouseButton::Other(3));
+        assert_eq!(map_mouse_button(W::Forward), MouseButton::Other(4));
+        assert_eq!(map_mouse_button(W::Other(7)), MouseButton::Other(7));
+    }
+
+    #[test]
+    fn map_cursor_icon_should_cover_every_kagari_icon() {
+        use winit::window::CursorIcon as W;
+        // Representative of each mapped shape (the match is exhaustive, so a new kagari variant is a
+        // compile error until mapped).
+        assert_eq!(map_cursor_icon(CursorIcon::Default), W::Default);
+        assert_eq!(map_cursor_icon(CursorIcon::Pointer), W::Pointer);
+        assert_eq!(map_cursor_icon(CursorIcon::Text), W::Text);
+        assert_eq!(map_cursor_icon(CursorIcon::Grabbing), W::Grabbing);
+        assert_eq!(map_cursor_icon(CursorIcon::ColResize), W::ColResize);
+        assert_eq!(map_cursor_icon(CursorIcon::NsResize), W::NsResize);
+    }
+
+    #[test]
+    fn scroll_delta_should_scale_line_and_pixel() {
+        use winit::dpi::PhysicalPosition;
+        // A line wheel scales by WHEEL_LINE_PX.
+        assert_eq!(
+            scroll_delta(MouseScrollDelta::LineDelta(0.0, 1.0), 1.0),
+            (0.0, WHEEL_LINE_PX)
+        );
+        // A pixel delta is physical → divided by the scale factor to logical px.
+        assert_eq!(
+            scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(20.0, 40.0)),
+                2.0
+            ),
+            (10.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn key_chord_should_carry_code_and_modifiers() {
+        let mods = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let ev = KeyEvent {
+            code: KeyCode::KeyS,
+            modifiers: mods,
+            pressed: true,
+            repeat: false,
+        };
+        let chord = key_chord(&ev);
+        assert_eq!(chord.code, KeyCode::KeyS);
+        assert_eq!(chord.modifiers, mods);
+    }
+
+    /// A key event for `code` with default modifiers.
+    fn key(code: KeyCode, pressed: bool) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: Modifiers::default(),
+            pressed,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn route_key_should_consume_bound_chord_on_press() {
+        // The default keymap binds Tab → FocusNext, so a Tab press is consumed as that action.
+        let km = Keymap::default();
+        assert_eq!(
+            route_key(&km, &key(KeyCode::Tab, true)),
+            KeyRoute::Consume(Action::FocusNext)
+        );
+    }
+
+    #[test]
+    fn route_key_should_deliver_bound_chord_on_release() {
+        // Actions are press-triggered: the Tab *release* is delivered to the focused node, not
+        // consumed (keymap is only consulted on press).
+        let km = Keymap::default();
+        assert_eq!(route_key(&km, &key(KeyCode::Tab, false)), KeyRoute::Deliver);
+    }
+
+    #[test]
+    fn route_key_should_deliver_unbound_key() {
+        // An unbound key press falls through to the focused node.
+        let km = Keymap::default();
+        assert_eq!(route_key(&km, &key(KeyCode::KeyA, true)), KeyRoute::Deliver);
     }
 }
