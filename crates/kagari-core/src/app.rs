@@ -8,7 +8,7 @@
 //! windows) and `Arc`-shared into each window's renderer. The glyph/image atlases stay per-window
 //! (sharing them is #191); FontDb sharing is #192. Design confirmed by a Tier-2 arch review.
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +50,42 @@ struct ThemeReload(Theme);
 type UserEvent = ThemeReload;
 #[cfg(not(feature = "hot-reload"))]
 type UserEvent = ();
+
+/// Extracts a human-readable message from a caught panic payload (#65). Panics carry `&str`
+/// (`panic!("literal")`) or `String` (`panic!("{}", …)`); anything else falls back.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic>")
+}
+
+/// Runs `f` under the frame/window panic boundary (#65, specs §1.11): catches an unwinding panic
+/// (an invariant violation, as opposed to a recoverable `Result`) and returns its message on `Err`.
+/// `AssertUnwindSafe` is deliberate — `f` borrows `&mut Window` state that may be left inconsistent
+/// by a panic, so the caller must **degrade the window** (stop mutating) rather than continue. Pure
+/// (no window state of its own) so the boundary is unit-testable without a live window/GPU.
+fn run_guarded(f: impl FnOnce()) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|payload| panic_message(payload.as_ref()).to_string())
+}
+
+/// Installs a process-global panic hook routing panics to `tracing::error!` with their source
+/// location and payload (#65, specs §1.11) — the boundary's caught `Err` carries the payload but not
+/// the location, so the hook supplies it. Chains the previous hook so a dev's stderr/backtrace is
+/// preserved. Installed by [`App::run`] (which owns the process event loop).
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        tracing::error!(location = %location, panic = %panic_message(info.payload()), "panic");
+        prev(info);
+    }));
+}
 
 /// The shared GPU: the wgpu adapter + device + queue, created once (lazily on the first window) and
 /// `Arc`-cloned into every window's renderer (specs §1.13). Device-loss recovery (#64) regenerates
@@ -216,6 +252,10 @@ struct WindowState {
     theme: RwSignal<Arc<Theme>>,
     scheduler: Scheduler,
     ime_enabled: bool,
+    // Set once a panic is caught in this window's frame/event work (#65): a degraded window skips all
+    // further frames + events (its last-good frame stays on screen; it can still be closed), rather
+    // than continuing to mutate state left inconsistent by the panic.
+    degraded: bool,
     // Per-window interactive state, persisted across frames (live winit input wiring, #177).
     // `hit_test` is re-recorded every paint; `focus`/`cursor_reg` are populated on the build-once
     // pass (they are not cleared per frame). `dispatch` keeps pointer capture across a drag.
@@ -326,6 +366,9 @@ impl App {
     /// Runs the winit event loop until the last window closes. Returns a startup/loop error (rather
     /// than diverging) so `main` can surface a nonzero exit.
     pub fn run(mut self) -> Result<(), AppError> {
+        // Route panics to tracing (with location) before the loop runs, so the frame/window panic
+        // boundary's caught panics are logged with their source location (#65, specs §1.11).
+        install_panic_hook();
         // Apply the initial theme (the watched file if set) to the App-level single source before the
         // loop starts (no window/effect exists yet, so this just sets the value).
         #[cfg(feature = "hot-reload")]
@@ -467,6 +510,7 @@ impl App {
                 drag_image_arena: Arena::new(),
                 drag_image_layout: LayoutTree::new(),
                 drag_owner: None,
+                degraded: false,
             },
         ))
     }
@@ -1095,35 +1139,56 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(state) = self.windows.get_mut(&id) else {
                     return;
                 };
+                // A degraded window (a prior panic) skips all further frame/event work; only
+                // `CloseRequested` (handled above) still acts on it. (#65)
+                if state.degraded {
+                    return;
+                }
                 let scale = state.window.scale_factor() as f32;
-                match other {
-                    WindowEvent::Resized(size) => {
-                        state.config.width = size.width.max(1);
-                        state.config.height = size.height.max(1);
-                        state.surface.configure(&state.device, &state.config);
-                        state.window.request_redraw();
-                    }
-                    WindowEvent::RedrawRequested => state.redraw(),
-                    WindowEvent::Ime(ime) => state.on_ime(ime),
-                    WindowEvent::ModifiersChanged(m) => state.modifiers = map_modifiers(m.state()),
-                    // Clear tracked modifiers on focus loss: winit doesn't guarantee a
-                    // `ModifiersChanged` when focus leaves (e.g. Alt+Tab), so a held modifier would
-                    // otherwise stay stuck and leak into the next click/key.
-                    WindowEvent::Focused(false) => state.modifiers = Modifiers::default(),
-                    WindowEvent::CursorMoved { position, .. } => {
-                        state.on_cursor_moved(position, scale)
-                    }
-                    WindowEvent::CursorLeft { .. } => state.on_cursor_left(),
-                    WindowEvent::MouseInput {
-                        state: btn_state,
-                        button,
-                        ..
-                    } => state.on_mouse_input(btn_state, button),
-                    WindowEvent::MouseWheel { delta, .. } => state.on_mouse_wheel(delta, scale),
-                    WindowEvent::PinchGesture { delta, .. } => state.on_pinch(delta),
-                    WindowEvent::DroppedFile(path) => state.on_dropped_file(path),
-                    WindowEvent::KeyboardInput { event, .. } => state.on_keyboard(&event),
-                    _ => {}
+                // Frame/window panic boundary (#65): the per-frame work (`redraw` = build/layout/paint)
+                // and event dispatch below run user code (handlers, #177/#178). Catch a panic so one
+                // element/handler cannot abort the whole app. Reborrow `state` into the guarded
+                // closure so the original binding is usable afterward to degrade the window on `Err`.
+                let outcome = {
+                    let state = &mut *state;
+                    run_guarded(move || match other {
+                        WindowEvent::Resized(size) => {
+                            state.config.width = size.width.max(1);
+                            state.config.height = size.height.max(1);
+                            state.surface.configure(&state.device, &state.config);
+                            state.window.request_redraw();
+                        }
+                        WindowEvent::RedrawRequested => state.redraw(),
+                        WindowEvent::Ime(ime) => state.on_ime(ime),
+                        WindowEvent::ModifiersChanged(m) => {
+                            state.modifiers = map_modifiers(m.state())
+                        }
+                        // Clear tracked modifiers on focus loss: winit doesn't guarantee a
+                        // `ModifiersChanged` when focus leaves (e.g. Alt+Tab), so a held modifier
+                        // would otherwise stay stuck and leak into the next click/key.
+                        WindowEvent::Focused(false) => state.modifiers = Modifiers::default(),
+                        WindowEvent::CursorMoved { position, .. } => {
+                            state.on_cursor_moved(position, scale)
+                        }
+                        WindowEvent::CursorLeft { .. } => state.on_cursor_left(),
+                        WindowEvent::MouseInput {
+                            state: btn_state,
+                            button,
+                            ..
+                        } => state.on_mouse_input(btn_state, button),
+                        WindowEvent::MouseWheel { delta, .. } => state.on_mouse_wheel(delta, scale),
+                        WindowEvent::PinchGesture { delta, .. } => state.on_pinch(delta),
+                        WindowEvent::DroppedFile(path) => state.on_dropped_file(path),
+                        WindowEvent::KeyboardInput { event, .. } => state.on_keyboard(&event),
+                        _ => {}
+                    })
+                };
+                if outcome.is_err() {
+                    // Degrade this window (skip further work) but keep the app + other windows alive.
+                    // The panic hook already logged the location + message; this only ties it to the
+                    // window (avoiding a duplicate of the payload/location the hook emitted).
+                    state.degraded = true;
+                    tracing::error!(window = ?id, "window degraded after a panic");
                 }
             }
         }
@@ -1143,10 +1208,13 @@ impl ApplicationHandler<UserEvent> for App {
         // Per-window hybrid driving (#36, §1.6): request a redraw only for windows that are dirty or
         // animating; an idle window stays idle. Iterates in place (no per-frame allocation, perf.md).
         for state in self.windows.values() {
-            if should_redraw(
-                state.damage.is_dirty(),
-                state.scheduler.has_active_sources(),
-            ) {
+            // A degraded window (#65) never repaints — skip it (its `redraw` would early-return anyway).
+            if !state.degraded
+                && should_redraw(
+                    state.damage.is_dirty(),
+                    state.scheduler.has_active_sources(),
+                )
+            {
                 state.window.request_redraw();
             }
         }
@@ -1410,5 +1478,40 @@ mod tests {
         // An unbound key press falls through to the focused node.
         let km = Keymap::default();
         assert_eq!(route_key(&km, &key(KeyCode::KeyA, true)), KeyRoute::Deliver);
+    }
+
+    #[test]
+    fn panic_boundary_should_catch_and_report_message() {
+        // Silence the default panic hook during the intentional panic so test output stays clean
+        // (kagari-core lib tests run serially per RK-005, so swapping the global hook is safe here).
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = run_guarded(|| panic!("boom"));
+        std::panic::set_hook(prev);
+        assert_eq!(
+            caught,
+            Err("boom".to_string()),
+            "a panic is caught and its message reported so the caller can degrade"
+        );
+    }
+
+    #[test]
+    fn panic_boundary_should_pass_ok_through() {
+        assert!(
+            run_guarded(|| { /* no panic */ }).is_ok(),
+            "a non-panicking closure passes through as Ok"
+        );
+    }
+
+    #[test]
+    fn panic_message_should_extract_str_and_string() {
+        // A `&str` payload (panic!("literal")) and a `String` payload (panic!("{}", …)); anything
+        // else falls back.
+        let s: &str = "literal";
+        assert_eq!(panic_message(&s), "literal");
+        let owned = String::from("owned");
+        assert_eq!(panic_message(&owned), "owned");
+        let non_string: u32 = 42;
+        assert_eq!(panic_message(&non_string), "<non-string panic>");
     }
 }
