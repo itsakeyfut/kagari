@@ -26,6 +26,8 @@ tracing = { workspace = true }
 kagari-golden = { workspace = true }
 # Encode in-memory PNG fixtures for the asset-loader golden (#56); also a normal dep above.
 image = { workspace = true }
+# block_on for wgpu's async adapter/device init in the device-loss recreate test (#64).
+pollster = { workspace = true }
 
 [lints]
 workspace = true

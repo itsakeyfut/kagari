@@ -11,6 +11,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use kagari_base::{NodeId, Point, Size, WindowId};
@@ -166,6 +167,10 @@ pub struct App {
     /// [`UiProxy`]s wrapping this before the loop exists; [`run`](Self::run) populates it with the
     /// event loop's `EventLoopProxy` so posted closures reach the UI thread's `user_event`.
     proxy_cell: Arc<OnceLock<EventLoopProxy<UiEvent>>>,
+    /// Set by the wgpu device-lost callback (#64) when the shared device is lost (TDR / GPU reset /
+    /// sleep-wake). [`about_to_wait`](Self::about_to_wait) polls + clears it and runs
+    /// [`recover_device`](Self::recover_device). Shared with the callback (which runs off the UI thread).
+    device_lost: Arc<AtomicBool>,
     /// The App-level theme (single source, §1.8). Each window holds a `Copy` of this signal; a swap
     /// (hot-reload) re-runs every window's theme→damage effect, so all windows reskin.
     theme: RwSignal<Arc<Theme>>,
@@ -324,6 +329,7 @@ impl App {
             root_owner,
             theme,
             proxy_cell: Arc::new(OnceLock::new()),
+            device_lost: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hot-reload")]
             theme_path: None,
             #[cfg(feature = "hot-reload")]
@@ -337,6 +343,46 @@ impl App {
     /// before the loop starts are dropped.
     pub fn ui_proxy(&self) -> UiProxy {
         UiProxy::new(Arc::clone(&self.proxy_cell))
+    }
+
+    /// Recovers from a lost GPU device (#64, specs §1.11/§2.9): regenerate the shared device once from
+    /// the surviving adapter, then fan `Renderer::recreate` + surface reconfigure out to every window
+    /// and flag a full repaint. Called by [`about_to_wait`](Self::about_to_wait) when the device-lost
+    /// flag is set. If the device cannot be re-created, log and degrade all windows (survive, #65).
+    fn recover_device(&mut self) {
+        // Nothing to recover if no device was ever created.
+        let Some(old) = self.gpu.take() else {
+            return;
+        };
+        // The adapter survives a device loss; request a fresh device + queue from it.
+        let (device, queue) = match pollster::block_on(create_device(&old.adapter)) {
+            Ok(dq) => dq,
+            Err(e) => {
+                tracing::error!(error = %e, "device re-creation failed after loss; degrading all windows");
+                for state in self.windows.values_mut() {
+                    state.degraded = true;
+                }
+                return; // `self.gpu` stays None; the app survives with frozen windows.
+            }
+        };
+        register_device_lost(&device, &self.device_lost, &self.proxy_cell);
+        // Fan out: rebuild each window's GPU resources against the new device, reconfigure its surface
+        // (new device before the old device's Arc clones drop), and flag a full repaint.
+        for state in self.windows.values_mut() {
+            state
+                .renderer
+                .recreate(Arc::clone(&device), Arc::clone(&queue));
+            state.device = Arc::clone(&device);
+            state.surface.configure(&device, &state.config);
+            state.damage.mark_all_dirty();
+            state.window.request_redraw();
+        }
+        self.gpu = Some(Gpu {
+            adapter: old.adapter,
+            device,
+            queue,
+        });
+        tracing::info!("device recovered; all windows rebuilt");
     }
 
     /// Provides an App-level context value (a service, §1.8), inherited by every window's root view.
@@ -457,7 +503,10 @@ impl App {
 
         // Lazily create the shared GPU on the first window; reuse it for all subsequent windows.
         if self.gpu.is_none() {
-            self.gpu = Some(pollster::block_on(create_gpu(&self.instance, &surface))?);
+            let gpu = pollster::block_on(create_gpu(&self.instance, &surface))?;
+            // Detect a genuine device loss on this device → recover in `about_to_wait` (#64).
+            register_device_lost(&gpu.device, &self.device_lost, &self.proxy_cell);
+            self.gpu = Some(gpu);
         }
         let (device, queue) = {
             let gpu = self.gpu.as_ref().expect("gpu created above");
@@ -1056,6 +1105,19 @@ async fn create_gpu(
         .map_err(|e| AppError::DeviceInit(e.to_string()))?;
     tracing::info!(backend = ?adapter.get_info().backend, "renderer adapter selected");
 
+    let (device, queue) = create_device(&adapter).await?;
+    Ok(Gpu {
+        adapter,
+        device,
+        queue,
+    })
+}
+
+/// Requests a fresh device + queue from `adapter` (`Arc`-wrapped). Used for first-window GPU creation
+/// and to regenerate the device after a loss (#64) — the adapter survives a device loss.
+async fn create_device(
+    adapter: &wgpu::Adapter,
+) -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>), AppError> {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("kagari.device"),
@@ -1067,12 +1129,35 @@ async fn create_gpu(
         })
         .await
         .map_err(|e| AppError::DeviceInit(e.to_string()))?;
+    Ok((Arc::new(device), Arc::new(queue)))
+}
 
-    Ok(Gpu {
-        adapter,
-        device: Arc::new(device),
-        queue: Arc::new(queue),
-    })
+/// Registers a device-lost callback (#64): on a genuine device loss (TDR / GPU reset / sleep-wake),
+/// wgpu invokes this — flag the loss and wake the loop (via the #66 proxy) so [`App::about_to_wait`]
+/// polls the flag and runs [`App::recover_device`]. Set on every device the app creates.
+fn register_device_lost(
+    device: &wgpu::Device,
+    flag: &Arc<AtomicBool>,
+    proxy_cell: &Arc<OnceLock<EventLoopProxy<UiEvent>>>,
+) {
+    let flag = Arc::clone(flag);
+    let proxy_cell = Arc::clone(proxy_cell);
+    device.set_device_lost_callback(move |reason, message| {
+        // Only a genuine loss (`Unknown`, e.g. a driver TDR/reset) warrants recovery. `Destroyed`
+        // fires solely from an explicit `device.destroy()` (which the app never calls today), so
+        // treating it as a loss would arm a spurious full-recreate — ignore it (RK-021).
+        if reason != wgpu::DeviceLostReason::Unknown {
+            tracing::debug!(reason = ?reason, "device-lost callback (non-loss); ignored");
+            return;
+        }
+        tracing::error!(reason = ?reason, message = %message, "wgpu device lost");
+        flag.store(true, Ordering::SeqCst);
+        // Wake the loop so `about_to_wait` polls the flag promptly even if the app is idle. The empty
+        // closure is a no-op; the wake is the point (reuses the #66 bridge).
+        if let Some(proxy) = proxy_cell.get() {
+            let _ = proxy.send_event(Box::new(|| {}));
+        }
+    });
 }
 
 /// Builds a surface configuration for `surface` against the shared `adapter`, choosing an sRGB
@@ -1221,6 +1306,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Recover from a lost GPU device before driving redraws (#64, specs §1.11/§2.9). The device-lost
+        // callback (on a wgpu thread) sets this flag and wakes the loop via the #66 proxy; swap it back
+        // to false and regenerate the device + rebuild every window once here on the UI thread.
+        if self.device_lost.swap(false, Ordering::SeqCst) {
+            self.recover_device();
+        }
         // Per-window hybrid driving (#36, §1.6): request a redraw only for windows that are dirty or
         // animating; an idle window stays idle. Iterates in place (no per-frame allocation, perf.md).
         for state in self.windows.values() {
