@@ -22,7 +22,7 @@ pub use dispatch::{
     dispatch_gesture, dispatch_key, dispatch_mouse,
 };
 pub use dnd::{DragPayload, DragSource, DropTarget, FileDrop};
-pub use focus::{FocusHandle, FocusId, FocusRegistry};
+pub use focus::{FocusHandle, FocusId, FocusRegistry, use_focus_handle};
 pub use gesture::{GestureEvent, GestureRecognizer};
 
 // Crate-internal dispatch machinery used by the element layer: the delivery mode + capture request
