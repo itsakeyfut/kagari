@@ -2,11 +2,10 @@
 //! [`DragSource`] that produces a payload, and a [`DropTarget`] that accepts a payload of a concrete
 //! type (downcast) and rejects others — plus the [`FileDrop`] payload for OS file drop.
 //!
-//! This is the headless typed model. The mouse-driven drag flow (down → move-threshold → hover →
-//! drop), the tree drop *delivery*, the OS file-drop winit wiring, and the per-target reactive
-//! hover-feedback signal land with the deferred live mouse wiring (deferred since #48). The floating
-//! drag-image is relocated to Phase 6 (overlay §4.2). hover feedback is decided by
-//! [`DropTarget::accepts`]; the signal-toggle that highlights the target is the live part.
+//! This is the headless typed model. The live mouse-driven drag flow (down → move-threshold → hover
+//! → drop), the tree drop *delivery*, the OS file-drop winit wiring, hover feedback, and the
+//! cursor-tracked drag-image are wired in the app shell (#178, on top of #177's live input); hover
+//! acceptance is decided by [`DropTarget::accepts`] / [`DropTarget::accepts_type`].
 
 use std::any::{Any, TypeId};
 use std::path::PathBuf;
@@ -79,6 +78,10 @@ impl DragSource {
 /// it to the target's concrete type before running the user handler.
 type ErasedDrop = Box<dyn FnMut(Box<dyn Any>, &mut EventCx)>;
 
+/// A drag-over / drag-leave listener stored on a drop target's element (#178): imperative (toggles a
+/// hover-feedback signal), not a reactive effect — runs as the live drag hovers/leaves the target.
+pub(crate) type DragHandler = Box<dyn FnMut(&mut EventCx)>;
+
 /// A drop target: accepts a payload of one concrete type `T` and runs a handler with it; payloads of
 /// any other type are rejected.
 pub struct DropTarget {
@@ -104,7 +107,14 @@ impl DropTarget {
     /// Whether this target accepts `payload` (its concrete type matches `T`). Used to decide hover
     /// feedback (highlight an accepting target) and to validate a drop before delivering it.
     pub fn accepts(&self, payload: &dyn DragPayload) -> bool {
-        payload.as_any().type_id() == self.accepted
+        self.accepts_type(payload.as_any().type_id())
+    }
+
+    /// Whether this target accepts a payload of type `ty`. The live drag flow (#178) checks hover
+    /// acceptance from the in-flight payload's [`TypeId`] alone (delivered up the tree as a `Copy`
+    /// value), without shipping the owned payload into the dispatch walk.
+    pub fn accepts_type(&self, ty: TypeId) -> bool {
+        ty == self.accepted
     }
 
     /// Delivers a drop: if `payload`'s type matches, moves it out and runs the handler, returning
@@ -190,6 +200,14 @@ mod tests {
             !target.accepts(&Bar(0)),
             "does not accept a wrong-type payload"
         );
+    }
+
+    #[test]
+    fn accepts_type_should_match_only_the_target_type() {
+        // The live drag flow (#178) checks hover acceptance from a `TypeId` alone.
+        let target = DropTarget::new::<Foo>(|_foo: Foo, _cx| {});
+        assert!(target.accepts_type(TypeId::of::<Foo>()));
+        assert!(!target.accepts_type(TypeId::of::<Bar>()));
     }
 
     #[test]

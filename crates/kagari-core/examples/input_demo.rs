@@ -11,8 +11,10 @@ use kagari_core::{App, CursorIcon, GestureEvent, MouseEvent, MouseKind, WindowOp
 use kagari_style::{ColorRole, Styled};
 
 fn main() -> Result<(), kagari_core::AppError> {
+    // Enable this example's own logs too: the on_mouse_down/on_wheel/on_gesture `tracing::info!`s are
+    // emitted under the `input_demo` target, which a `kagari_core=info`-only filter would hide.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kagari_core=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kagari_core=info,input_demo=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut app = App::new()?;

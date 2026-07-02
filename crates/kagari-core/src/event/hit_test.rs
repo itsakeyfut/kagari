@@ -91,6 +91,16 @@ impl HitTest {
         hits.sort_by_key(|r| std::cmp::Reverse(r.order));
         hits.into_iter().map(|r| r.node).collect()
     }
+
+    /// The topmost node under `p` whose region matches `pred` on its [`InteractFlags`] — e.g. the
+    /// nearest drag source (on press) or drop target (on hover) for the live drag flow (#178).
+    pub fn pick_where(&self, p: Point, pred: impl Fn(InteractFlags) -> bool) -> Option<NodeId> {
+        self.regions
+            .iter()
+            .filter(|r| r.contains(p) && pred(r.flags))
+            .max_by_key(|r| r.order)
+            .map(|r| r.node)
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +155,51 @@ mod tests {
         let mut ht = HitTest::new();
         ht.push(region(1, 0.0, 0.0, 10.0, 10.0, 0));
         assert_eq!(ht.pick(Point::new(50.0, 50.0)), None);
+    }
+
+    #[test]
+    fn pick_where_should_return_topmost_matching_flag() {
+        // A drag-source region (order 0) behind a front-most non-source region (order 1), both over
+        // (5,5). `pick_where(drag_source)` must pick the source despite the front region being on top
+        // (the flag predicate filters before the topmost-by-order choice) — this drives drag arming.
+        let bounds = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
+        let mut ht = HitTest::new();
+        ht.push(HitRegion {
+            node: NodeId::from_raw(1),
+            bounds,
+            clip: bounds,
+            order: 0,
+            flags: InteractFlags {
+                drag_source: true,
+                ..InteractFlags::default()
+            },
+        });
+        ht.push(HitRegion {
+            node: NodeId::from_raw(2),
+            bounds,
+            clip: bounds,
+            order: 1,
+            flags: InteractFlags {
+                mouse: true,
+                ..InteractFlags::default()
+            },
+        });
+        let p = Point::new(5.0, 5.0);
+        assert_eq!(
+            ht.pick_where(p, |f| f.drag_source),
+            Some(NodeId::from_raw(1)),
+            "the topmost drag_source wins even under a front-most non-source"
+        );
+        assert_eq!(
+            ht.pick_where(p, |f| f.drop_target),
+            None,
+            "no region matches the predicate → None"
+        );
+        assert_eq!(
+            ht.pick_where(Point::new(50.0, 50.0), |f| f.drag_source),
+            None,
+            "outside all regions → None"
+        );
     }
 
     #[test]

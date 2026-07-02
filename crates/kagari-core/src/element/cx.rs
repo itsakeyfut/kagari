@@ -1,5 +1,6 @@
 //! Build/paint/event contexts and the damage seam for the element tree (#31, extended in #34).
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 use kagari_base::{NodeId, Rect, Size};
@@ -8,10 +9,11 @@ use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
 use kagari_text::TextSystem;
 
+use super::AnyElement;
 use crate::arena::Arena;
 use crate::event::{
-    Action, CaptureOp, CursorRegistry, Delivery, FocusRegistry, GestureEvent, HitRegion, HitTest,
-    KeyEvent, MouseEvent,
+    Action, CaptureOp, CursorRegistry, Delivery, DragPayload, FocusRegistry, GestureEvent,
+    HitRegion, HitTest, KeyEvent, MouseEvent,
 };
 use crate::overlay::OverlayRegistry;
 
@@ -241,6 +243,20 @@ pub enum Event {
     Action(Action),
     /// A recognized [`GestureEvent`] (#51), dispatched up the hit path to `on_gesture` handlers.
     Gesture(GestureEvent),
+    /// A drag began on this node (#178): a drag source produces its payload + drag-image into the
+    /// [`EventCx`] ([`produce_drag`](EventCx::produce_drag)). Delivered to the source node only.
+    DragStart,
+    /// A drag of a payload of type `payload` is hovering this node (#178): a matching drop target
+    /// calls [`accept_drag`](EventCx::accept_drag) and runs its `on_drag_over` handler. Carries the
+    /// payload's [`TypeId`] (a `Copy` value), not the owned payload.
+    DragOver {
+        payload: TypeId,
+    },
+    /// A hovering drag left this node (#178): the drop target runs its `on_drag_leave` handler.
+    DragLeave,
+    /// A drop landed on this node (#178): the drop target takes the payload from the [`EventCx`]
+    /// ([`take_drop_payload`](EventCx::take_drop_payload)) and delivers it via `try_drop`.
+    Drop,
 }
 
 /// Context for [`Element::handle_event`](super::Element::handle_event) during a dispatch walk (#48).
@@ -258,6 +274,13 @@ pub struct EventCx<'a> {
     current: Option<NodeId>,
     stopped: bool,
     capture: Option<CaptureOp>,
+    /// Drag (#178): a source produces its `(payload, drag-image)` here during a `DragStart` delivery;
+    /// the driver ([`dispatch_drag_start`](crate::event::dispatch_drag_start)) takes it after.
+    drag_produced: Option<(Box<dyn DragPayload>, Option<AnyElement>)>,
+    /// Drag (#178): set true by a matching drop target during a `DragOver` delivery (hover feedback).
+    drag_accepted: bool,
+    /// Drag (#178): the owned payload the driver ships into a `Drop` delivery; the target takes it.
+    drag_drop_payload: Option<Box<dyn DragPayload>>,
 }
 
 impl<'a> EventCx<'a> {
@@ -269,6 +292,9 @@ impl<'a> EventCx<'a> {
             current: None,
             stopped: false,
             capture: None,
+            drag_produced: None,
+            drag_accepted: false,
+            drag_drop_payload: None,
         }
     }
 
@@ -311,5 +337,35 @@ impl<'a> EventCx<'a> {
     /// nodes in the filtered set on an enter/leave pass).
     pub(crate) fn should_fire(&self, id: NodeId) -> bool {
         self.delivery.should_fire(id)
+    }
+
+    /// Drag source → driver (#178): records the payload + optional drag-image produced on `DragStart`.
+    pub fn produce_drag(&mut self, payload: Box<dyn DragPayload>, image: Option<AnyElement>) {
+        self.drag_produced = Some((payload, image));
+    }
+
+    /// Driver reads what a `DragStart` delivery produced (the source's payload + drag-image).
+    pub(crate) fn take_produced(&mut self) -> Option<(Box<dyn DragPayload>, Option<AnyElement>)> {
+        self.drag_produced.take()
+    }
+
+    /// Drop target → driver (#178): marks that this target accepts the hovering drag (`DragOver`).
+    pub fn accept_drag(&mut self) {
+        self.drag_accepted = true;
+    }
+
+    /// Whether a `DragOver` delivery was accepted by a matching drop target.
+    pub(crate) fn drag_accepted(&self) -> bool {
+        self.drag_accepted
+    }
+
+    /// Driver → drop target (#178): ships the owned payload into a `Drop` delivery.
+    pub(crate) fn set_drop_payload(&mut self, payload: Box<dyn DragPayload>) {
+        self.drag_drop_payload = Some(payload);
+    }
+
+    /// Drop target takes the payload shipped into a `Drop` delivery (to hand to `try_drop`).
+    pub fn take_drop_payload(&mut self) -> Option<Box<dyn DragPayload>> {
+        self.drag_drop_payload.take()
     }
 }
