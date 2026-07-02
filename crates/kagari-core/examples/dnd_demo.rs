@@ -1,11 +1,14 @@
-//! Live drag-and-drop demo (#178): drag the swatch onto the drop zone (logs the payload), and drop
-//! OS files onto the file zone (logged as a `FileDrop`). The manual "ignition test" for the live drag
-//! flow — CI can't run a real window + GPU, so this is verified by hand.
+//! Live drag-and-drop demo (#178): drag the swatch onto the drop zone. The manual "ignition test" for
+//! the live drag flow — CI can't run a real window + GPU, so this is verified by hand, **watching the
+//! console**: press-and-drag "drag me" (a drag-image follows the cursor) onto "drop here" and you get
+//! `drag entered the drop zone` → `dropped swatch` (and `drag left the drop zone`); press Esc mid-drag
+//! to cancel. Feedback is logged (not visual) because a token-driven reactive `bg` is not yet a thing
+//! — `Styled::bg` is static — so the demo relies on the console.
+//!
+//! OS file drop onto "drop files here" is wired but currently a no-op: winit gives no drop position,
+//! so the file cannot be routed to the target (see #206 / the DnD-maturity epic #211).
 //!
 //! Run with: `cargo run -p kagari-core --example dnd_demo`
-//!
-//! Then: press-and-drag the "drag me" swatch (a drag-image follows the cursor) onto "drop here"
-//! (logs on over / leave / drop); press Esc mid-drag to cancel; drop files onto "drop files here".
 
 use kagari_core::{App, FileDrop, WindowOptions, div, text};
 use kagari_style::{ColorRole, Styled};
@@ -15,8 +18,10 @@ use kagari_style::{ColorRole, Styled};
 struct Swatch(&'static str);
 
 fn main() -> Result<(), kagari_core::AppError> {
+    // Enable BOTH kagari-core and this example's own logs: the handler `tracing::info!`s below are
+    // emitted under the `dnd_demo` target, so a `kagari_core=info`-only filter would hide them.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kagari_core=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kagari_core=info,dnd_demo=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut app = App::new()?;
@@ -46,7 +51,7 @@ fn main() -> Result<(), kagari_core::AppError> {
                 .drop_target::<FileDrop>(|f: FileDrop, _cx| {
                     tracing::info!(count = f.0.len(), "dropped files")
                 })
-                .child(text("drop files here")),
+                .child(text("drop files here (no-op until #206)")),
         ])
     })?;
     app.run()
