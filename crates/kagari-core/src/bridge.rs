@@ -13,6 +13,23 @@ use crate::reactive::Owner;
 /// is [`UiProxy`].
 pub(crate) type UiEvent = Box<dyn FnOnce() + Send + 'static>;
 
+/// The winit event loop's user-event type: either a background-posted UI closure (#66) or an
+/// accessibility event forwarded by the `accesskit_winit` adapter (#67). One enum because a winit
+/// event loop has a single user-event type; the app's `user_event` matches on it.
+pub(crate) enum UserEvent {
+    /// A background-posted UI closure to run on the UI thread (#66).
+    Ui(UiEvent),
+    /// An accessibility event from the `accesskit_winit` adapter (#67): initial-tree request, an
+    /// action request, or deactivation.
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        UserEvent::Accessibility(event)
+    }
+}
+
 /// A cloneable, `Send` handle a background task uses to post work to the UI thread (#66). Obtain one
 /// from [`App::ui_proxy`](crate::App::ui_proxy) and move a clone into any task; [`spawn`](Self::spawn)
 /// runs a closure on the UI thread. One-way: the closure updates signals — it must not read or mutate
@@ -23,12 +40,12 @@ pub(crate) type UiEvent = Box<dyn FnOnce() + Send + 'static>;
 /// before the loop starts is dropped (with a warning) rather than delivered.
 #[derive(Clone)]
 pub struct UiProxy {
-    cell: Arc<OnceLock<EventLoopProxy<UiEvent>>>,
+    cell: Arc<OnceLock<EventLoopProxy<UserEvent>>>,
 }
 
 impl UiProxy {
     /// Wraps the app's deferred proxy cell (populated by [`App::run`](crate::App::run)).
-    pub(crate) fn new(cell: Arc<OnceLock<EventLoopProxy<UiEvent>>>) -> Self {
+    pub(crate) fn new(cell: Arc<OnceLock<EventLoopProxy<UserEvent>>>) -> Self {
         Self { cell }
     }
 
@@ -41,7 +58,7 @@ impl UiProxy {
         match self.cell.get() {
             // `send_event` errors only if the loop has closed (app exiting) — then the work is moot.
             Some(proxy) => {
-                let _ = proxy.send_event(Box::new(f));
+                let _ = proxy.send_event(UserEvent::Ui(Box::new(f)));
             }
             None => {
                 tracing::warn!("UiProxy::spawn called before the event loop started; work dropped")

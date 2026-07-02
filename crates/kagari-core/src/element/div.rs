@@ -2,10 +2,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, Size};
+use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, SharedString, Size};
 use kagari_layout::{FlexDirection, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect, Shadow};
 use kagari_style::{SpacingStep, Style, Styled, Theme};
+
+use crate::a11y::{A11y, Role};
 
 use super::{
     AnchorHandle, AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx,
@@ -78,6 +80,10 @@ pub struct Div {
     /// The anchor handle bound by [`anchor_ref`](Self::anchor_ref) (#175): this node records its
     /// `NodeId` into the handle at build so an overlay can anchor to it. `None` = not an anchor.
     anchor_handle: Option<AnchorHandle>,
+    /// Optional accessibility info (#67): `role`/`a11y_label`/`a11y_value`. Recorded into the a11y
+    /// sink at paint (with the node's absolute bounds) when set, so the derived accesskit tree carries
+    /// this element. `None` = not exposed to accessibility.
+    a11y: Option<A11y>,
 }
 
 /// Creates an empty [`Div`].
@@ -104,6 +110,7 @@ pub fn div() -> Div {
         drag_leave_handlers: Vec::new(),
         cursor: None,
         anchor_handle: None,
+        a11y: None,
     }
 }
 
@@ -334,6 +341,32 @@ impl Div {
     /// so an `overlay(...).anchor(&handle, placement)` can position relative to this element.
     pub fn anchor_ref(mut self, handle: &AnchorHandle) -> Self {
         self.anchor_handle = Some(handle.clone());
+        self
+    }
+
+    /// The [`A11y`] to populate, inserting a default (role [`Role::Label`]) on first use so a lone
+    /// `a11y_label`/`a11y_value` (no explicit role) still exposes the element.
+    fn a11y_mut(&mut self) -> &mut A11y {
+        self.a11y.get_or_insert_with(A11y::default)
+    }
+
+    /// Sets this element's accessibility [`Role`] (#67), exposing it in the derived accesskit tree.
+    pub fn role(mut self, role: Role) -> Self {
+        self.a11y_mut().role = role;
+        self
+    }
+
+    /// Sets this element's accessibility label (#67) — the accessible name a screen reader announces.
+    /// Also exposes the element (default role [`Role::Label`]) if no [`role`](Self::role) was set.
+    pub fn a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_mut().label = Some(label.into());
+        self
+    }
+
+    /// Sets this element's accessibility value (#67) — e.g. a text input's contents or a control's
+    /// current value. Also exposes the element (default role [`Role::Label`]) if no role was set.
+    pub fn a11y_value(mut self, value: impl Into<SharedString>) -> Self {
+        self.a11y_mut().value = Some(value.into());
         self
     }
 
@@ -632,6 +665,13 @@ impl Element for Div {
                     flags,
                 });
             }
+        }
+
+        // Record this element's accessibility node (#67) at its absolute bounds, so the derived
+        // accesskit tree carries it with laid-out geometry. No-op when this div has no a11y info or
+        // no a11y sink is attached (GPU-free tests / the paths before live wiring).
+        if let (Some(a11y), Some(id)) = (&self.a11y, self.id) {
+            cx.record_a11y(id, a11y.clone(), bounds);
         }
 
         // Paint each child at its absolute bounds. `LayoutTree::layout` returns parent-relative
@@ -1016,6 +1056,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,
@@ -1079,6 +1120,7 @@ mod tests {
             arena,
             layout,
             text,
+            None,
             None,
             None,
             None,
@@ -1206,6 +1248,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut scene,
             viewport,
             &damage,
@@ -1236,6 +1279,7 @@ mod tests {
             &mut arena,
             &mut layout,
             &mut text,
+            None,
             None,
             None,
             None,
@@ -1309,6 +1353,7 @@ mod tests {
             &mut text,
             None,
             Some(&mut hit),
+            None,
             None,
             None,
             None,

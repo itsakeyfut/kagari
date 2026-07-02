@@ -53,6 +53,7 @@ fn paint_scene(
         None, // no overlays in this golden
         None, // no focus registry
         None, // no cursor registry
+        None, // no a11y sink
         &mut scene,
         viewport,
         &damage,

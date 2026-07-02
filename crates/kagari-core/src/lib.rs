@@ -7,6 +7,7 @@
 //! tracking (`damage`), the hybrid frame scheduler (`scheduler`), and the events/input layer
 //! (`event`) — so far the hit-test structure (#47).
 
+pub mod a11y;
 pub mod anim;
 pub mod app;
 pub mod arena;
@@ -20,6 +21,7 @@ pub mod paint;
 pub mod reactive;
 pub mod scheduler;
 
+pub use a11y::Role;
 pub use anim::{Animatable, Animated, AnimationSpec, Easing};
 pub use app::{App, Decorations, WindowOptions};
 pub use bridge::UiProxy;
