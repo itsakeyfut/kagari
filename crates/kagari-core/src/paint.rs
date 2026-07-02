@@ -14,6 +14,7 @@ use kagari_layout::{LayoutError, LayoutTree};
 use kagari_render::{Atlas, Scene};
 use kagari_text::TextSystem;
 
+use crate::a11y::A11yTree;
 use crate::arena::Arena;
 use crate::damage::DamageState;
 use crate::element::{AnyElement, DamageSink, LayoutCx, PaintCx};
@@ -46,6 +47,7 @@ pub fn render_tree(
     overlay: Option<&mut OverlayRegistry>,
     focus: Option<&mut FocusRegistry>,
     cursor: Option<&mut CursorRegistry>,
+    a11y: Option<&mut A11yTree>,
     scene: &mut Scene,
     viewport: Size,
     damage: &Arc<DamageState>,
@@ -89,10 +91,19 @@ pub fn render_tree(
     if let Some(reg) = overlay.as_deref_mut() {
         reg.clear();
     }
+    // Clear the a11y sink for this frame; annotated elements re-record during paint (#67) — a
+    // per-frame record (absolute bounds), not a build-once registry (RK-019).
+    let mut a11y = a11y;
+    if let Some(tree) = a11y.as_deref_mut() {
+        tree.clear();
+    }
     let mut paint_cx = PaintCx::new(scene, layout, text, atlas, hit_test, theme);
     paint_cx.set_viewport(viewport);
     if let Some(reg) = overlay {
         paint_cx.attach_overlay(reg);
+    }
+    if let Some(tree) = a11y {
+        paint_cx.attach_a11y(tree);
     }
     root.paint(root_bounds, &mut paint_cx);
 
@@ -183,6 +194,7 @@ mod tests {
             None, // no overlay
             None, // no focus registry
             None, // no cursor registry
+            None, // no a11y sink
             &mut scene,
             Size { w: 200.0, h: 100.0 },
             &damage,
@@ -232,6 +244,7 @@ mod tests {
             None, // no overlay
             None, // no focus registry
             None, // no cursor registry
+            None, // no a11y sink
             &mut scene,
             Size { w: 200.0, h: 200.0 },
             &damage,

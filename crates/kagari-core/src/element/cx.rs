@@ -10,6 +10,7 @@ use kagari_style::Theme;
 use kagari_text::TextSystem;
 
 use super::AnyElement;
+use crate::a11y::{A11y, A11yTree};
 use crate::arena::Arena;
 use crate::event::{
     Action, CaptureOp, CursorRegistry, Delivery, DragPayload, FocusRegistry, GestureEvent,
@@ -101,6 +102,10 @@ pub struct PaintCx<'a> {
     /// The window viewport size (logical px), for anchored overlay auto-flip / on-screen clamping
     /// (#175). Set by `render_tree`; default zero (unused unless an overlay is anchored).
     viewport: Size,
+    /// The frame's accessibility sink (#67), if attached: an annotated element records its semantic
+    /// node + absolute bounds into it during paint (like `hit_test`). `None` skips recording (GPU-free
+    /// tests / GPU-free paths). Set by `render_tree` via [`attach_a11y`](Self::attach_a11y).
+    a11y: Option<&'a mut A11yTree>,
 }
 
 impl<'a> PaintCx<'a> {
@@ -125,6 +130,7 @@ impl<'a> PaintCx<'a> {
             overlay: None,
             overlay_orders: Vec::new(),
             viewport: Size { w: 0.0, h: 0.0 },
+            a11y: None,
         }
     }
 
@@ -229,6 +235,21 @@ impl<'a> PaintCx<'a> {
     pub fn record_hit(&mut self, region: HitRegion) {
         if let Some(ht) = self.hit_test.as_deref_mut() {
             ht.push(region);
+        }
+    }
+
+    /// Attaches the frame's accessibility sink (`render_tree` sets this): annotated elements record
+    /// their semantic node into it during the paint walk (#67).
+    pub(crate) fn attach_a11y(&mut self, tree: &'a mut A11yTree) {
+        self.a11y = Some(tree);
+    }
+
+    /// Records an annotated element's accessibility node at its absolute `bounds` into the attached
+    /// a11y sink, if one is attached (#67). A no-op when `a11y` is `None`. `pub(crate)`: `A11y` is an
+    /// internal type, so this stays off the public surface (accesskit isolation).
+    pub(crate) fn record_a11y(&mut self, node: NodeId, a11y: A11y, bounds: Rect) {
+        if let Some(tree) = self.a11y.as_deref_mut() {
+            tree.record(node, a11y, bounds);
         }
     }
 }

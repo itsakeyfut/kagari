@@ -26,8 +26,9 @@ use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
 
 use kagari_style::Theme;
 
+use crate::a11y::A11yTree;
 use crate::arena::Arena;
-use crate::bridge::{UiEvent, UiProxy, run_ui_event};
+use crate::bridge::{UiProxy, UserEvent, run_ui_event};
 use crate::damage::DamageState;
 use crate::element::{AnyElement, IntoElement};
 use crate::error::AppError;
@@ -41,11 +42,6 @@ use crate::paint::{paint_element_into, render_tree};
 use crate::reactive::prelude::*;
 use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
 use crate::scheduler::{Scheduler, should_redraw};
-
-/// The winit user event: a [`UiEvent`] (boxed UI closure) posted from a background task via the
-/// bridge (#66). [`App::user_event`] runs it on the UI thread under the app root owner. The hot-reload
-/// theme watcher (#44) is one consumer — it posts a closure that swaps the App-level theme signal.
-type UserEvent = UiEvent;
 
 /// Extracts a human-readable message from a caught panic payload (#65). Panics carry `&str`
 /// (`panic!("literal")`) or `String` (`panic!("{}", …)`); anything else falls back.
@@ -166,7 +162,7 @@ pub struct App {
     /// The background→UI bridge's deferred proxy cell (#66): [`ui_proxy`](Self::ui_proxy) hands out
     /// [`UiProxy`]s wrapping this before the loop exists; [`run`](Self::run) populates it with the
     /// event loop's `EventLoopProxy` so posted closures reach the UI thread's `user_event`.
-    proxy_cell: Arc<OnceLock<EventLoopProxy<UiEvent>>>,
+    proxy_cell: Arc<OnceLock<EventLoopProxy<UserEvent>>>,
     /// Set by the wgpu device-lost callback (#64) when the shared device is lost (TDR / GPU reset /
     /// sleep-wake). [`about_to_wait`](Self::about_to_wait) polls + clears it and runs
     /// [`recover_device`](Self::recover_device). Shared with the callback (which runs off the UI thread).
@@ -286,6 +282,12 @@ struct WindowState {
     // effects, so a reactive drag-image's effects dispose when the drag ends rather than accumulating
     // on the long-lived window owner (RK-005/006/020). `None` when no drag is active.
     drag_owner: Option<Owner>,
+    // Accessibility (#67). `a11y` is the per-frame sink annotated elements record into during paint
+    // (absolute bounds, cleared each frame like `hit_test`); `adapter` bridges the derived accesskit
+    // tree to the OS. `redraw` pushes a full `TreeUpdate` via `adapter.update_if_active` (no-op unless
+    // an assistive tech is active), and `window_event` feeds winit events to `adapter.process_event`.
+    a11y: A11yTree,
+    adapter: accesskit_winit::Adapter,
 }
 
 /// Binds a window's theme→damage effect: reading the App-level theme subscribes, so a swap re-runs
@@ -385,6 +387,38 @@ impl App {
         tracing::info!("device recovered; all windows rebuilt");
     }
 
+    /// Handles an accessibility event forwarded by a window's `accesskit_winit` adapter (#67). MVP is
+    /// read-only: serve the derived tree + focus on the initial request; action routing (click/focus/
+    /// set-value) into the event system is post-MVP (§1.12).
+    fn on_accessibility_event(&mut self, event: accesskit_winit::Event) {
+        use accesskit_winit::WindowEvent as AkWindowEvent;
+        let Some(state) = self.windows.get_mut(&event.window_id) else {
+            return;
+        };
+        match event.window_event {
+            AkWindowEvent::InitialTreeRequested => {
+                // Serve the current tree (the last painted frame's nodes; root-only if nothing has
+                // painted yet), then request a redraw so a fresh frame repopulates the sink.
+                let scale = state.window.scale_factor();
+                state.adapter.update_if_active(|| {
+                    state
+                        .a11y
+                        .build_update(&state.arena, state.focus.focused_node(), scale)
+                });
+                state.window.request_redraw();
+            }
+            AkWindowEvent::ActionRequested(request) => {
+                tracing::debug!(
+                    action = ?request.action,
+                    "accesskit action requested (ignored; routing is post-MVP)"
+                );
+            }
+            AkWindowEvent::AccessibilityDeactivated => {
+                tracing::debug!("accessibility deactivated");
+            }
+        }
+    }
+
     /// Provides an App-level context value (a service, §1.8), inherited by every window's root view.
     /// Call before `run`; values are visible to windows opened afterward (each window's owner is a
     /// child of the app root owner).
@@ -456,7 +490,9 @@ impl App {
         // closure that swaps the App-level theme signal (Copy + Send) on the UI thread (#44/#66).
         let theme = self.theme;
         match kagari_style::ThemeWatcher::new(path, move |reloaded| {
-            let _ = proxy.send_event(Box::new(move || theme.set(Arc::new(reloaded))));
+            let _ = proxy.send_event(UserEvent::Ui(Box::new(move || {
+                theme.set(Arc::new(reloaded))
+            })));
         }) {
             Ok(watcher) => self.theme_watcher = Some(watcher),
             Err(e) => tracing::warn!(error = %e, "failed to start theme hot-reload watcher"),
@@ -484,8 +520,12 @@ impl App {
         event_loop: &ActiveEventLoop,
         pending: PendingWindow,
     ) -> Result<(WinitWindowId, WindowId, WindowState), AppError> {
+        // Create the window initially hidden: the accesskit adapter must be built before the window
+        // is first shown (`accesskit_winit` panics on an already-visible window, #67/RK-022). It is
+        // made visible at the end of this function, once the adapter exists.
         let attrs = WindowAttributes::default()
             .with_title(pending.opts.title.clone())
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(
                 pending.opts.inner_size.w,
                 pending.opts.inner_size.h,
@@ -540,6 +580,24 @@ impl App {
             (root, focus)
         });
 
+        // The accessibility adapter (#67) forwards accesskit events as winit user events (an initial
+        // tree request / action request / deactivation) via the same `EventLoopProxy` as the #66
+        // bridge. The proxy is populated in `run()` before the loop drives `resumed` → here, so it is
+        // present; fail the window rather than panic if that invariant is somehow broken.
+        let adapter = match self.proxy_cell.get() {
+            Some(proxy) => {
+                accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, proxy.clone())
+            }
+            None => {
+                return Err(AppError::WindowCreate(
+                    "event loop proxy not initialized before window creation".into(),
+                ));
+            }
+        };
+        // The adapter now exists, so it is safe to show the window (#67/RK-022: the adapter must be
+        // built while the window is still hidden).
+        window.set_visible(true);
+
         Ok((
             winit_id,
             pending.id,
@@ -574,6 +632,8 @@ impl App {
                 drag_image_layout: LayoutTree::new(),
                 drag_owner: None,
                 degraded: false,
+                a11y: A11yTree::default(),
+                adapter,
             },
         ))
     }
@@ -1044,6 +1104,7 @@ impl WindowState {
             None, // a window overlay registry (menus/tooltips live hit-testing) is out of #177 scope
             Some(&mut self.focus),
             Some(&mut self.cursor_reg),
+            Some(&mut self.a11y),
             &mut self.scene,
             viewport,
             &self.damage,
@@ -1052,6 +1113,16 @@ impl WindowState {
             tracing::error!(error = %e, "layout/paint failed");
             return;
         }
+
+        // Push the derived accessibility tree to the OS (#67). `update_if_active` is a no-op unless an
+        // assistive tech has activated, so this is free when a11y is idle; it runs on the paint pass
+        // (damage-gated), so the tree stays in sync with what changed. Disjoint field borrows: `&mut
+        // adapter` with `&a11y`/`&arena`/`&focus`.
+        let a11y_scale = self.window.scale_factor();
+        self.adapter.update_if_active(|| {
+            self.a11y
+                .build_update(&self.arena, self.focus.focused_node(), a11y_scale)
+        });
 
         // Paint the cursor-tracked drag-image on top of the main tree (#178), into the same scene.
         // Built under the per-drag owner so any reactive props register there and dispose when the
@@ -1138,7 +1209,7 @@ async fn create_device(
 fn register_device_lost(
     device: &wgpu::Device,
     flag: &Arc<AtomicBool>,
-    proxy_cell: &Arc<OnceLock<EventLoopProxy<UiEvent>>>,
+    proxy_cell: &Arc<OnceLock<EventLoopProxy<UserEvent>>>,
 ) {
     let flag = Arc::clone(flag);
     let proxy_cell = Arc::clone(proxy_cell);
@@ -1155,7 +1226,7 @@ fn register_device_lost(
         // Wake the loop so `about_to_wait` polls the flag promptly even if the app is idle. The empty
         // closure is a no-op; the wake is the point (reuses the #66 bridge).
         if let Some(proxy) = proxy_cell.get() {
-            let _ = proxy.send_event(Box::new(|| {}));
+            let _ = proxy.send_event(UserEvent::Ui(Box::new(|| {})));
         }
     });
 }
@@ -1225,6 +1296,12 @@ impl ApplicationHandler<UserEvent> for App {
         id: WinitWindowId,
         event: WindowEvent,
     ) {
+        // Feed every window event to the accessibility adapter first (#67) so the AT keeps tree/focus
+        // synced (runs even for a degraded window, which still reports its last-good semantics). Takes
+        // `&event`; the match below then consumes it.
+        if let Some(state) = self.windows.get_mut(&id) {
+            state.adapter.process_event(&state.window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // Remove the closed window (dropping its surface then its shared-device Arc clone;
@@ -1294,14 +1371,21 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        // Run a background-posted UI closure on the UI thread under the app root owner (#66): its
-        // signal writes are tracked and their synchronous effects flag damage → redraw next frame.
-        // The hot-reload watcher's theme swap arrives this way, re-running every window's theme→damage
-        // effect so all windows reskin. Guard it with the panic boundary (#65) — a panic in the
-        // (consumer-supplied) closure is caught + logged so it can't abort the app. It is app-level
-        // (not tied to a window), so there is nothing to degrade; just survive.
-        if run_guarded(|| run_ui_event(&self.root_owner, event)).is_err() {
-            tracing::error!("a background UI closure panicked; dropped (app kept alive)");
+        match event {
+            // Run a background-posted UI closure on the UI thread under the app root owner (#66): its
+            // signal writes are tracked and their synchronous effects flag damage → redraw next frame.
+            // The hot-reload watcher's theme swap arrives this way, re-running every window's
+            // theme→damage effect so all windows reskin. Guard it with the panic boundary (#65) — a
+            // panic in the (consumer-supplied) closure is caught + logged so it can't abort the app.
+            // It is app-level (not tied to a window), so there is nothing to degrade; just survive.
+            UserEvent::Ui(closure) => {
+                if run_guarded(|| run_ui_event(&self.root_owner, closure)).is_err() {
+                    tracing::error!("a background UI closure panicked; dropped (app kept alive)");
+                }
+            }
+            // Accessibility (#67): the adapter asks for the initial tree, requests an action, or
+            // deactivates. MVP is read-only — serve the tree + focus; action routing is post-MVP.
+            UserEvent::Accessibility(event) => self.on_accessibility_event(event),
         }
     }
 
