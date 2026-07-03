@@ -11,7 +11,7 @@
 use kagari_core::reactive::RwSignal;
 use kagari_core::{App, IconId, WindowOptions, div, icon};
 use kagari_style::{ColorRole, Styled};
-use kagari_widgets::{ControlSize, button};
+use kagari_widgets::{ControlSize, button, checkbox, switch};
 
 fn main() -> Result<(), kagari_core::AppError> {
     let mut app = App::new()?;
@@ -63,6 +63,18 @@ fn main() -> Result<(), kagari_core::AppError> {
                         .child(button("Confirm").icon(IconId::Check))
                         .child(icon(IconId::Close))
                         .child(icon(IconId::ChevronDown).color_role(ColorRole::Accent)),
+                )
+                // Checkbox / Switch (#73): a bool bound to a signal; click or Space toggles it.
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(checkbox(RwSignal::new(true)).label("Enabled"))
+                        .child(checkbox(RwSignal::new(false)).label("Off"))
+                        .child(checkbox(RwSignal::new(true)).disabled(true).label("Locked"))
+                        .child(switch(RwSignal::new(true)).label("Dark mode"))
+                        .child(switch(RwSignal::new(false))),
                 )
         },
     )?;
