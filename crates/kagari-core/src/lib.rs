@@ -31,8 +31,8 @@ pub use app::{App, Decorations, WindowOptions};
 pub use bridge::UiProxy;
 pub use damage::DamageState;
 pub use element::{
-    AnchorHandle, AnyElement, Element, IntoElement, Placement, ScrollHandle, div, overlay, scroll,
-    text, virtualized_list,
+    AnchorHandle, AnyElement, Element, IntoElement, Placement, ScrollHandle, Transformed, div,
+    overlay, scroll, text, transform, virtualized_list,
 };
 pub use error::AppError;
 pub use event::{
@@ -43,7 +43,7 @@ pub use event::{
     dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
     use_focus_handle,
 };
-pub use kagari_base::WindowId;
+pub use kagari_base::{Transform, WindowId};
 pub use overlay::{OverlayEntry, OverlayLayer, OverlayLayers, OverlayRegistry};
 pub use persist::{
     KeymapOverrides, OverrideBinding, PersistedState, PersistenceService, WindowGeometry,
