@@ -9,7 +9,7 @@
 //! any button also fires its `on_click` (printed to stdout).
 
 use kagari_core::reactive::RwSignal;
-use kagari_core::{App, WindowOptions, div};
+use kagari_core::{App, IconId, WindowOptions, div, icon};
 use kagari_style::{ColorRole, Styled};
 use kagari_widgets::{ControlSize, button};
 
@@ -53,6 +53,16 @@ fn main() -> Result<(), kagari_core::AppError> {
                         // A toggle button: its background follows the bound signal (pressed = Accent,
                         // unpressed = Surface) — #245's reactive role styling.
                         .child(button("Bold").toggle(RwSignal::new(false))),
+                )
+                // Icons (#246): a leading icon on a button (tinted to the label) + standalone icons.
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(button("Confirm").icon(IconId::Check))
+                        .child(icon(IconId::Close))
+                        .child(icon(IconId::ChevronDown).color_role(ColorRole::Accent)),
                 )
         },
     )?;

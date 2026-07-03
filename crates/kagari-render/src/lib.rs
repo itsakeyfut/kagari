@@ -25,7 +25,7 @@ pub use error::RenderError;
 pub use path::PathBuilder;
 pub use renderer::Renderer;
 pub use scene::{
-    Background, Batch, Border, MonochromeSprite, PathPrim, PolychromeSprite, PrimitiveKind, Quad,
-    RoundedRect, Scene, Shadow, Underline, UnderlineStyle,
+    Background, Batch, Border, IconSprite, MonochromeSprite, PathPrim, PolychromeSprite,
+    PrimitiveKind, Quad, RoundedRect, Scene, Shadow, Underline, UnderlineStyle,
 };
 pub use svg::IconId;

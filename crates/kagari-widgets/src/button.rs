@@ -5,15 +5,17 @@
 //! **Scope**: variant (primary/ghost/danger) + [`ControlSize`] + disabled + `on_click` (mouse **and**
 //! Space/Enter) + a controlled `toggle` signal + focusability ([`use_focus_handle`], #218), with the
 //! visual state feedback wired via #245: a **focus-ring** border shown while focused, a **toggle-pressed**
-//! color bound to the toggle signal, and a theme-reactive **role-based** label color. (Icon-button
-//! `.icon()` still awaits the icon element, #246.)
+//! color bound to the toggle signal, and a theme-reactive **role-based** label color. A leading icon
+//! (`.icon()`, #246) tints to match the label.
 
 use std::rc::Rc;
 
 use kagari_base::SharedString;
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IntoElement, KeyCode, Role, div, text, use_focus_handle};
+use kagari_core::{
+    AnyElement, IconId, IntoElement, KeyCode, Role, div, icon, text, use_focus_handle,
+};
 use kagari_style::{ColorRole, Styled};
 
 use crate::control::{ControlSize, apply_size, label_px};
@@ -36,6 +38,7 @@ pub struct Button {
     disabled: bool,
     on_click: Option<Rc<dyn Fn()>>,
     toggle: Option<RwSignal<bool>>,
+    icon_id: Option<IconId>,
 }
 
 /// Creates a primary, medium button with `label`.
@@ -47,6 +50,7 @@ pub fn button(label: impl Into<SharedString>) -> Button {
         disabled: false,
         on_click: None,
         toggle: None,
+        icon_id: None,
     }
 }
 
@@ -93,6 +97,13 @@ impl Button {
         self.toggle = Some(signal);
         self
     }
+
+    /// Adds a leading icon (#246), tinted to match the label and sized to the label font. Composed
+    /// before the label, separated by the control's inner gap.
+    pub fn icon(mut self, icon_id: IconId) -> Self {
+        self.icon_id = Some(icon_id);
+        self
+    }
 }
 
 /// The `(background, foreground)` roles for `variant`, or muted roles when `disabled`.
@@ -116,6 +127,7 @@ impl IntoElement for Button {
             disabled,
             on_click,
             toggle,
+            icon_id,
         } = self;
         let (bg_role, fg_role) = roles(variant, disabled);
 
@@ -139,10 +151,10 @@ impl IntoElement for Button {
         }
         root = apply_size(root, size);
 
-        // Background + label color. A toggle binds them reactively to its signal (pressed = the variant's
+        // Background + foreground. A toggle binds them reactively to its signal (pressed = the variant's
         // active roles, unpressed = a subtle Surface/Text); otherwise they are static roles (theme-reactive
-        // at paint, muted when disabled).
-        let label_el = match toggle {
+        // at paint, muted when disabled). The label and an optional leading icon share the foreground tint.
+        let (label_el, icon_el) = match toggle {
             Some(signal) if !disabled => {
                 let (on_bg, on_fg) = roles(variant, false);
                 root = root.bg(rx(move || {
@@ -152,15 +164,23 @@ impl IntoElement for Button {
                         ColorRole::Surface
                     }
                 }));
-                text(label)
+                let label_el = text(label)
                     .color_role(rx(
                         move || if signal.get() { on_fg } else { ColorRole::Text },
                     ))
-                    .size(label_px(size))
+                    .size(label_px(size));
+                let icon_el = icon_id.map(|ic| {
+                    icon(ic).size(label_px(size)).color_role(rx(move || {
+                        if signal.get() { on_fg } else { ColorRole::Text }
+                    }))
+                });
+                (label_el, icon_el)
             }
             _ => {
                 root = root.bg(bg_role);
-                text(label).color_role(fg_role).size(label_px(size))
+                let label_el = text(label).color_role(fg_role).size(label_px(size));
+                let icon_el = icon_id.map(|ic| icon(ic).size(label_px(size)).color_role(fg_role));
+                (label_el, icon_el)
             }
         };
 
@@ -194,6 +214,9 @@ impl IntoElement for Button {
                 });
         }
 
+        if let Some(icon_el) = icon_el {
+            root = root.child(icon_el);
+        }
         root.child(label_el).into_element()
     }
 }
@@ -499,6 +522,37 @@ mod tests {
         assert!(
             has_ring(&scene),
             "a focused button paints a FocusRing border"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn button_icon_should_emit_icon_sprite() {
+        // `.icon(..)` (#246) composes a leading icon leaf: the deferred model emits it into `scene.icons`
+        // even without an atlas, so a GPU-free scene-structure test can assert the request.
+        let owner = Owner::new();
+        owner.set();
+        let b = build(button("Confirm").icon(IconId::Check));
+        assert_eq!(
+            b.scene.icons.len(),
+            1,
+            "an icon button emits one icon request"
+        );
+        assert_eq!(b.scene.icons[0].icon, IconId::Check);
+        drop(owner);
+    }
+
+    #[test]
+    fn button_disabled_icon_should_use_muted_tint() {
+        // The icon shares the label's foreground tint — muted (TextMuted) when disabled.
+        let owner = Owner::new();
+        owner.set();
+        let b = build(button("x").icon(IconId::Check).disabled(true));
+        assert_eq!(b.scene.icons.len(), 1);
+        assert_eq!(
+            b.scene.icons[0].tint,
+            Theme::default().resolve_color(ColorRole::TextMuted),
+            "a disabled button's icon uses the muted foreground role"
         );
         drop(owner);
     }
