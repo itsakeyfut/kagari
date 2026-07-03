@@ -36,3 +36,32 @@ pub(crate) fn label_px(size: ControlSize) -> Px {
         ControlSize::Lg => Px(18.0),
     }
 }
+
+/// The checkbox's square box side (logical px) for `size` — sized near the label cap height so the box
+/// and its label align.
+pub(crate) fn checkbox_box_px(size: ControlSize) -> Px {
+    match size {
+        ControlSize::Sm => Px(16.0),
+        ControlSize::Md => Px(18.0),
+        ControlSize::Lg => Px(22.0),
+    }
+}
+
+/// The check-glyph side (logical px) for `size` — a little smaller than the box so the ✓ sits inside it.
+pub(crate) fn check_glyph_px(size: ControlSize) -> Px {
+    match size {
+        ControlSize::Sm => Px(12.0),
+        ControlSize::Md => Px(14.0),
+        ControlSize::Lg => Px(16.0),
+    }
+}
+
+/// The switch metrics `(track_w, track_h, knob)` (logical px) for `size`. The knob is inset 2px on all
+/// sides (so `track_h = knob + 4`), and its ON travel is `track_w - knob - 4`.
+pub(crate) fn switch_dims(size: ControlSize) -> (Px, Px, Px) {
+    match size {
+        ControlSize::Sm => (Px(28.0), Px(16.0), Px(12.0)),
+        ControlSize::Md => (Px(34.0), Px(20.0), Px(16.0)),
+        ControlSize::Lg => (Px(42.0), Px(24.0), Px(20.0)),
+    }
+}
