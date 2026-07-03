@@ -3,7 +3,7 @@
 use std::any::TypeId;
 use std::sync::Arc;
 
-use kagari_base::{NodeId, Rect, Size};
+use kagari_base::{NodeId, Rect, Size, Transform};
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
@@ -30,6 +30,19 @@ const OVERLAY_SLOT_STRIDE: u32 = 1 << 16;
 struct OverlayOrderState {
     base: u32,
     counter: u32,
+}
+
+/// One active paint transform (#221) plus the primitive/hit-region counts captured when it was pushed, so
+/// [`pop_transform`](PaintCx::pop_transform) maps exactly the geometry emitted while it was active.
+struct TransformFrame {
+    t: Transform,
+    shadows: usize,
+    quads: usize,
+    paths: usize,
+    images: usize,
+    glyphs: usize,
+    underlines: usize,
+    hits: usize,
 }
 
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
@@ -106,6 +119,10 @@ pub struct PaintCx<'a> {
     /// node + absolute bounds into it during paint (like `hit_test`). `None` skips recording (GPU-free
     /// tests / GPU-free paths). Set by `render_tree` via [`attach_a11y`](Self::attach_a11y).
     a11y: Option<&'a mut A11yTree>,
+    /// The active paint-transform stack (#221): a `transform` element pushes a frame around its child;
+    /// on pop, the primitives + hit regions emitted since are mapped. Empty = identity (no per-primitive
+    /// cost when unused).
+    transforms: Vec<TransformFrame>,
 }
 
 impl<'a> PaintCx<'a> {
@@ -131,7 +148,63 @@ impl<'a> PaintCx<'a> {
             overlay_orders: Vec::new(),
             viewport: Size { w: 0.0, h: 0.0 },
             a11y: None,
+            transforms: Vec::new(),
         }
+    }
+
+    /// Pushes a paint transform (#221): geometry emitted until the matching [`pop_transform`](Self::pop_transform)
+    /// is mapped by `t` (scale + translate), in window space. Nested pushes compose. Snapshots the current
+    /// primitive/hit-region counts so only the enclosed geometry is mapped.
+    pub fn push_transform(&mut self, t: Transform) {
+        self.transforms.push(TransformFrame {
+            t,
+            shadows: self.scene.shadows.len(),
+            quads: self.scene.quads.len(),
+            paths: self.scene.paths.len(),
+            images: self.scene.images.len(),
+            glyphs: self.scene.glyphs.len(),
+            underlines: self.scene.underlines.len(),
+            hits: self.hit_test.as_deref().map_or(0, HitTest::len),
+        });
+    }
+
+    /// Maps every primitive + hit region emitted since the matching [`push_transform`](Self::push_transform)
+    /// by that transform, then pops it. A nested inner pop maps first, so the outer pop re-maps the same
+    /// range — composing `outer(inner(p))` (no explicit composition needed at pop).
+    pub fn pop_transform(&mut self) {
+        let Some(f) = self.transforms.pop() else {
+            return;
+        };
+        for s in &mut self.scene.shadows[f.shadows..] {
+            s.apply_transform(&f.t);
+        }
+        for q in &mut self.scene.quads[f.quads..] {
+            q.apply_transform(&f.t);
+        }
+        for p in &mut self.scene.paths[f.paths..] {
+            p.apply_transform(&f.t);
+        }
+        for i in &mut self.scene.images[f.images..] {
+            i.apply_transform(&f.t);
+        }
+        for g in &mut self.scene.glyphs[f.glyphs..] {
+            g.apply_transform(&f.t);
+        }
+        for u in &mut self.scene.underlines[f.underlines..] {
+            u.apply_transform(&f.t);
+        }
+        if let Some(ht) = self.hit_test.as_deref_mut() {
+            ht.transform_from(f.hits, &f.t);
+        }
+    }
+
+    /// The composed active transform (#221): content→window for the current subtree (identity when no
+    /// transform is active). A widget maps a window pointer to content via
+    /// [`Transform::inverse_point`](kagari_base::Transform::inverse_point).
+    pub fn active_transform(&self) -> Transform {
+        self.transforms
+            .iter()
+            .fold(Transform::IDENTITY, |acc, f| acc.compose(f.t))
     }
 
     /// Sets the window viewport size for anchored-overlay placement (#175); `render_tree` calls this.

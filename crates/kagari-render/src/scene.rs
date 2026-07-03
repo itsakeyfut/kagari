@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use kagari_base::{Color, Corners, Edges, Point, Rect};
+use kagari_base::{Color, Corners, Edges, Point, Rect, Transform};
 
 use crate::atlas::AtlasCoord;
 
@@ -162,6 +162,102 @@ impl PathPrim {
             vertices,
             indices,
             order,
+        }
+    }
+}
+
+/// Scales rounded-corner radii by a uniform factor (#221 transform).
+fn scale_corners(c: Corners, s: f32) -> Corners {
+    Corners {
+        tl: c.tl * s,
+        tr: c.tr * s,
+        br: c.br * s,
+        bl: c.bl * s,
+    }
+}
+
+/// Maps a rounded-rect content mask under `t` (#221): its rect by `map_rect`, its radii by `scale`.
+fn map_mask(mask: RoundedRect, t: &Transform) -> RoundedRect {
+    RoundedRect {
+        rect: t.map_rect(mask.rect),
+        radii: scale_corners(mask.radii, t.scale),
+    }
+}
+
+impl Quad {
+    /// Maps this quad into window space under a paint transform (#221): bounds + content mask by `t`,
+    /// corner radii + border widths by `scale`. The gradient stops (quad-local `[0,1]`) are unaffected.
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.bounds = t.map_rect(self.bounds);
+        self.content_mask = map_mask(self.content_mask, t);
+        self.corner_radii = scale_corners(self.corner_radii, t.scale);
+        let w = &mut self.border.widths;
+        *w = Edges {
+            top: w.top * t.scale,
+            right: w.right * t.scale,
+            bottom: w.bottom * t.scale,
+            left: w.left * t.scale,
+        };
+    }
+}
+
+impl Shadow {
+    /// Maps this shadow under a paint transform (#221): the casting box + content mask by `t`, and the
+    /// corner radii / blur / spread / offset by `scale`.
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.bounds = t.map_rect(self.bounds);
+        self.content_mask = map_mask(self.content_mask, t);
+        self.corner_radii = scale_corners(self.corner_radii, t.scale);
+        self.offset = self.offset * t.scale;
+        self.blur *= t.scale;
+        self.spread *= t.scale;
+    }
+}
+
+impl MonochromeSprite {
+    /// Maps this glyph/coverage sprite under a paint transform (#221): bounds + content mask by `t`. The
+    /// atlas tile is unchanged, so a zoomed glyph samples its base raster (re-raster at zoom is post-MVP).
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.bounds = t.map_rect(self.bounds);
+        self.content_mask = map_mask(self.content_mask, t);
+    }
+}
+
+impl PolychromeSprite {
+    /// Maps this image sprite under a paint transform (#221): bounds + content mask by `t`.
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.bounds = t.map_rect(self.bounds);
+        self.content_mask = map_mask(self.content_mask, t);
+    }
+}
+
+impl Underline {
+    /// Maps this underline band under a paint transform (#221): rect + content mask by `t`, thickness by
+    /// `scale`.
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.rect = t.map_rect(self.rect);
+        self.content_mask = map_mask(self.content_mask, t);
+        self.thickness *= t.scale;
+    }
+}
+
+impl PathPrim {
+    /// Maps this tessellated path under a paint transform (#221): every vertex position + its per-vertex
+    /// rounded-rect mask (offset by `map_point`, half-extents + radii by `scale`). The feather-AA pair
+    /// (`cov_a`/`cov_b`, a screen-space px ramp) is left unscaled — an accepted approximation at zoom.
+    pub fn apply_transform(&mut self, t: &Transform) {
+        for v in &mut self.vertices {
+            let p = t.map_point(Point::new(v.position[0], v.position[1]));
+            v.position = [p.x, p.y];
+            let m = t.map_point(Point::new(v.mask_offset[0], v.mask_offset[1]));
+            v.mask_offset = [m.x, m.y];
+            v.mask_half = [v.mask_half[0] * t.scale, v.mask_half[1] * t.scale];
+            v.mask_radii = [
+                v.mask_radii[0] * t.scale,
+                v.mask_radii[1] * t.scale,
+                v.mask_radii[2] * t.scale,
+                v.mask_radii[3] * t.scale,
+            ];
         }
     }
 }
@@ -666,6 +762,110 @@ mod tests {
                 PrimitiveKind::Sprite,
                 PrimitiveKind::Underline
             ]
+        );
+    }
+
+    #[test]
+    fn apply_transform_should_scale_quad_geometry() {
+        // scale ×2 + offset (5,5): bounds origin*2+offset, size*2; radii/border widths *2; content mask
+        // maps too (#221).
+        let mut q = Quad {
+            bounds: Rect::from_xywh(10.0, 10.0, 20.0, 20.0),
+            corner_radii: Corners {
+                tl: 2.0,
+                tr: 2.0,
+                br: 2.0,
+                bl: 2.0,
+            },
+            bg: Background::Solid(Color::new(0.0, 0.0, 0.0, 1.0)),
+            border: Border {
+                widths: Edges {
+                    top: 1.0,
+                    right: 1.0,
+                    bottom: 1.0,
+                    left: 1.0,
+                },
+                color: Color::TRANSPARENT,
+            },
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                radii: Corners::default(),
+            },
+            order: 0,
+        };
+        q.apply_transform(&Transform::new(2.0, Point::new(5.0, 5.0)));
+        assert_eq!(q.bounds, Rect::from_xywh(25.0, 25.0, 40.0, 40.0));
+        assert_eq!(q.corner_radii.tl, 4.0);
+        assert_eq!(q.border.widths.top, 2.0);
+        assert_eq!(q.content_mask.rect, Rect::from_xywh(5.0, 5.0, 200.0, 200.0));
+    }
+
+    #[test]
+    fn apply_transform_should_scale_shadow_extras() {
+        let mut s = Shadow {
+            bounds: Rect::from_xywh(10.0, 10.0, 20.0, 20.0),
+            corner_radii: Corners::default(),
+            offset: Point::new(2.0, 3.0),
+            blur: 4.0,
+            spread: 1.0,
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                radii: Corners::default(),
+            },
+            order: 0,
+        };
+        s.apply_transform(&Transform::new(2.0, Point::new(5.0, 5.0)));
+        assert_eq!(s.bounds, Rect::from_xywh(25.0, 25.0, 40.0, 40.0));
+        assert_eq!(s.offset, Point::new(4.0, 6.0), "shadow offset scales");
+        assert_eq!(s.blur, 8.0, "blur scales");
+        assert_eq!(s.spread, 2.0, "spread scales");
+    }
+
+    #[test]
+    fn apply_transform_should_scale_underline_thickness() {
+        let mut u = Underline {
+            rect: Rect::from_xywh(0.0, 0.0, 10.0, 2.0),
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            style: UnderlineStyle::Solid,
+            thickness: 1.5,
+            content_mask: RoundedRect {
+                rect: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+                radii: Corners::default(),
+            },
+            order: 0,
+        };
+        u.apply_transform(&Transform::new(2.0, Point::new(0.0, 0.0)));
+        assert_eq!(u.rect, Rect::from_xywh(0.0, 0.0, 20.0, 4.0));
+        assert_eq!(u.thickness, 3.0, "underline thickness scales");
+    }
+
+    #[test]
+    fn apply_transform_should_map_path_vertices() {
+        let v = PathVertex {
+            position: [3.0, 4.0],
+            cov_a: 1.0,
+            cov_b: 0.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            mask_offset: [1.0, 1.0],
+            mask_half: [5.0, 5.0],
+            mask_radii: [0.0, 0.0, 0.0, 0.0],
+        };
+        let mut p = PathPrim::new(vec![v], vec![0], 0);
+        p.apply_transform(&Transform::new(2.0, Point::new(10.0, 10.0)));
+        assert_eq!(
+            p.vertices[0].position,
+            [16.0, 18.0],
+            "vertex position mapped (p*2+10)"
+        );
+        assert_eq!(
+            p.vertices[0].mask_half,
+            [10.0, 10.0],
+            "mask half-extents scale"
+        );
+        assert_eq!(
+            p.vertices[0].cov_a, 1.0,
+            "feather-AA coverage left unscaled"
         );
     }
 }

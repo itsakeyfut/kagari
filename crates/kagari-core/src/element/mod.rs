@@ -13,6 +13,7 @@ mod dynamic;
 mod overlay;
 mod scroll;
 mod text;
+mod transform;
 mod virtualized;
 
 pub use cx::{DamageSink, Event, EventCx, LayoutCx, PaintCx};
@@ -21,6 +22,7 @@ pub use dynamic::{DynIf, DynList, dyn_if, dyn_list};
 pub use overlay::{AnchorHandle, Overlay, Placement, overlay};
 pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};
+pub use transform::{Transformed, transform};
 pub use virtualized::{VirtualizedList, virtualized_list};
 
 use kagari_base::{NodeId, Rect};

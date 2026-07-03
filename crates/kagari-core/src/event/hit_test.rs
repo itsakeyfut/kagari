@@ -11,7 +11,7 @@
 //! lands with its first consumer in #48 — until handlers/focus/cursor exist there is nothing
 //! interactive to record. This module is the structure those issues build on.
 
-use kagari_base::{NodeId, Point, Rect};
+use kagari_base::{NodeId, Point, Rect, Transform};
 
 /// Which interactions a node opts into. Populated by later issues' setters (mouse handlers #48,
 /// `track_focus` #49, cursor #53, drag/drop #52); carried as metadata on a [`HitRegion`].
@@ -73,6 +73,26 @@ impl HitTest {
     /// Records a region (called during paint by the recorder #48 wires in).
     pub fn push(&mut self, region: HitRegion) {
         self.regions.push(region);
+    }
+
+    /// The number of recorded regions — the since-marker for a paint transform (#221).
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Whether no regions are recorded.
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// Maps the `bounds`/`clip` of every region recorded since index `start` by a paint transform (#221),
+    /// so a transformed subtree's regions pick correctly in window space with the existing pick path.
+    pub(crate) fn transform_from(&mut self, start: usize, t: &Transform) {
+        let start = start.min(self.regions.len());
+        for r in &mut self.regions[start..] {
+            r.bounds = t.map_rect(r.bounds);
+            r.clip = t.map_rect(r.clip);
+        }
     }
 
     /// The topmost node under `p`: the containing region with the largest `order` (front-most), or
@@ -228,5 +248,37 @@ mod tests {
         ht.clear();
         assert!(ht.pick(Point::new(5.0, 5.0)).is_none());
         assert!(ht.regions.capacity() >= cap, "capacity retained for reuse");
+    }
+
+    #[test]
+    fn transform_from_should_map_bounds_and_clip() {
+        let mut ht = HitTest::new();
+        ht.push(HitRegion {
+            node: NodeId::from_raw(1),
+            bounds: Rect::from_xywh(10.0, 10.0, 20.0, 20.0),
+            clip: Rect::from_xywh(0.0, 0.0, 100.0, 100.0),
+            order: 0,
+            flags: InteractFlags {
+                mouse: true,
+                ..InteractFlags::default()
+            },
+        });
+        ht.transform_from(0, &Transform::new(2.0, Point::new(5.0, 5.0)));
+        assert_eq!(
+            ht.regions[0].bounds,
+            Rect::from_xywh(25.0, 25.0, 40.0, 40.0),
+            "bounds mapped"
+        );
+        assert_eq!(
+            ht.regions[0].clip,
+            Rect::from_xywh(5.0, 5.0, 200.0, 200.0),
+            "clip mapped independently of bounds"
+        );
+        // A start past the end is clamped to a no-op (no panic).
+        ht.transform_from(99, &Transform::new(3.0, Point::new(0.0, 0.0)));
+        assert_eq!(
+            ht.regions[0].bounds,
+            Rect::from_xywh(25.0, 25.0, 40.0, 40.0)
+        );
     }
 }
