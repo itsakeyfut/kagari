@@ -5,12 +5,22 @@
 
 use std::sync::{Arc, Mutex};
 
-use kagari_base::{NodeId, Point, Rect, Size};
+use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
 use kagari_layout::{Display, LayoutStyle};
+use kagari_render::{Background, Border, Quad, RoundedRect};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
-use crate::reactive::{Prop, create_effect};
+use crate::event::{FocusId, FocusRegistry};
+use crate::overlay::{OverlayLayer, OverlayLayers};
+use crate::reactive::prelude::*;
+use crate::reactive::{Prop, RwSignal, create_effect, use_context};
+
+/// A modal backdrop's scrim color (#219): a semi-transparent black behind the overlay content. Hardcoded
+/// for the MVP substrate; a theme-token backdrop is post-MVP.
+fn backdrop_scrim() -> Color {
+    Color::new(0.0, 0.0, 0.0, 0.5)
+}
 
 /// An anchored overlay's side preference relative to its anchor element (#175).
 ///
@@ -111,6 +121,32 @@ pub struct Overlay {
     resolved_position: Arc<Mutex<Option<Point>>>,
     id: Option<NodeId>,
     child_id: Option<NodeId>,
+    /// Controllable open state (#219): when `Some`, the overlay is interactive — it paints/registers a
+    /// layer only while `true`, and its open-state effect saves/restores focus + repaints on toggle. When
+    /// `None`, the overlay is a plain (always-drawn, non-interactive) portal, e.g. a drag-image (#172).
+    open: Option<RwSignal<bool>>,
+    /// Dismiss on an outside press / Esc (opt-in).
+    dismiss_on_outside: bool,
+    /// Confine Tab/Shift+Tab within this overlay while it is topmost (opt-in).
+    trap_focus: bool,
+    /// Paint a modal backdrop + block input to content beneath (opt-in).
+    backdrop: bool,
+    /// Optional dismissal callback, run when the overlay is dismissed.
+    on_dismiss: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The window's interactive layer stack, read from context at build (absent in GPU-free tests).
+    layers: Option<OverlayLayers>,
+    /// The window's focus registry (#218), read from context at build, for focus save/restore.
+    focus: Option<FocusRegistry>,
+    /// Tracks the open transition for the open-state effect (previous open value + saved focus).
+    open_state: Arc<Mutex<OpenState>>,
+}
+
+/// The open-state effect's cross-frame memory: the previous `open` value (to detect transitions) and the
+/// [`FocusId`] saved on open, restored on close (focus trap return-focus, #218/#219).
+#[derive(Default)]
+struct OpenState {
+    prev: bool,
+    saved: Option<FocusId>,
 }
 
 /// Creates an overlay portal wrapping `child`. It paints at an absolute `(0, 0)` until placed with
@@ -123,6 +159,14 @@ pub fn overlay(child: impl IntoElement) -> Overlay {
         resolved_position: Arc::new(Mutex::new(None)),
         id: None,
         child_id: None,
+        open: None,
+        dismiss_on_outside: false,
+        trap_focus: false,
+        backdrop: false,
+        on_dismiss: None,
+        layers: None,
+        focus: None,
+        open_state: Arc::new(Mutex::new(OpenState::default())),
     }
 }
 
@@ -146,6 +190,89 @@ impl Overlay {
         };
         self.position = None;
         self
+    }
+
+    /// Makes the overlay interactive with a controlled open signal (#219, D2): the overlay paints and
+    /// registers a layer only while the signal is `true`. Opening saves the focused element and closing
+    /// restores it; toggling repaints. Without `.open(..)` the overlay is a plain always-drawn portal.
+    ///
+    /// Drive the overlay's **mount/visibility from this same `open` signal** (e.g. wrap content in
+    /// `dyn_if(open, ..)`): return-focus runs on the close transition of the effect, so unmounting the
+    /// overlay while it is still `open` (via a *different* condition) disposes the effect without restoring
+    /// focus.
+    pub fn open(mut self, open: RwSignal<bool>) -> Self {
+        self.open = Some(open);
+        self
+    }
+
+    /// Dismiss this overlay on an outside pointer press or Esc (topmost/innermost-first, #219). The
+    /// dismissing press is consumed; a modal `backdrop` also blocks it from content beneath.
+    pub fn dismiss_on_outside(mut self, dismiss: bool) -> Self {
+        self.dismiss_on_outside = dismiss;
+        self
+    }
+
+    /// Confine Tab / Shift+Tab within this overlay's focusables while it is the topmost open overlay
+    /// (#219, on #218). Focus is saved on open and restored on close.
+    pub fn trap_focus(mut self, trap: bool) -> Self {
+        self.trap_focus = trap;
+        self
+    }
+
+    /// Paint a modal backdrop (a full-viewport scrim beneath the content) that blocks input to content
+    /// beneath (#219). Combine with `.dismiss_on_outside(true)` for a backdrop-click-to-dismiss modal.
+    pub fn backdrop(mut self, backdrop: bool) -> Self {
+        self.backdrop = backdrop;
+        self
+    }
+
+    /// Runs `on_dismiss` when the overlay is dismissed (outside press / Esc), after clearing its open
+    /// signal — e.g. to notify a parent or run teardown (#219).
+    pub fn on_dismiss(mut self, on_dismiss: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_dismiss = Some(Arc::new(on_dismiss));
+        self
+    }
+
+    /// Registers the open-state effect (#219): a synchronous effect (ADR 0001 / RK-005) that subscribes
+    /// to the `open` signal and, on each transition, saves the focused [`FocusId`] on open / restores it
+    /// on close (focus-trap return, #218) and flags paint-damage so the toggle repaints. Registered once
+    /// at build under the window owner (so it lives for the window — the redraw builds under
+    /// `self._owner`), a no-op when the overlay is not interactive (`open` is `None`).
+    fn bind_open(&self, id: NodeId, damage: &Arc<dyn DamageSink>) {
+        let Some(open) = self.open else {
+            return;
+        };
+        let focus = self.focus.clone();
+        let state = Arc::clone(&self.open_state);
+        let damage = Arc::clone(damage);
+        create_effect(move || {
+            let now = open.get();
+            // Compute the focus target to restore (close transition) while holding the lock, then release
+            // it *before* writing `focus.current()` — `set` fires subscribers synchronously, and the
+            // `open_state` mutex is not reentrant (same discipline as `dismiss_topmost`/`step_within`).
+            let restore = {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                if now == st.prev {
+                    return;
+                }
+                st.prev = now;
+                match (&focus, now) {
+                    // Opened: remember what had focus so it can be restored on close (untracked read).
+                    (Some(focus), true) => {
+                        st.saved = focus.current().get_untracked();
+                        None
+                    }
+                    // Closed: hand the saved id back out to restore after the lock is released.
+                    (Some(_), false) => st.saved.take(),
+                    (None, _) => None,
+                }
+            };
+            if let (Some(focus), Some(saved)) = (&focus, restore) {
+                focus.current().set(Some(saved));
+            }
+            // Paint reads `open` untracked, so a toggle must flag damage to repaint (damage-driven redraw).
+            damage.mark_paint_dirty(id);
+        });
     }
 
     /// Resolves the reactive `position` prop into `resolved_position` (the absolute-placement analogue
@@ -207,7 +334,14 @@ impl Element for Overlay {
                         ..LayoutStyle::default()
                     },
                 );
+                // Read the interactive substrate handles from context (#219): the window's overlay layer
+                // stack + focus registry (#218). Absent in GPU-free tests → the overlay stays a plain,
+                // non-interactive portal. The redraw builds under the window owner, so context resolves
+                // and the open-state effect survives (RK-008).
+                self.layers = use_context::<OverlayLayers>();
+                self.focus = use_context::<FocusRegistry>();
                 self.bind_position(&cx.damage, id);
+                self.bind_open(id, &cx.damage);
                 id
             }
         };
@@ -227,6 +361,12 @@ impl Element for Overlay {
     }
 
     fn paint(&mut self, _bounds: Rect, cx: &mut PaintCx) {
+        // Controllable open (#219): a closed interactive overlay paints nothing and registers no layer.
+        if let Some(open) = self.open {
+            if !open.get_untracked() {
+                return;
+            }
+        }
         // The overlay ignores its zero-size in-flow `bounds` and paints its child at the resolved
         // window position, deferred to the top painter-order and escaping any parent clip.
         let Some(child_id) = self.child_id else {
@@ -248,9 +388,6 @@ impl Element for Overlay {
                 None => Point::new(0.0, 0.0),
             },
         };
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
         let child_bounds = Rect {
             origin,
             size: overlay_size,
@@ -259,13 +396,55 @@ impl Element for Overlay {
         // slot 0 when no registry is attached (a lone overlay still draws frontmost).
         let anchor_node = self.id.unwrap_or(child_id);
         let slot = cx.overlay_register(anchor_node, child_bounds).unwrap_or(0);
+        // Snapshot the backdrop opt-in before the child's `&mut` borrow.
+        let backdrop = self.backdrop;
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         // Escape any parent clip and draw the subtree in the overlay's high painter-order band.
         let saved_clip = cx.clip();
         cx.set_clip(None);
         cx.enter_overlay(slot);
+        // Modal backdrop (#219): a full-viewport scrim painted first, so it takes the lowest order in the
+        // band (beneath the content); it blocks input to content below (the shell consumes outside
+        // presses over it).
+        if backdrop {
+            let vp = cx.viewport();
+            let rect = Rect::from_xywh(0.0, 0.0, vp.w, vp.h);
+            let order = cx.next_order();
+            let mask = cx.clip_rect(rect);
+            cx.scene.quads.push(Quad {
+                bounds: rect,
+                corner_radii: Corners::default(),
+                bg: Background::Solid(backdrop_scrim()),
+                border: Border {
+                    widths: Edges::default(),
+                    color: Color::TRANSPARENT,
+                },
+                content_mask: RoundedRect {
+                    rect: mask,
+                    radii: Corners::default(),
+                },
+                order,
+            });
+        }
         child.paint(child_bounds, cx);
         cx.exit_overlay();
         cx.set_clip(saved_clip);
+        // Register the interactive layer (#219) — open overlays only (those built with `.open(..)`). The
+        // shell reads this stack for outside/Esc dismiss routing and focus-trap. Registration order =
+        // paint order = z order, so the topmost open overlay is the last registered.
+        if let (Some(open), Some(layers)) = (self.open, &self.layers) {
+            layers.push(OverlayLayer::new(
+                anchor_node,
+                child_bounds,
+                self.dismiss_on_outside,
+                self.trap_focus,
+                self.backdrop,
+                open,
+                self.on_dismiss.clone(),
+            ));
+        }
     }
 
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
@@ -294,6 +473,7 @@ mod tests {
     use crate::element::{DamageSink, div, scroll};
     use crate::event::HitTest;
     use crate::overlay::OverlayRegistry;
+    use crate::reactive::{Owner, provide_context};
     use kagari_base::Color;
     use kagari_layout::LayoutTree;
     use kagari_render::{Background, Scene};
@@ -939,5 +1119,149 @@ mod tests {
             Point::new(120.0, 20.0),
             "places below the anchor and clamps the cross axis on-screen"
         );
+    }
+
+    /// Builds + paints `root` (with a viewport + overlay registry), assuming an ambient reactive owner is
+    /// set (so `use_context` resolves at build). Returns the scene. Used by the interactive-overlay tests.
+    fn paint_interactive(root: &mut AnyElement, viewport: Size) -> Scene {
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: std::sync::Arc<dyn DamageSink> = std::sync::Arc::new(NoopDamage);
+        let theme = Theme::default();
+        let id = root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+        layout.compute(id, viewport).unwrap();
+        let mut scene = Scene::new();
+        let mut overlay_reg = OverlayRegistry::new();
+        {
+            let bounds = layout.layout(id);
+            let mut cx = PaintCx::new(&mut scene, &layout, &mut text, None, None, &theme);
+            cx.set_viewport(viewport);
+            cx.attach_overlay(&mut overlay_reg);
+            root.paint(bounds, &mut cx);
+        }
+        scene
+    }
+
+    #[test]
+    fn overlay_open_false_should_paint_nothing_and_not_register() {
+        let owner = Owner::new();
+        owner.set();
+        let layers = OverlayLayers::new();
+        provide_context(layers.clone());
+
+        // A closed interactive overlay: its child is still built, but paint gates on `open` → nothing is
+        // drawn and no layer is registered.
+        let mut root = overlay(div().size(Size { w: 50.0, h: 50.0 }).background(green()))
+            .open(RwSignal::new(false))
+            .into_element();
+        let scene = paint_interactive(&mut root, Size { w: 200.0, h: 200.0 });
+
+        assert!(scene.quads.is_empty(), "a closed overlay paints no quads");
+        assert!(
+            layers.is_empty(),
+            "a closed overlay registers no interactive layer"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn overlay_backdrop_should_paint_scrim_beneath_child() {
+        let owner = Owner::new();
+        owner.set();
+        let layers = OverlayLayers::new();
+        provide_context(layers.clone());
+
+        // An open modal overlay: a full-viewport scrim is painted beneath the child, both in the high
+        // overlay band, and the overlay registers an interactive layer.
+        let mut root = overlay(div().size(Size { w: 50.0, h: 50.0 }).background(green()))
+            .open(RwSignal::new(true))
+            .backdrop(true)
+            .into_element();
+        let scene = paint_interactive(&mut root, Size { w: 200.0, h: 200.0 });
+
+        assert_eq!(scene.quads.len(), 2, "the backdrop scrim + the child bg");
+        let backdrop = &scene.quads[0];
+        let child = &scene.quads[1];
+        assert!(
+            backdrop.order < child.order,
+            "the backdrop is painted beneath the child content"
+        );
+        assert!(
+            backdrop.order >= 1 << 28,
+            "the backdrop is in the high overlay band"
+        );
+        assert_eq!(
+            backdrop.bounds,
+            Rect::from_xywh(0.0, 0.0, 200.0, 200.0),
+            "the backdrop covers the full viewport"
+        );
+        assert_eq!(
+            backdrop.bg,
+            Background::Solid(backdrop_scrim()),
+            "the backdrop is the translucent scrim"
+        );
+        assert!(!layers.is_empty(), "the open overlay registered a layer");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn overlay_open_toggle_should_save_and_restore_focus() {
+        let owner = Owner::new();
+        owner.set();
+        let layers = OverlayLayers::new();
+        provide_context(layers.clone());
+        let reg = FocusRegistry::new();
+        provide_context(reg.clone());
+
+        // Two focusables; `first` holds focus before the overlay opens.
+        let first = reg.handle();
+        let second = reg.handle();
+        first.focus();
+        assert!(first.is_focused(), "the pre-open focus target");
+
+        // Build a trap-focus overlay under the owner: its open-state effect registers here (#219).
+        let open = RwSignal::new(false);
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: std::sync::Arc<dyn DamageSink> = std::sync::Arc::new(NoopDamage);
+        let theme = Theme::default();
+        let mut ov = overlay(div().size(Size { w: 20.0, h: 20.0 }))
+            .open(open)
+            .trap_focus(true)
+            .into_element();
+        ov.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+
+        // Open → the effect saves the focused id (`first`). Move focus inside; close → focus returns.
+        open.set(true);
+        second.focus();
+        assert!(second.is_focused(), "focus moved while the overlay is open");
+        open.set(false);
+        assert_eq!(
+            reg.current().get_untracked(),
+            Some(first.id()),
+            "closing the overlay returns focus to the pre-open target"
+        );
+
+        drop(owner);
     }
 }

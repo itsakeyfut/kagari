@@ -44,7 +44,7 @@ pub use event::{
     use_focus_handle,
 };
 pub use kagari_base::WindowId;
-pub use overlay::{OverlayEntry, OverlayRegistry};
+pub use overlay::{OverlayEntry, OverlayLayer, OverlayLayers, OverlayRegistry};
 pub use persist::{
     KeymapOverrides, OverrideBinding, PersistedState, PersistenceService, WindowGeometry,
 };
