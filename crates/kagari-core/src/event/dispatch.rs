@@ -73,6 +73,19 @@ pub struct MouseEvent {
     pub modifiers: Modifiers,
 }
 
+impl MouseEvent {
+    /// Builds a mouse event from its `kind`, pointer `pos`, and held `modifiers`. Handlers receive
+    /// events pre-built by the app; this is the supported way to *synthesize* one (tests,
+    /// programmatic input injection) despite the `#[non_exhaustive]` struct.
+    pub fn new(kind: MouseKind, pos: Point, modifiers: Modifiers) -> Self {
+        Self {
+            kind,
+            pos,
+            modifiers,
+        }
+    }
+}
+
 /// A resolved keyboard event delivered to elements (#49): the physical `code`, the `modifiers` held,
 /// whether it is a press (`pressed`) or release, and whether it is an auto-`repeat`. `#[non_exhaustive]`:
 /// delivered to handlers (not user-constructed), so fields can be added without a breaking change.
@@ -83,6 +96,21 @@ pub struct KeyEvent {
     pub modifiers: Modifiers,
     pub pressed: bool,
     pub repeat: bool,
+}
+
+impl KeyEvent {
+    /// Builds a key event from its physical `code`, held `modifiers`, press state (`pressed`), and
+    /// auto-`repeat` flag. Handlers receive events pre-built by the app; this is the supported way
+    /// to *synthesize* one (tests, programmatic input injection) despite the `#[non_exhaustive]`
+    /// struct.
+    pub fn new(code: KeyCode, modifiers: Modifiers, pressed: bool, repeat: bool) -> Self {
+        Self {
+            code,
+            modifiers,
+            pressed,
+            repeat,
+        }
+    }
 }
 
 /// Which key-listener a builder setter registers (matched against a [`KeyEvent`]'s `pressed` flag).

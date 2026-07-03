@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, SharedString, Size};
-use kagari_layout::{FlexDirection, LayoutStyle};
+use kagari_layout::{AlignItems, FlexDirection, JustifyContent, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect, Shadow};
 use kagari_style::{SpacingStep, Style, Styled, Theme};
 
@@ -163,6 +163,18 @@ impl Div {
     /// extension of the #146 reactive-size path).
     pub fn gap(mut self, gap: Px) -> Self {
         self.layout.gap = gap;
+        self
+    }
+
+    /// Centers children on the cross axis (`align-items: center`). Damage kind: static layout.
+    pub fn items_center(mut self) -> Self {
+        self.layout.align_items = Some(AlignItems::Center);
+        self
+    }
+
+    /// Centers children on the main axis (`justify-content: center`). Damage kind: static layout.
+    pub fn justify_center(mut self) -> Self {
+        self.layout.justify_content = Some(JustifyContent::Center);
         self
     }
 
