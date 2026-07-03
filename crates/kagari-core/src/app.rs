@@ -39,6 +39,7 @@ use crate::event::{
     MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_drag_leave, dispatch_drag_over,
     dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
 };
+use crate::overlay::{OverlayLayers, OverlayRegistry};
 use crate::paint::{paint_element_into, render_tree};
 use crate::persist::{PersistenceService, WindowGeometry};
 use crate::reactive::prelude::*;
@@ -296,6 +297,12 @@ struct WindowState {
     hit_test: HitTest,
     focus: FocusRegistry,
     cursor_reg: CursorRegistry,
+    // Interactive overlay substrate (#219). `overlay_reg` (z-slots so stacked/nested overlays get
+    // distinct painter-order bands) is re-recorded each paint by `render_tree`. `overlay_layers` (the
+    // interactive layer stack the shell reads for outside/Esc dismiss routing + focus-trap) is
+    // context-provided to open overlays and cleared by the shell before each paint.
+    overlay_reg: OverlayRegistry,
+    overlay_layers: OverlayLayers,
     cursor_state: CursorState,
     dispatch: DispatchState,
     gestures: GestureRecognizer,
@@ -672,7 +679,7 @@ impl App {
         let child_owner = self.root_owner.child();
         let theme = self.theme;
         let damage = Arc::new(DamageState::default());
-        let (root, focus) = child_owner.with(|| {
+        let (root, focus, overlay_layers) = child_owner.with(|| {
             bind_window_theme_damage(theme, Arc::clone(&damage));
             // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
             // window's child owner (RK-005/008); it disposes when the window closes.
@@ -681,8 +688,13 @@ impl App {
             // widget's `use_focus_handle()` mints into this same registry (shared inner) and joins its
             // tab order / `focused_node` resolution. Disposed with the child owner on close (RK-006/008).
             provide_context(focus.clone());
+            // Interactive overlay layer stack (#219): provide a clone into context so an open `Overlay`
+            // registers here at paint; the shell reads it for dismiss routing + focus-trap. Disposed with
+            // the child owner on close.
+            let overlay_layers = OverlayLayers::new();
+            provide_context(overlay_layers.clone());
             let root = (pending.root)();
-            (root, focus)
+            (root, focus, overlay_layers)
         });
 
         // The accessibility adapter (#67) forwards accesskit events as winit user events (an initial
@@ -742,6 +754,8 @@ impl App {
                 hit_test: HitTest::new(),
                 focus,
                 cursor_reg: CursorRegistry::new(),
+                overlay_reg: OverlayRegistry::new(),
+                overlay_layers,
                 cursor_state: CursorState::new(),
                 dispatch: DispatchState::default(),
                 gestures: GestureRecognizer::new(),
@@ -917,6 +931,14 @@ impl WindowState {
 
     /// Handle a pointer move: update the tracked position + gesture cursor, dispatch a `Move` (hover
     /// diff + capture), then resolve the cursor and apply it only when it changes (#53).
+    /// Whether an open modal backdrop should swallow pointer input at `pos` (#219): a `backdrop(true)`
+    /// overlay blocks input to content beneath, so a pointer event outside every open overlay's content
+    /// is consumed (not dispatched to the tree). The dismiss of the topmost overlay is handled separately
+    /// in [`on_mouse_input`](Self::on_mouse_input)'s press path.
+    fn modal_blocks_pointer(&self, pos: Point) -> bool {
+        self.overlay_layers.has_open_backdrop() && self.overlay_layers.pointer_outside_all(pos)
+    }
+
     fn on_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>, scale: f32) {
         self.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
         self.gestures.set_cursor(self.pointer);
@@ -937,6 +959,12 @@ impl WindowState {
                 self.begin_drag();
                 return;
             }
+        }
+
+        // A modal backdrop blocks hover to content beneath (#219): the pointer is still tracked above,
+        // but the move is not dispatched (and the background cursor is not resolved).
+        if self.modal_blocks_pointer(self.pointer) {
+            return;
         }
 
         let ev = MouseEvent {
@@ -966,6 +994,19 @@ impl WindowState {
         let button = map_mouse_button(button);
         match state {
             ElementState::Pressed => {
+                // Interactive overlay dismiss (#219): a press outside every open overlay's content
+                // dismisses the topmost dismissible overlay (innermost-first). A dismissal — or an open
+                // modal backdrop — consumes the press so it does not reach content beneath. A press
+                // inside an overlay, or with no dismissible/modal overlay, falls through to dispatch.
+                if !self.overlay_layers.is_empty()
+                    && self.overlay_layers.pointer_outside_all(self.pointer)
+                {
+                    let dismissed = self.overlay_layers.dismiss_topmost();
+                    if dismissed || self.overlay_layers.has_open_backdrop() {
+                        self.damage.mark_all_dirty();
+                        return;
+                    }
+                }
                 let ev = MouseEvent {
                     kind: MouseKind::Down(button),
                     pos: self.pointer,
@@ -997,6 +1038,11 @@ impl WindowState {
                 }
                 // A press that never passed the threshold was a click, not a drag: disarm.
                 self.drag = DragState::Idle;
+                // A modal backdrop that swallowed the press (#219) also swallows the matching release, so
+                // no stray `Up` reaches content beneath.
+                if self.modal_blocks_pointer(self.pointer) {
+                    return;
+                }
                 let ev = MouseEvent {
                     kind: MouseKind::Up(button),
                     pos: self.pointer,
@@ -1016,6 +1062,11 @@ impl WindowState {
     /// Handle a scroll: dispatch the raw wheel to `on_wheel` **and** the recognized gesture (pan, or
     /// zoom with ctrl) to `on_gesture` — independent opt-in channels (#177 Q1).
     fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, scale: f32) {
+        // A modal backdrop blocks scrolling of content beneath (#219): swallow a wheel outside the
+        // overlay content so the background does not scroll under the modal.
+        if self.modal_blocks_pointer(self.pointer) {
+            return;
+        }
         let (dx, dy) = scroll_delta(delta, scale);
         let wheel = MouseEvent {
             kind: MouseKind::Wheel { dx, dy },
@@ -1061,6 +1112,15 @@ impl WindowState {
             self.end_drag(false);
             return;
         }
+        // Esc dismisses the topmost dismissible overlay (#219), innermost-first, one layer per press,
+        // before keymap/focus routing — so Esc closes an open menu/dialog rather than reaching the tree.
+        if code == KeyCode::Escape
+            && event.state.is_pressed()
+            && self.overlay_layers.dismiss_topmost()
+        {
+            self.damage.mark_all_dirty();
+            return;
+        }
         let kev = KeyEvent {
             code,
             modifiers: self.modifiers,
@@ -1070,6 +1130,14 @@ impl WindowState {
         match route_key(&self.keymap, &kev) {
             KeyRoute::Consume(action) => self.handle_action(action),
             KeyRoute::Deliver => {
+                // Focus trap (#219): while a trap overlay is topmost, don't deliver a raw key to a focused
+                // node outside its scope — otherwise typing leaks to the background before Tab (a consumed
+                // `FocusNext`, confined in `handle_action`) moves focus into the overlay.
+                if let Some(trap) = self.overlay_layers.topmost_trap() {
+                    if !self.focus.is_focus_within(&self.arena, trap.node) {
+                        return;
+                    }
+                }
                 dispatch_key(&mut self.root, &self.arena, self.focus.focused_node(), &kev)
             }
         }
@@ -1079,8 +1147,16 @@ impl WindowState {
     /// action bubbles to `on_action` handlers along the focus chain.
     fn handle_action(&mut self, action: Action) {
         match action {
-            Action::FocusNext => self.focus.focus_next(),
-            Action::FocusPrev => self.focus.focus_prev(),
+            // While a focus-trapping overlay is topmost (#219), confine Tab/Shift+Tab to its focusables;
+            // otherwise navigate the whole window's tab order.
+            Action::FocusNext => match self.overlay_layers.topmost_trap() {
+                Some(layer) => self.focus.focus_next_within(&self.arena, layer.node),
+                None => self.focus.focus_next(),
+            },
+            Action::FocusPrev => match self.overlay_layers.topmost_trap() {
+                Some(layer) => self.focus.focus_prev_within(&self.arena, layer.node),
+                None => self.focus.focus_prev(),
+            },
             // Dev-only: F12 toggles the debug overlay (#69); repaint so it appears/disappears.
             #[cfg(debug_assertions)]
             Action::Named(ref name) if name.as_str() == DEBUG_OVERLAY_ACTION => {
@@ -1247,22 +1323,34 @@ impl WindowState {
             Vec::new()
         };
 
-        let root_id = match render_tree(
-            &mut self.root,
-            &mut self.arena,
-            &mut self.layout,
-            &mut self.text,
-            Some(self.renderer.atlas_mut()),
-            Some(&mut self.hit_test),
-            None, // a window overlay registry (menus/tooltips live hit-testing) is out of #177 scope
-            Some(&mut self.focus),
-            Some(&mut self.cursor_reg),
-            Some(&mut self.a11y),
-            &mut self.scene,
-            viewport,
-            &self.damage,
-            &theme,
-        ) {
+        // Clear the interactive overlay layer stack before painting; open overlays repopulate it during
+        // the paint walk (mirrors `hit_test`, which `render_tree` clears internally). The shell reads
+        // last frame's stack during input, so it is cleared here at the start of the next paint (#219).
+        self.overlay_layers.clear();
+
+        // Build + paint under the window owner (#219): build-once reactive-prop effects (overlay
+        // open-state, reactive positions) register under it and live for the window, rather than dying
+        // with no ambient owner (RK-008). Cloning the owner handle sidesteps borrowing `self._owner`
+        // while the closure mutably borrows the rest of `self` (as `drag_owner` does for the drag-image).
+        let owner = self._owner.clone();
+        let root_id = match owner.with(|| {
+            render_tree(
+                &mut self.root,
+                &mut self.arena,
+                &mut self.layout,
+                &mut self.text,
+                Some(self.renderer.atlas_mut()),
+                Some(&mut self.hit_test),
+                Some(&mut self.overlay_reg), // z-slots for stacked/nested overlays (#219)
+                Some(&mut self.focus),
+                Some(&mut self.cursor_reg),
+                Some(&mut self.a11y),
+                &mut self.scene,
+                viewport,
+                &self.damage,
+                &theme,
+            )
+        }) {
             Ok(root_id) => root_id,
             Err(e) => {
                 tracing::error!(error = %e, "layout/paint failed");

@@ -146,6 +146,20 @@ impl FocusRegistry {
         self.step(-1);
     }
 
+    /// Moves focus to the next focusable **within** `scope_root`'s subtree (wrapping) — the focus-trap
+    /// tab order (#219). Only focusables whose registered node is a descendant-or-self of `scope_root`
+    /// participate; from focus outside the scope, enters at the first. A no-op when the scope has no
+    /// registered focusables.
+    pub fn focus_next_within(&self, arena: &Arena, scope_root: NodeId) {
+        self.step_within(arena, scope_root, 1);
+    }
+
+    /// Moves focus to the previous focusable within `scope_root`'s subtree (wrapping); the focus-trap
+    /// analogue of [`focus_prev`](Self::focus_prev).
+    pub fn focus_prev_within(&self, arena: &Arena, scope_root: NodeId) {
+        self.step_within(arena, scope_root, -1);
+    }
+
     /// Advances the focus by `delta` (+1 next / -1 prev) over the tab order, wrapping.
     fn step(&self, delta: isize) {
         let inner = self.inner();
@@ -170,6 +184,42 @@ impl FocusRegistry {
         self.current.set(Some(target));
     }
 
+    /// Advances focus by `delta` over only the focusables inside `scope_root`'s subtree (the focus-trap
+    /// tab order), wrapping. Filters the flat tab order to ids whose registered node is a
+    /// descendant-or-self of `scope_root`.
+    fn step_within(&self, arena: &Arena, scope_root: NodeId, delta: isize) {
+        let inner = self.inner();
+        let scoped: Vec<FocusId> = inner
+            .order
+            .iter()
+            .copied()
+            .filter(|id| {
+                inner
+                    .nodes
+                    .get(id)
+                    .is_some_and(|&node| is_within(arena, node, scope_root))
+            })
+            .collect();
+        if scoped.is_empty() {
+            return;
+        }
+        let len = scoped.len();
+        let next = match self
+            .current
+            .get_untracked()
+            .and_then(|cur| scoped.iter().position(|&id| id == cur))
+        {
+            // (cur + delta) mod len, wrapping within the scope.
+            Some(i) => (i as isize + delta).rem_euclid(len as isize) as usize,
+            // No focus, or focus outside the scope: enter at the first (next) / last (prev).
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        let target = scoped[next];
+        drop(inner);
+        self.current.set(Some(target));
+    }
+
     /// Whether `node` contains focus: it is the focused node or an ancestor of it.
     pub fn is_focus_within(&self, arena: &Arena, node: NodeId) -> bool {
         match self.focused_node() {
@@ -182,6 +232,21 @@ impl FocusRegistry {
 impl Default for FocusRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Whether `node` is `scope_root` or a descendant of it, walking parents without allocating (unlike
+/// `ancestor_path`, which builds a `Vec`). The focus-trap filter tests this per focusable on every Tab
+/// (#219), so it stays allocation-free and short-circuits on the first match.
+fn is_within(arena: &Arena, mut node: NodeId, scope_root: NodeId) -> bool {
+    loop {
+        if node == scope_root {
+            return true;
+        }
+        match arena.get(node).and_then(|n| n.parent) {
+            Some(parent) => node = parent,
+            None => return false,
+        }
     }
 }
 
@@ -340,6 +405,113 @@ mod tests {
         assert!(
             h.is_focused(),
             "focus_next from none selects the context-minted handle (it is in tab order)"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn focus_next_within_should_cycle_within_scope() {
+        let owner = Owner::new();
+        owner.set();
+
+        // Arena: root → { outside_node, scope_root → { a_node, b_node } }.
+        let mut arena = Arena::new();
+        let root = node(&mut arena, None);
+        let outside_node = node(&mut arena, Some(root));
+        let scope_root = node(&mut arena, Some(root));
+        let a_node = node(&mut arena, Some(scope_root));
+        let b_node = node(&mut arena, Some(scope_root));
+
+        let reg = FocusRegistry::new();
+        // Flat tab order (mint order): outside, a, b. `a`/`b` are inside the scope; `outside` is not.
+        let outside = reg.handle();
+        let a = reg.handle();
+        let b = reg.handle();
+        reg.register(outside.id(), outside_node);
+        reg.register(a.id(), a_node);
+        reg.register(b.id(), b_node);
+
+        // Confined nav visits only the scope's focusables (a, b), skipping `outside`, and wraps.
+        reg.focus_next_within(&arena, scope_root);
+        assert!(
+            a.is_focused(),
+            "confined next enters the scope at its first focusable"
+        );
+        reg.focus_next_within(&arena, scope_root);
+        assert!(b.is_focused(), "advances to the scope's second focusable");
+        reg.focus_next_within(&arena, scope_root);
+        assert!(
+            a.is_focused(),
+            "wraps within the scope (never leaves to the outside focusable)"
+        );
+        reg.focus_prev_within(&arena, scope_root);
+        assert!(b.is_focused(), "prev wraps to the scope's last focusable");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn focus_next_within_should_enter_scope_from_outside_focus() {
+        let owner = Owner::new();
+        owner.set();
+
+        // The real focus-trap entry: an overlay opens while focus is still on its outside trigger; the
+        // first Tab must move focus *into* the scope (the `current = outside`, not-in-scope fallthrough).
+        let mut arena = Arena::new();
+        let root = node(&mut arena, None);
+        let outside_node = node(&mut arena, Some(root));
+        let scope_root = node(&mut arena, Some(root));
+        let a_node = node(&mut arena, Some(scope_root));
+        let b_node = node(&mut arena, Some(scope_root));
+
+        let reg = FocusRegistry::new();
+        let outside = reg.handle();
+        let a = reg.handle();
+        let b = reg.handle();
+        reg.register(outside.id(), outside_node);
+        reg.register(a.id(), a_node);
+        reg.register(b.id(), b_node);
+
+        // Focus starts *outside* the scope.
+        outside.focus();
+        assert!(outside.is_focused(), "focus starts on the outside trigger");
+
+        reg.focus_next_within(&arena, scope_root);
+        assert!(
+            a.is_focused(),
+            "Tab enters the scope at its first focusable (focus was outside the scope)"
+        );
+        reg.focus_prev_within(&arena, scope_root);
+        assert!(
+            b.is_focused(),
+            "Shift+Tab from outside-focus enters at the scope's last focusable"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn focus_next_within_on_empty_scope_should_be_noop() {
+        let owner = Owner::new();
+        owner.set();
+
+        // A trap scope with no registered focusables: nav is a no-op (focus unchanged), no panic.
+        let mut arena = Arena::new();
+        let root = node(&mut arena, None);
+        let empty_scope = node(&mut arena, Some(root));
+        let other_node = node(&mut arena, Some(root));
+
+        let reg = FocusRegistry::new();
+        let other = reg.handle();
+        reg.register(other.id(), other_node);
+        other.focus();
+
+        reg.focus_next_within(&arena, empty_scope);
+        assert_eq!(
+            reg.current().get_untracked(),
+            Some(other.id()),
+            "navigating an empty trap scope leaves focus unchanged"
         );
 
         drop(owner);
