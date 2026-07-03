@@ -40,6 +40,7 @@ slotmap = "1.1.1"          # retained node arena (kagari-core); generation-check
 cosmic-text = "0.19"
 sys-locale = "0.3.2"
 swash = "0.2.9"
+unicode-segmentation = "1.13.3"    # grapheme-cluster boundaries for the text editing core (#220)
 etagere = "0.3"
 lyon = "1.0.19"
 resvg = "0.47"

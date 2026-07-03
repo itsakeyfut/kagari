@@ -47,7 +47,7 @@ pub struct PlacedGlyph {
     pub cluster: usize,
 }
 
-/// Per-line layout metrics (for measure / future cursor positioning).
+/// Per-line layout metrics (for measure + cursor positioning / vertical motion, #220).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineInfo {
     /// Y offset to the top of the line.
@@ -56,6 +56,10 @@ pub struct LineInfo {
     pub height: f32,
     /// Laid-out width of the line in px.
     pub width: f32,
+    /// First source byte offset covered by this visual line.
+    pub byte_start: usize,
+    /// One-past-the-last source byte offset covered by this visual line (excludes a trailing `\n`).
+    pub byte_end: usize,
 }
 
 /// The result of shaping: placed glyphs, the intrinsic size, and per-line info.
@@ -166,17 +170,47 @@ impl TextSystem {
             borrowed.shape_until_scroll(false);
         }
 
+        // Byte offset of each cosmic-text BufferLine (paragraphs split on `\n`) in the original text.
+        // cosmic-text glyph clusters are BufferLine-relative, so add the line's base for an absolute
+        // document offset — required for multi-line cursor mapping / vertical motion (#220).
+        let line_starts: Vec<usize> = {
+            let mut off = 0usize;
+            text.split('\n')
+                .map(|line| {
+                    let start = off;
+                    off += line.len() + 1; // + the `\n`
+                    start
+                })
+                .collect()
+        };
+
         let mut glyphs = Vec::new();
         let mut lines = Vec::new();
         let mut width = 0f32;
         let mut height = 0f32;
+        // Carries the previous line's end so a blank (glyph-less) visual line gets a byte position.
+        let mut prev_line_end = 0usize;
         for run in buffer.layout_runs() {
+            let base = line_starts.get(run.line_i).copied().unwrap_or(0);
             width = width.max(run.line_w);
             height = height.max(run.line_top + run.line_height);
+            // Source byte range of this visual line (#220): the span of its glyph clusters (absolute;
+            // min start, max end — robust to bidi), or the previous line's end for a blank line.
+            let (byte_start, byte_end) = run
+                .glyphs
+                .iter()
+                .fold(None, |acc: Option<(usize, usize)>, g| {
+                    let (s, e) = (base + g.start, base + g.end);
+                    Some(acc.map_or((s, e), |(accs, acce)| (accs.min(s), acce.max(e))))
+                })
+                .unwrap_or((prev_line_end, prev_line_end));
+            prev_line_end = byte_end;
             lines.push(LineInfo {
                 top: run.line_top,
                 height: run.line_height,
                 width: run.line_w,
+                byte_start,
+                byte_end,
             });
             for glyph in run.glyphs {
                 // Logical position per cosmic-text's `LayoutGlyph::physical`: the
@@ -189,7 +223,7 @@ impl TextSystem {
                     x: glyph.x + x_off,
                     y: run.line_y + glyph.y - y_off,
                     size_px: glyph.font_size,
-                    cluster: glyph.start,
+                    cluster: base + glyph.start,
                 });
             }
         }
@@ -200,6 +234,41 @@ impl TextSystem {
             lines,
         }
     }
+}
+
+/// The index of the visual line containing byte offset `byte`: the last line whose range starts at or
+/// before `byte` (the final line for a trailing offset). For cursor line-mapping + vertical motion (#220).
+pub(crate) fn line_of_byte(shaped: &ShapedText, byte: usize) -> usize {
+    shaped
+        .lines
+        .iter()
+        .rposition(|line| line.byte_start <= byte)
+        .unwrap_or(0)
+}
+
+/// The byte offset on visual line `line_index` nearest the line-relative logical x `x` — the per-line
+/// inverse of [`x_at_byte`](crate::ime::x_at_byte), for a vertical-motion goal-column (#220). Compares
+/// each glyph cluster's x against `x` (plus a line-end candidate at the line width), returning the
+/// closest; the result is a glyph cluster boundary (a grapheme boundary) or the line's `byte_end`.
+pub(crate) fn byte_at_x(shaped: &ShapedText, line_index: usize, x: f32) -> usize {
+    let Some(line) = shaped.lines.get(line_index) else {
+        return 0;
+    };
+    // Seed with the line-end candidate, then take any nearer glyph on this line.
+    let mut best_byte = line.byte_end;
+    let mut best_dist = (line.width - x).abs();
+    for glyph in shaped
+        .glyphs
+        .iter()
+        .filter(|g| g.cluster >= line.byte_start && g.cluster <= line.byte_end)
+    {
+        let dist = (glyph.x - x).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_byte = glyph.cluster;
+        }
+    }
+    best_byte
 }
 
 #[cfg(test)]

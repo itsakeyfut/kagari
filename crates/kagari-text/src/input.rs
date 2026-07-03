@@ -1,25 +1,37 @@
 //! First-class text editing core (specs §5.3): the `TextBuffer` owns committed text,
-//! the cursor and selection, command-coalesced undo/redo, the OS clipboard bridge
-//! (arboard), and the embedded IME composition state (#25's `ImeState`).
+//! the cursor and selection, command-coalesced undo/redo, a runtime-agnostic clipboard
+//! hook (pure `copy`/`cut`/`paste` — the app supplies the OS clipboard, §7.2), and the
+//! embedded IME composition state (#25's `ImeState`).
 //!
-//! All offsets are byte offsets kept on `char` boundaries, so the multi-byte text that
-//! moat #5 targets never panics a `String` slice. Vertical (up/down) movement needs the
-//! shaped line layout and is post-MVP; horizontal char/word movement is here.
+//! Cursor/motion/delete snap to **grapheme-cluster boundaries** (combining chars stay
+//! intact; multi-byte text never panics a `String` slice — moat #5). Horizontal char/word
+//! and line/home/end motion is byte-based; vertical (up/down) motion uses the shaped line
+//! layout (#220).
 
 use std::ops::Range;
 
 use kagari_base::Rect;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ime::{ImeEvent, ImeState, x_at_byte};
-use crate::shape::ShapedText;
+use crate::shape::{ShapedText, byte_at_x, line_of_byte};
 
-/// A cursor movement granularity for [`TextBuffer::move_cursor`].
+/// A horizontal cursor movement granularity for [`TextBuffer::move_cursor`]. `Char*` moves by grapheme
+/// cluster; vertical (up/down) motion is [`TextBuffer::move_vertical`] (it needs the shaped line layout).
+///
+/// `#[non_exhaustive]`: motion is a growth area (more granularities are likely), so variants can be added
+/// without a breaking change (matching kagari's other growth-area enums like the core's `CursorIcon`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Movement {
     CharLeft,
     CharRight,
     WordLeft,
     WordRight,
+    /// To the start of the current line (after the previous `\n`, or the buffer start).
+    LineStart,
+    /// To the end of the current line (before the next `\n`, or the buffer end).
+    LineEnd,
 }
 
 /// A forward edit. `undo` inverts it (in reverse within a group); `redo` re-applies it.
@@ -50,6 +62,9 @@ pub struct TextBuffer {
     /// Whether a contiguous typing run is open to coalescing into the last undo group.
     /// Any non-typing edit (move, delete, paste, IME commit, undo/redo) is a barrier.
     coalescing: bool,
+    /// The caret x preserved across consecutive vertical moves (the "goal column", #220): set on the
+    /// first [`move_vertical`](Self::move_vertical), read by later ones, cleared by any other operation.
+    goal_x: Option<f32>,
     ime: ImeState,
 }
 
@@ -104,6 +119,7 @@ impl TextBuffer {
             return;
         }
         self.coalescing = false;
+        self.goal_x = None;
         self.cursor = end;
         self.selection = if start == end { None } else { Some(start..end) };
     }
@@ -125,18 +141,81 @@ impl TextBuffer {
 
     /// Delete the current selection (no-op if collapsed). Its own undo group.
     pub fn delete_selection(&mut self) {
-        let Some(range) = self.selection.take() else {
+        if let Some(range) = self.selection.take() {
+            self.delete_range(range);
+        }
+    }
+
+    /// Delete the grapheme cluster before the cursor (Backspace), or the selection if any. Its own group.
+    pub fn delete_backward(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
             return;
-        };
+        }
+        let start = self.prev_boundary(self.cursor);
+        if start < self.cursor {
+            self.delete_range(start..self.cursor);
+        }
+    }
+
+    /// Delete the grapheme cluster after the cursor (Delete), or the selection if any. Its own group.
+    pub fn delete_forward(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            return;
+        }
+        let end = self.next_boundary(self.cursor);
+        if end > self.cursor {
+            self.delete_range(self.cursor..end);
+        }
+    }
+
+    /// Remove `range` (grapheme/char boundaries), collapse the cursor to its start, as one undo group.
+    fn delete_range(&mut self, range: Range<usize>) {
         let removed = self.text[range.clone()].to_string();
         self.text.replace_range(range.clone(), "");
         self.cursor = range.start;
+        self.selection = None;
         self.coalescing = false;
+        self.goal_x = None;
         self.redo.clear();
         self.undo.push(vec![EditCommand::Delete { range, removed }]);
     }
 
+    /// Select the whole buffer; the cursor moves to the end.
+    pub fn select_all(&mut self) {
+        self.coalescing = false;
+        self.goal_x = None;
+        self.cursor = self.text.len();
+        self.selection = if self.text.is_empty() {
+            None
+        } else {
+            Some(0..self.text.len())
+        };
+    }
+
+    /// The selected text as a borrowed slice, or `None` when the selection is collapsed. Complements
+    /// [`copy`](Self::copy) (which allocates for the clipboard hook).
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection
+            .as_ref()
+            .map(|range| &self.text[range.clone()])
+    }
+
+    /// Replace the whole buffer with `text`: cursor at the end, selection cleared, undo history reset —
+    /// a programmatic set (e.g. a controlled value binding), not an undoable edit.
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.cursor = self.text.len();
+        self.selection = None;
+        self.coalescing = false;
+        self.goal_x = None;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     fn typed_insert(&mut self, s: &str) {
+        self.goal_x = None;
         let at = self.cursor;
         self.text.insert_str(at, s);
         self.cursor = at + s.len();
@@ -171,6 +250,7 @@ impl TextBuffer {
         self.text.insert_str(at, s);
         self.cursor = at + s.len();
         self.coalescing = false;
+        self.goal_x = None;
         self.redo.clear();
         self.undo.push(vec![
             EditCommand::Delete {
@@ -190,18 +270,57 @@ impl TextBuffer {
     /// anchor; otherwise collapse the selection. A movement is an undo-coalescing barrier.
     pub fn move_cursor(&mut self, by: Movement, extend: bool) {
         self.coalescing = false;
-        let anchor = match (&self.selection, extend) {
-            (Some(sel), true) => {
-                if self.cursor == sel.start {
-                    sel.end
-                } else {
-                    sel.start
-                }
-            }
-            _ => self.cursor,
-        };
+        self.goal_x = None;
+        let anchor = self.extend_anchor(extend);
         let target = self.compute_move(self.cursor, by);
         self.cursor = target;
+        self.set_cursor_selection(anchor, target, extend);
+    }
+
+    /// Move the cursor up or down one visual line using the shaped layout (#220), preserving the caret's
+    /// x (the "goal column") across consecutive vertical moves. With `extend`, grow/shrink the selection
+    /// from its anchor; otherwise collapse it. At the first/last line this clamps within the buffer.
+    pub fn move_vertical(&mut self, down: bool, extend: bool, shaped: &ShapedText) {
+        self.coalescing = false;
+        let anchor = self.extend_anchor(extend);
+        // Establish (or reuse) the goal column from the current caret x — the one field a vertical move
+        // does *not* clear, so a run of up/down keeps the column.
+        let goal = match self.goal_x {
+            Some(g) => g,
+            None => {
+                let g = x_at_byte(shaped, self.cursor);
+                self.goal_x = Some(g);
+                g
+            }
+        };
+        let line = line_of_byte(shaped, self.cursor);
+        let target_line = if down {
+            (line + 1).min(shaped.lines.len().saturating_sub(1))
+        } else {
+            line.saturating_sub(1)
+        };
+        let target = if target_line == line {
+            self.cursor // already at the top/bottom edge
+        } else {
+            byte_at_x(shaped, target_line, goal).min(self.text.len())
+        };
+        self.cursor = target;
+        self.set_cursor_selection(anchor, target, extend);
+    }
+
+    /// The selection anchor for an extend move: the fixed (non-cursor) end of the current selection, or
+    /// the cursor when there is none / not extending.
+    fn extend_anchor(&self, extend: bool) -> usize {
+        match (&self.selection, extend) {
+            (Some(sel), true) if self.cursor == sel.start => sel.end,
+            (Some(sel), true) => sel.start,
+            _ => self.cursor,
+        }
+    }
+
+    /// Apply the selection after a cursor move to `target`: a range from `anchor` when extending (and the
+    /// two differ), else collapsed.
+    fn set_cursor_selection(&mut self, anchor: usize, target: usize, extend: bool) {
         self.selection = if extend && anchor != target {
             Some(anchor.min(target)..anchor.max(target))
         } else {
@@ -215,21 +334,38 @@ impl TextBuffer {
             Movement::CharRight => self.next_boundary(i),
             Movement::WordLeft => self.word_left(i),
             Movement::WordRight => self.word_right(i),
+            Movement::LineStart => self.line_start(i),
+            Movement::LineEnd => self.line_end(i),
         }
     }
 
+    /// The byte offset of the previous grapheme-cluster boundary before `i` (or `0` if at the start).
+    /// Grapheme-aware so a combining sequence (e.g. `e` + U+0301) moves/deletes as one cluster.
     fn prev_boundary(&self, i: usize) -> usize {
         self.text[..i]
-            .chars()
+            .graphemes(true)
             .next_back()
-            .map_or(0, |c| i - c.len_utf8())
+            .map_or(0, |g| i - g.len())
     }
 
+    /// The byte offset of the next grapheme-cluster boundary after `i` (or `i` if at the end).
     fn next_boundary(&self, i: usize) -> usize {
         self.text[i..]
-            .chars()
+            .graphemes(true)
             .next()
-            .map_or(i, |c| i + c.len_utf8())
+            .map_or(i, |g| i + g.len())
+    }
+
+    /// The start of the line containing `i`: just after the previous `\n`, or the buffer start.
+    fn line_start(&self, i: usize) -> usize {
+        self.text[..i].rfind('\n').map_or(0, |nl| nl + 1)
+    }
+
+    /// The end of the line containing `i`: just before the next `\n`, or the buffer end.
+    fn line_end(&self, i: usize) -> usize {
+        self.text[i..]
+            .find('\n')
+            .map_or(self.text.len(), |off| i + off)
     }
 
     /// Previous word start: skip whitespace left, then the word run. Simple MVP rule
@@ -292,27 +428,6 @@ impl TextBuffer {
         self.coalescing = false;
     }
 
-    /// Copy the selection to the OS clipboard (arboard). A missing/unavailable
-    /// clipboard is logged and ignored — never panics (headless CI has no clipboard).
-    pub fn clipboard_copy(&self) {
-        let Some(text) = self.copy() else {
-            return;
-        };
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
-            Ok(()) => {}
-            Err(error) => tracing::warn!(%error, "clipboard copy failed"),
-        }
-    }
-
-    /// Paste the OS clipboard text (arboard) at the cursor. Unavailable clipboard or a
-    /// read error is logged and ignored.
-    pub fn clipboard_paste(&mut self) {
-        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
-            Ok(text) => self.paste(&text),
-            Err(error) => tracing::warn!(%error, "clipboard paste failed"),
-        }
-    }
-
     // --- IME ---------------------------------------------------------------------
 
     /// Apply an IME event: `Preedit` updates the embedded composition state (rendered
@@ -336,6 +451,7 @@ impl TextBuffer {
     /// Revert the most recent edit group.
     pub fn undo(&mut self) {
         self.coalescing = false;
+        self.goal_x = None;
         let Some(group) = self.undo.pop() else {
             return;
         };
@@ -358,6 +474,7 @@ impl TextBuffer {
     /// Re-apply the most recently undone edit group.
     pub fn redo(&mut self) {
         self.coalescing = false;
+        self.goal_x = None;
         let Some(group) = self.redo.pop() else {
             return;
         };
@@ -560,13 +677,132 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_copy_should_not_panic_without_clipboard() {
-        // The OS round-trip can't be tested deterministically (headless CI has no
-        // clipboard; clipboard_paste depends on global state), but the graceful path
-        // must never panic and must not mutate the buffer.
-        let mut buffer = TextBuffer::with_text("abc");
-        buffer.set_selection(0..3);
-        buffer.clipboard_copy();
-        assert_eq!(buffer.text(), "abc");
+    fn move_cursor_char_should_step_over_grapheme() {
+        // "é" = 'e' + U+0301 (combining acute) is one grapheme (two chars, three bytes); CharRight
+        // steps over the whole cluster, not a single char.
+        let mut buffer = TextBuffer::with_text("e\u{0301}x"); // "éx"
+        buffer.set_selection(0..0);
+        buffer.move_cursor(Movement::CharRight, false);
+        assert_eq!(
+            buffer.cursor(),
+            3,
+            "CharRight steps over the whole é grapheme (3 bytes)"
+        );
+        buffer.move_cursor(Movement::CharRight, false);
+        assert_eq!(buffer.cursor(), 4, "then over 'x'");
+    }
+
+    #[test]
+    fn delete_backward_should_remove_prev_grapheme() {
+        // Grapheme-aware backspace removes the whole é cluster; a char-based delete would strip only the
+        // accent, leaving "ae".
+        let mut buffer = TextBuffer::with_text("ae\u{0301}"); // "aé", cursor at 4
+        buffer.delete_backward();
+        assert_eq!(buffer.text(), "a", "backspace removes the whole é grapheme");
+        assert_eq!(buffer.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_should_remove_next_grapheme() {
+        let mut buffer = TextBuffer::with_text("e\u{0301}a"); // "éa"
+        buffer.set_selection(0..0); // cursor at 0
+        buffer.delete_forward();
+        assert_eq!(
+            buffer.text(),
+            "a",
+            "delete removes the whole é grapheme forward"
+        );
+        assert_eq!(buffer.cursor(), 0);
+    }
+
+    #[test]
+    fn delete_backward_should_remove_selection_when_present() {
+        let mut buffer = TextBuffer::with_text("hello");
+        buffer.set_selection(1..4); // "ell"
+        buffer.delete_backward();
+        assert_eq!(
+            buffer.text(),
+            "ho",
+            "a selection is deleted whole, not a single grapheme"
+        );
+        assert_eq!(buffer.cursor(), 1);
+    }
+
+    #[test]
+    fn select_all_should_span_buffer() {
+        let mut buffer = TextBuffer::with_text("hello");
+        buffer.select_all();
+        assert_eq!(buffer.selection(), Some(0..5));
+        assert_eq!(buffer.cursor(), 5);
+        assert_eq!(buffer.selected_text(), Some("hello"));
+    }
+
+    #[test]
+    fn selected_text_should_borrow_selection() {
+        let mut buffer = TextBuffer::with_text("hello");
+        assert_eq!(buffer.selected_text(), None, "no selection borrows nothing");
+        buffer.set_selection(1..4);
+        assert_eq!(buffer.selected_text(), Some("ell"));
+    }
+
+    #[test]
+    fn set_text_should_reset_state() {
+        let mut buffer = TextBuffer::with_text("old");
+        buffer.insert("x"); // establishes undo history
+        buffer.set_selection(0..2);
+        buffer.set_text("new");
+        assert_eq!(buffer.text(), "new");
+        assert_eq!(buffer.cursor(), 3, "cursor at the end of the new text");
+        assert_eq!(buffer.selection(), None);
+        buffer.undo();
+        assert_eq!(buffer.text(), "new", "set_text clears the undo history");
+    }
+
+    #[test]
+    fn move_cursor_line_should_go_home_and_end() {
+        // "ab\ncd": bytes a0 b1 \n2 c3 d4; cursor starts at 5 (end, on line 2).
+        let mut buffer = TextBuffer::with_text("ab\ncd");
+        buffer.move_cursor(Movement::LineStart, false);
+        assert_eq!(buffer.cursor(), 3, "home → start of line 2 (after the \\n)");
+        buffer.move_cursor(Movement::LineEnd, false);
+        assert_eq!(
+            buffer.cursor(),
+            5,
+            "end → buffer end (line 2 has no trailing \\n)"
+        );
+        buffer.set_selection(0..0); // line 1
+        buffer.move_cursor(Movement::LineEnd, false);
+        assert_eq!(buffer.cursor(), 2, "end of line 1 is just before the \\n");
+    }
+
+    #[test]
+    fn move_vertical_should_change_line_and_clamp() {
+        // Two visual lines ("hello" / "world"); vertical motion moves between them via the goal column
+        // and clamps at the last line. shape() is GPU-free.
+        let mut system = TextSystem::new(FontDb::new());
+        let style = TextStyle {
+            family: "Noto Sans".into(),
+            size: Px(16.0),
+            weight: fontdb::Weight::NORMAL,
+            line_height: None,
+        };
+        let shaped = system.shape("hello\nworld", &style, None);
+        let mut buffer = TextBuffer::with_text("hello\nworld");
+
+        buffer.set_selection(2..2); // "he|llo" on line 1 (bytes 0..5)
+        buffer.move_vertical(true, false, &shaped);
+        let on_line2 = buffer.cursor();
+        assert!(
+            (6..=11).contains(&on_line2),
+            "down lands on line 2 (bytes 6..11), got {on_line2}"
+        );
+        buffer.move_vertical(true, false, &shaped); // already the last line → no-op
+        assert_eq!(
+            buffer.cursor(),
+            on_line2,
+            "vertical past the last line is a no-op"
+        );
+        buffer.move_vertical(false, false, &shaped);
+        assert!(buffer.cursor() <= 5, "up returns onto line 1 (bytes 0..5)");
     }
 }
