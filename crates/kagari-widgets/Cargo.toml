@@ -10,5 +10,12 @@ kagari-base = { workspace = true }
 kagari-core = { workspace = true }
 kagari-style = { workspace = true }
 
+[dev-dependencies]
+# Downward-only (widgets → core → {layout, render, text}); test-harness only: build/paint an element
+# tree (render_tree) and assert scene/behavior. Not part of the public dependency surface.
+kagari-layout = { workspace = true }
+kagari-render = { workspace = true }
+kagari-text = { workspace = true }
+
 [lints]
 workspace = true
