@@ -10,6 +10,7 @@
 mod cx;
 mod div;
 mod dynamic;
+mod icon;
 mod overlay;
 mod scroll;
 mod text;
@@ -19,6 +20,7 @@ mod virtualized;
 pub use cx::{DamageSink, Event, EventCx, LayoutCx, PaintCx};
 pub use div::{Div, div};
 pub use dynamic::{DynIf, DynList, dyn_if, dyn_list};
+pub use icon::{Icon, icon};
 pub use overlay::{AnchorHandle, Overlay, Placement, overlay};
 pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};

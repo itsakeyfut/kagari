@@ -42,6 +42,7 @@ struct TransformFrame {
     images: usize,
     glyphs: usize,
     underlines: usize,
+    icons: usize,
     hits: usize,
 }
 
@@ -164,6 +165,7 @@ impl<'a> PaintCx<'a> {
             images: self.scene.images.len(),
             glyphs: self.scene.glyphs.len(),
             underlines: self.scene.underlines.len(),
+            icons: self.scene.icons.len(),
             hits: self.hit_test.as_deref().map_or(0, HitTest::len),
         });
     }
@@ -192,6 +194,11 @@ impl<'a> PaintCx<'a> {
         }
         for u in &mut self.scene.underlines[f.underlines..] {
             u.apply_transform(&f.t);
+        }
+        // Deferred icon requests (#246): map bounds + mask; the renderer resolves each from the *mapped*
+        // bounds, so a zoomed icon re-rasterizes crisply (no fixed-tile blur).
+        for ic in &mut self.scene.icons[f.icons..] {
+            ic.apply_transform(&f.t);
         }
         if let Some(ht) = self.hit_test.as_deref_mut() {
             ht.transform_from(f.hits, &f.t);

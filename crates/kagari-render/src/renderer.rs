@@ -10,7 +10,7 @@ use crate::error::RenderError;
 use crate::path::PathRenderer;
 use crate::polychrome::PolychromeRenderer;
 use crate::quad::QuadRenderer;
-use crate::scene::{Batch, PrimitiveKind, Scene};
+use crate::scene::{Batch, IconSprite, PolychromeSprite, PrimitiveKind, Scene};
 use crate::shadow::ShadowRenderer;
 use crate::sprite::SpriteRenderer;
 use crate::svg::{IconId, icon_key, rasterize_icon};
@@ -161,30 +161,21 @@ impl Renderer {
     /// crisply. The icon is monochrome white — tint it via the `PolychromeSprite::tint`. A rasterization
     /// failure (not expected for a bundled icon) degrades to a transparent tile, never panics.
     pub fn icon_coord(&mut self, icon: IconId, px: u32) -> AtlasCoord {
-        let key = icon_key(icon, px);
-        let coord = self.rgba_atlas.get_or_insert(key, (px, px), || {
-            rasterize_icon(icon, px)
-                .map(|d| d.rgba)
-                .unwrap_or_else(|error| {
-                    tracing::warn!(
-                        ?error,
-                        ?icon,
-                        px,
-                        "icon rasterization failed; using transparent tile"
-                    );
-                    vec![0u8; (px as usize) * (px as usize) * 4]
-                })
-        });
-        // An icon larger than the atlas layer is skipped (degenerate coord) → it would draw nothing.
-        // Icons are small so this is out of normal range, but surface it rather than fail silently (RK-017).
-        if coord.max == [0.0, 0.0] {
-            tracing::warn!(
-                ?icon,
-                px,
-                "icon px exceeds the atlas layer; the icon will be blank"
-            );
+        icon_coord(&mut self.rgba_atlas, icon, px)
+    }
+
+    /// Resolves each deferred [`IconSprite`](crate::IconSprite) in `scene.icons` (#246) into a tinted
+    /// [`PolychromeSprite`] appended to `scene.images`, rasterizing at the **physical** size
+    /// (`bounds` height × `scale`) so the icon is crisp. Runs before batching; `scene.icons` is cleared
+    /// after (capacity retained). A no-op when no icons were emitted.
+    fn resolve_icons(&mut self, scene: &mut Scene, scale: f32) {
+        for i in 0..scene.icons.len() {
+            let req = scene.icons[i]; // `IconSprite: Copy` — the read releases the `scene.icons` borrow.
+            let px = icon_px(req.bounds.size.h, scale);
+            let tex = icon_coord(&mut self.rgba_atlas, req.icon, px);
+            scene.images.push(resolve_icon(req, tex));
         }
-        coord
+        scene.icons.clear();
     }
 
     /// Render one frame: draw the scene's quads into the offscreen linear target,
@@ -206,6 +197,10 @@ impl Renderer {
         // Drain any image decodes that finished since the last frame into the RGBA atlas (#56), so a
         // freshly-loaded image is uploaded before this frame samples it. Disjoint field borrow.
         self.assets.drain(&mut self.rgba_atlas);
+
+        // Resolve deferred icon requests (#246) into tinted image sprites, rasterizing at the physical
+        // size from `scale`, before batching so they interleave by painter's order like any image.
+        self.resolve_icons(scene, scale);
 
         // Sort + merge all primitive kinds into one painter's-order batch list (into
         // the reused buffer), then pack each kind's instances (in that order) so the
@@ -319,5 +314,119 @@ impl Renderer {
         self.rgba_atlas_bind = self
             .polychrome
             .make_atlas_bind(&self.device, self.rgba_atlas.texture_view());
+    }
+}
+
+/// Upper bound on an icon's rasterization size, in physical px (RK-028). Icons larger than the atlas
+/// layer are blank regardless (RK-017), so this only guards against a huge layout-driven size reaching a
+/// fallback allocation that would overflow `usize` / OOM — it clamps no real icon.
+const MAX_ICON_PX: u32 = 4096;
+
+/// The atlas coord for a bundled icon (#57) rasterized at `px` (logical size × scale factor) into
+/// `atlas` (the shared RGBA atlas). Glyph-style: rasterized synchronously on a cache miss and cached by
+/// `(icon, px)`, so the icon is available the frame it is requested; a different `px` re-rasterizes
+/// crisply. The icon is monochrome white — tint it via [`PolychromeSprite::tint`]. A rasterization
+/// failure (not expected for a bundled icon) degrades to a transparent tile, never panics.
+fn icon_coord(atlas: &mut Atlas, icon: IconId, px: u32) -> AtlasCoord {
+    let key = icon_key(icon, px);
+    let coord = atlas.get_or_insert(key, (px, px), || {
+        rasterize_icon(icon, px)
+            .map(|d| d.rgba)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    ?error,
+                    ?icon,
+                    px,
+                    "icon rasterization failed; using transparent tile"
+                );
+                // Checked sizing (RK-028): `px*px*4` would overflow `usize` for a pathologically large px.
+                let n = (px as usize).saturating_mul(px as usize).saturating_mul(4);
+                vec![0u8; n]
+            })
+    });
+    // An icon larger than the atlas layer is skipped (degenerate coord) → it would draw nothing. Icons
+    // are small so this is out of normal range, but surface it rather than fail silently (RK-017).
+    if coord.max == [0.0, 0.0] {
+        tracing::warn!(
+            ?icon,
+            px,
+            "icon px exceeds the atlas layer; the icon will be blank"
+        );
+    }
+    coord
+}
+
+/// The physical rasterization size for an icon of logical height `bounds_h` at the frame `scale` (#246).
+/// Floors to 1 (`NaN`/negative/zero → 1, avoiding a 0×0 raster) and clamps to [`MAX_ICON_PX`] (RK-028,
+/// so a huge layout-driven size can't reach an overflowing allocation).
+fn icon_px(bounds_h: f32, scale: f32) -> u32 {
+    ((bounds_h * scale).round().max(1.0) as u32).min(MAX_ICON_PX)
+}
+
+/// Resolves a deferred [`IconSprite`] into a tinted [`PolychromeSprite`] given its atlas `tex` (#246),
+/// carrying bounds / tint / content_mask / painter's `order` verbatim.
+fn resolve_icon(req: IconSprite, tex: AtlasCoord) -> PolychromeSprite {
+    PolychromeSprite {
+        bounds: req.bounds,
+        tex,
+        tint: req.tint,
+        content_mask: req.content_mask,
+        order: req.order,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::RoundedRect;
+    use kagari_base::{Color, Corners, Rect};
+
+    #[test]
+    fn icon_px_should_scale_and_clamp() {
+        assert_eq!(icon_px(16.0, 1.0), 16);
+        assert_eq!(
+            icon_px(16.0, 2.0),
+            32,
+            "px scales with the frame scale (crisp on HiDPI)"
+        );
+        assert_eq!(
+            icon_px(0.0, 1.0),
+            1,
+            "a zero size floors to 1 (avoids a 0x0 raster)"
+        );
+        assert_eq!(icon_px(f32::NAN, 1.0), 1, "NaN floors to 1");
+        assert_eq!(
+            icon_px(1.0e30, 4.0),
+            MAX_ICON_PX,
+            "a pathologically huge size clamps to MAX_ICON_PX (RK-028)"
+        );
+    }
+
+    #[test]
+    fn resolve_icon_should_carry_fields_and_tint() {
+        let tint = Color::new(0.2, 0.4, 0.6, 1.0);
+        let bounds = Rect::from_xywh(3.0, 5.0, 20.0, 20.0);
+        let content_mask = RoundedRect {
+            rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
+            radii: Corners::default(),
+        };
+        let req = IconSprite {
+            bounds,
+            icon: IconId::Check,
+            tint,
+            content_mask,
+            order: 7,
+        };
+        let tex = AtlasCoord {
+            page: 1,
+            min: [0.1, 0.2],
+            max: [0.3, 0.4],
+        };
+        let s = resolve_icon(req, tex);
+        assert_eq!(s.bounds, bounds);
+        assert_eq!(s.tint, tint);
+        assert_eq!(s.tex, tex);
+        assert_eq!(s.order, 7);
+        assert_eq!(s.content_mask, content_mask);
     }
 }

@@ -12,6 +12,7 @@ use bytemuck::{Pod, Zeroable};
 use kagari_base::{Color, Corners, Edges, Point, Rect, Transform};
 
 use crate::atlas::AtlasCoord;
+use crate::svg::IconId;
 
 /// A rounded rectangle, used as a content-mask clip region.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -98,6 +99,22 @@ pub struct PolychromeSprite {
     pub tint: Color,
     pub content_mask: RoundedRect,
     /// Painter's-order key (CPU-side only — not uploaded to the GPU).
+    pub order: u32,
+}
+
+/// A deferred icon request (#246): a bundled [`IconId`] to be rasterized **at render time** into the
+/// RGBA atlas at the resolved physical size (`bounds` × the frame `scale`) and drawn as a tinted
+/// [`PolychromeSprite`]. `bounds` is the logical destination (square); `tint` multiplies the
+/// monochrome-white icon (`Color::WHITE` = as-is). Kept as an unresolved request — not a resolved
+/// sprite — so the element paint path needs neither the atlas nor the scale factor (the renderer owns
+/// both), and a zoomed icon re-rasterizes crisply from its mapped bounds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct IconSprite {
+    pub bounds: Rect,
+    pub icon: IconId,
+    pub tint: Color,
+    pub content_mask: RoundedRect,
+    /// Painter's-order key (CPU-side only), carried onto the resolved [`PolychromeSprite`].
     pub order: u32,
 }
 
@@ -231,6 +248,16 @@ impl PolychromeSprite {
     }
 }
 
+impl IconSprite {
+    /// Maps this icon request under a paint transform (#221): bounds + content mask by `t`. The physical
+    /// raster size is resolved from the *mapped* bounds at render, so a zoomed icon re-rasterizes crisply
+    /// (unlike a glyph, whose atlas tile is fixed).
+    pub fn apply_transform(&mut self, t: &Transform) {
+        self.bounds = t.map_rect(self.bounds);
+        self.content_mask = map_mask(self.content_mask, t);
+    }
+}
+
 impl Underline {
     /// Maps this underline band under a paint transform (#221): rect + content mask by `t`, thickness by
     /// `scale`.
@@ -294,6 +321,9 @@ pub struct Scene {
     pub images: Vec<PolychromeSprite>,
     pub glyphs: Vec<MonochromeSprite>,
     pub underlines: Vec<Underline>,
+    /// Deferred icon requests (#246), resolved into `images` by the renderer at frame start (rasterized
+    /// at the physical size from the frame scale). Not a batch kind — empty after resolution.
+    pub icons: Vec<IconSprite>,
 }
 
 impl Scene {
@@ -309,6 +339,7 @@ impl Scene {
         self.images.clear();
         self.glyphs.clear();
         self.underlines.clear();
+        self.icons.clear();
     }
 
     /// Sort each primitive vector into painter's order, then **merge** them into one
