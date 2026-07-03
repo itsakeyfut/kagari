@@ -4,10 +4,11 @@
 //!
 //! Run with: `cargo run -p kagari-widgets --example gallery`
 //!
-//! Note: interactive state *visuals* (focus-ring outline, toggle-pressed color) are not rendered yet
-//! (relocated to #245), so the disabled/variant backgrounds + labels are what's visually confirmable
-//! here today; clicking a button does fire its `on_click` (printed to stdout).
+//! Interactive state visuals are wired (#245): focus a button (Tab, once focus navigation is on) to
+//! see the focus-ring border, and click the toggle button to see its pressed (Accent) color. Clicking
+//! any button also fires its `on_click` (printed to stdout).
 
+use kagari_core::reactive::RwSignal;
 use kagari_core::{App, WindowOptions, div};
 use kagari_style::{ColorRole, Styled};
 use kagari_widgets::{ControlSize, button};
@@ -42,12 +43,16 @@ fn main() -> Result<(), kagari_core::AppError> {
                         .child(button("Large").size(ControlSize::Lg)),
                 )
                 // Interactive: the click fires the callback (mouse or Space/Enter while focused).
-                // Wrapped in a row so the button sizes to its content (a lone flex-column child would
+                // Wrapped in a row so each button sizes to its content (a lone flex-column child would
                 // otherwise stretch to the full window width via the flex `align-items: stretch` default).
                 .child(
                     div()
                         .flex()
-                        .child(button("Click me").on_click(|| println!("clicked!"))),
+                        .gap_2()
+                        .child(button("Click me").on_click(|| println!("clicked!")))
+                        // A toggle button: its background follows the bound signal (pressed = Accent,
+                        // unpressed = Surface) — #245's reactive role styling.
+                        .child(button("Bold").toggle(RwSignal::new(false))),
                 )
         },
     )?;

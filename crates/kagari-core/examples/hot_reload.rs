@@ -7,7 +7,7 @@
 //! Then edit the `Surface` color in the RON file and save — the window's background follows it.
 
 use kagari_core::{App, WindowOptions, div, text};
-use kagari_style::{ColorRole, Styled};
+use kagari_style::ColorRole;
 
 fn main() -> Result<(), kagari_core::AppError> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

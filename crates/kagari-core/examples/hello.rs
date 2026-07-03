@@ -6,7 +6,7 @@
 //! paint → render. The window's root element is the app's built-in demo tree.
 
 use kagari_core::{App, WindowOptions, div, text};
-use kagari_style::{ColorRole, Styled};
+use kagari_style::ColorRole;
 
 fn main() -> Result<(), kagari_core::AppError> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

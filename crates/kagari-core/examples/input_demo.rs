@@ -8,7 +8,7 @@
 //! wheel (→ pan), and ctrl+scroll (→ zoom). Each is logged. `RUST_LOG=kagari_core=info` is the default.
 
 use kagari_core::{App, CursorIcon, GestureEvent, MouseEvent, MouseKind, WindowOptions, div, text};
-use kagari_style::{ColorRole, Styled};
+use kagari_style::ColorRole;
 
 fn main() -> Result<(), kagari_core::AppError> {
     // Enable this example's own logs too: the on_mouse_down/on_wheel/on_gesture `tracing::info!`s are

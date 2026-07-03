@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Px, Rect, SharedString, Size};
 use kagari_layout::{AlignItems, FlexDirection, JustifyContent, LayoutStyle};
 use kagari_render::{Background, Border, Quad, RoundedRect, Shadow};
-use kagari_style::{SpacingStep, Style, Styled, Theme};
+use kagari_style::{ColorRole, SpacingStep, Style, Styled, Theme};
 
 use crate::a11y::{A11y, Role};
 
@@ -41,6 +41,17 @@ pub struct Div {
     /// Resolved background: written by the bound reactive effect (or once, for a static prop),
     /// read by `paint`. Shared + `'static` so the effect can own a handle to it.
     resolved_bg: Arc<Mutex<Option<Background>>>,
+    /// Semantic background **role** (static or reactive, #245) — the theme-reactive counterpart of
+    /// `bg`: the effect resolves the *role* (not the color) and flags paint-dirty; `paint` resolves
+    /// role → color via `cx.theme`, so it follows both a signal (state) and a theme swap. Takes
+    /// precedence over the raw `bg` when set. Bound by [`Styled::bg`]-style `.bg(role)` / `.bg(rx(..))`.
+    bg_role: Option<Prop<ColorRole>>,
+    resolved_bg_role: Arc<Mutex<Option<ColorRole>>>,
+    /// Semantic border-color **role**, *optional* so it can vanish (e.g. a focus ring shown only while
+    /// focused): the resolved value is `Option<ColorRole>` — `None` = no border this frame. Paired with
+    /// the static `border_width` token; resolved to a color at paint via `cx.theme`. Paint-dirty (#245).
+    border_role: Option<Prop<Option<ColorRole>>>,
+    resolved_border_role: Arc<Mutex<Option<Option<ColorRole>>>>,
     /// Raw/reactive fixed size (#146). A reactive size's bind effect flags **layout-dirty** (vs `bg`'s
     /// paint-dirty), so a signal-driven size change triggers relayout.
     size: Option<Prop<Size>>,
@@ -96,6 +107,10 @@ pub fn div() -> Div {
         id: None,
         child_ids: Vec::new(),
         resolved_bg: Arc::new(Mutex::new(None)),
+        bg_role: None,
+        resolved_bg_role: Arc::new(Mutex::new(None)),
+        border_role: None,
+        resolved_border_role: Arc::new(Mutex::new(None)),
         size: None,
         resolved_size: Arc::new(Mutex::new(None)),
         applied_layout: None,
@@ -144,6 +159,26 @@ impl Div {
     /// **Damage kind: paint-dirty** (appearance only, no relayout — contrast [`size`](Self::size)).
     pub fn background(mut self, bg: impl Into<Prop<Background>>) -> Self {
         self.bg = Some(bg.into());
+        self
+    }
+
+    /// Sets the semantic background **role** — a static token or a reactive [`Prop`] (#245). Shadows
+    /// the static [`Styled::bg`] with a reactive-capable form: `.bg(ColorRole::Accent)` resolves once,
+    /// `.bg(rx(move || if h.is_focused() { .. } else { .. }))` re-resolves on the signal. The role
+    /// (not a raw color) is stored, so a theme swap still re-resolves it at paint. **Damage: paint-dirty.**
+    pub fn bg(mut self, role: impl Into<Prop<ColorRole>>) -> Self {
+        self.bg_role = Some(role.into());
+        self
+    }
+
+    /// Sets an *optional* semantic border-color **role** — a static token or a reactive [`Prop`] (#245),
+    /// where `None` means no border this frame (e.g. a focus ring shown only while focused:
+    /// `.border_color(rx(move || h.is_focused().then_some(ColorRole::FocusRing)))`). Pair with a
+    /// `border_w_*` width token. The border is drawn inset (reusing the quad's per-edge border), so it
+    /// costs no layout and shifts no content. Takes **precedence** over the always-on
+    /// [`Styled::border`](kagari_style::Styled::border) when both are set. **Damage: paint-dirty.**
+    pub fn border_color(mut self, role: impl Into<Prop<Option<ColorRole>>>) -> Self {
+        self.border_role = Some(role.into());
         self
     }
 
@@ -423,6 +458,75 @@ impl Div {
         self.resolved_bg.lock().ok().and_then(|slot| *slot)
     }
 
+    /// Resolves the background-**role** prop into `resolved_bg_role` (#245) — the theme-reactive
+    /// counterpart of [`bind_background`](Self::bind_background). A static prop writes the role once;
+    /// a reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure and,
+    /// only when the *role* changed (design.md §9), writes the cell and flags **paint**-dirty. The
+    /// role → color resolution happens later, in `paint` against `cx.theme`, so both a state signal
+    /// and a theme swap are reflected.
+    fn bind_bg_role(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.bg_role.take() {
+            Some(Prop::Static(role)) => {
+                if let Ok(mut slot) = self.resolved_bg_role.lock() {
+                    *slot = Some(role);
+                }
+            }
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_bg_role);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let role = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != Some(role) {
+                            *slot = Some(role);
+                            damage.mark_paint_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn current_bg_role(&self) -> Option<ColorRole> {
+        self.resolved_bg_role.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Resolves the *optional* border-color-**role** prop into `resolved_border_role` (#245). Same
+    /// paint-dirty effect discipline as [`bind_bg_role`](Self::bind_bg_role); the resolved value is an
+    /// `Option<ColorRole>` (`None` = no border this frame), stored behind an outer `Option` (`None` =
+    /// never resolved). `paint` flattens it via [`current_border_role`](Self::current_border_role).
+    fn bind_border_role(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.border_role.take() {
+            Some(Prop::Static(role)) => {
+                if let Ok(mut slot) = self.resolved_border_role.lock() {
+                    *slot = Some(role);
+                }
+            }
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_border_role);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let role = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != Some(role) {
+                            *slot = Some(role);
+                            damage.mark_paint_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn current_border_role(&self) -> Option<ColorRole> {
+        self.resolved_border_role
+            .lock()
+            .ok()
+            .and_then(|slot| slot.flatten())
+    }
+
     /// Resolves the size prop into `resolved_size` (#146), the **layout-dirty** counterpart of
     /// [`bind_background`](Self::bind_background). A static prop writes the cell once; a reactive prop
     /// registers a synchronous effect (ADR 0001) that re-resolves the closure and — only when the
@@ -520,6 +624,8 @@ impl Element for Div {
                 self.id = Some(id);
                 cx.layout.insert(id, None);
                 self.bind_background(&cx.damage, id);
+                self.bind_bg_role(&cx.damage, id);
+                self.bind_border_role(&cx.damage, id);
                 self.bind_size(&cx.damage, id);
                 // Record this focus target's FocusId → NodeId so keyboard dispatch / focus-within
                 // can resolve the focused node (#49). No-op when no registry is attached (the app
@@ -617,16 +723,34 @@ impl Element for Div {
             });
         }
 
-        // Background: the semantic token (`bg(role)` → resolved theme color) takes precedence; the
-        // raw/reactive `.background()` value is the fallback. border emit is deferred (the theme has
-        // no border-width resolution yet — a follow-up).
+        // Background: the semantic **role** (`bg(role)`/`bg(rx(..))` → resolved theme color at paint,
+        // so it follows a state signal *and* a theme swap) takes precedence; the raw/reactive
+        // `.background()` value is the fallback. `.or(self.style.paint.bg)` is a compatibility path for a
+        // generic `impl Styled` caller of `Styled::bg` (which writes `paint.bg`) — the inherent
+        // `Div::bg` shadows it and writes `bg_role`, so direct Div callers never hit `paint.bg`.
         let bg = self
-            .style
-            .paint
-            .bg
+            .current_bg_role()
+            .or(self.style.paint.bg)
             .map(|role| Background::Solid(cx.theme.resolve_color(role)))
             .or_else(|| self.current_bg());
-        if let Some(bg) = bg {
+        // Border (#245): the optional border-color role (reactive/static; `None` = no border this
+        // frame) resolved to a color, plus the `border_w_*` width token. The border is drawn inset,
+        // reusing the quad's per-edge border — so its width is applied only when a color is present
+        // (an unfocused focus ring adds no inset), and it costs no layout / shifts no content.
+        let border_color = self
+            .current_border_role()
+            .or(self.style.paint.border_color)
+            .map(|role| cx.theme.resolve_color(role));
+        let border_width = self
+            .style
+            .paint
+            .border_width
+            .map(|step| cx.theme.resolve_border_width(step).0)
+            .unwrap_or(0.0);
+        let has_border = border_width > 0.0 && border_color.is_some();
+        // Emit a quad when there is a fill *or* a visible border; a border-only element paints over a
+        // transparent fill (the shader draws the border band, leaving the interior transparent).
+        if bg.is_some() || has_border {
             // Clip the fill to any scroll ancestor (identity when unclipped). A quad the clip fully
             // culls (empty intersection) is skipped rather than emitted with a zero-area mask —
             // but only when a clip is active, so an unclipped zero-size div still emits as before.
@@ -636,10 +760,19 @@ impl Element for Div {
                 cx.scene.quads.push(Quad {
                     bounds,
                     corner_radii,
-                    bg,
+                    bg: bg.unwrap_or(Background::Solid(Color::TRANSPARENT)),
                     border: Border {
-                        widths: Edges::default(),
-                        color: Color::TRANSPARENT,
+                        widths: if has_border {
+                            Edges {
+                                top: border_width,
+                                right: border_width,
+                                bottom: border_width,
+                                left: border_width,
+                            }
+                        } else {
+                            Edges::default()
+                        },
+                        color: border_color.unwrap_or(Color::TRANSPARENT),
                     },
                     content_mask: RoundedRect {
                         rect: mask,
@@ -868,7 +1001,7 @@ mod tests {
     use crate::reactive::rx;
     use kagari_layout::LayoutTree;
     use kagari_render::Scene;
-    use kagari_style::ColorRole;
+    use kagari_style::{BorderWidthStep, ColorRole};
     use kagari_text::{FontDb, TextSystem};
     use reactive_graph::owner::Owner;
     use reactive_graph::prelude::*;
@@ -1434,5 +1567,228 @@ mod tests {
             CursorIcon::Default,
             "outside the cursor region the cursor reverts to default"
         );
+    }
+
+    #[test]
+    fn div_should_emit_border_from_role_and_width_token() {
+        // A `.border(role).border_w_2()` resolves the width token + color role at paint into the quad's
+        // per-edge border (#245): the shader draws the inset border band from these.
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let theme = Theme::light();
+        let bw = theme.resolve_border_width(BorderWidthStep::B2).0;
+        assert!(bw > 0.0, "the light theme defines a non-zero B2 width");
+
+        let mut d = div()
+            .bg(ColorRole::Surface)
+            .border(ColorRole::Border)
+            .border_w_2();
+        d.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+
+        let mut scene = Scene::new();
+        d.paint(
+            Rect::default(),
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, None, &theme),
+        );
+
+        assert_eq!(scene.quads.len(), 1);
+        let q = &scene.quads[0];
+        assert_eq!(q.border.widths.top, bw);
+        assert_eq!(q.border.widths.left, bw);
+        assert_eq!(q.border.color, theme.resolve_color(ColorRole::Border));
+    }
+
+    #[test]
+    fn div_border_only_should_emit_quad() {
+        // A border with no background still emits a quad — the interior is transparent, the shader
+        // draws only the border band (#245).
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let theme = Theme::light();
+
+        let mut d = div().border(ColorRole::Border).border_w_2();
+        d.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+
+        let mut scene = Scene::new();
+        d.paint(
+            Rect::default(),
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, None, &theme),
+        );
+
+        assert_eq!(scene.quads.len(), 1, "a border-only div still emits a quad");
+        assert_eq!(scene.quads[0].bg, Background::Solid(Color::TRANSPARENT));
+        assert_eq!(
+            scene.quads[0].border.color,
+            theme.resolve_color(ColorRole::Border)
+        );
+    }
+
+    #[test]
+    fn div_reactive_bg_role_should_repaint_on_signal() {
+        // A reactive `.bg(rx(..))` re-resolves the *role* on a signal write, flags paint-dirty, and the
+        // next paint resolves the new role → color via the theme (#245). Synchronous effect (RK-003/005);
+        // keep `owner` alive; the write is between frames (RK-009).
+        let owner = Owner::new();
+        owner.set();
+
+        let (read, write) = signal(false);
+        let mut root = div()
+            .bg(rx(move || {
+                if read.get() {
+                    ColorRole::Accent
+                } else {
+                    ColorRole::Surface
+                }
+            }))
+            .size(Size { w: 10.0, h: 10.0 })
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage = Arc::new(DamageState::default());
+        let viewport = Size { w: 50.0, h: 50.0 };
+        let render = |root: &mut AnyElement,
+                      arena: &mut Arena,
+                      layout: &mut LayoutTree,
+                      text: &mut TextSystem,
+                      damage: &Arc<DamageState>,
+                      theme: &Theme|
+         -> Scene {
+            let mut scene = Scene::new();
+            render_tree(
+                root, arena, layout, text, None, None, None, None, None, None, &mut scene,
+                viewport, damage, theme,
+            )
+            .unwrap();
+            scene
+        };
+
+        let scene = render(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            &damage,
+            &theme,
+        );
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(theme.resolve_color(ColorRole::Surface)),
+            "frame 1 (signal=false) paints the Surface role"
+        );
+
+        write.set(true);
+        assert!(
+            damage.is_dirty(),
+            "the reactive bg-role write flags paint damage"
+        );
+
+        let scene = render(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            &damage,
+            &theme,
+        );
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(theme.resolve_color(ColorRole::Accent)),
+            "frame 2 (signal=true) paints the Accent role"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn div_reactive_border_role_should_toggle_on_signal() {
+        // The focus-ring pattern (#245): an optional reactive border color — `None` while the signal is
+        // false (no quad, since there is no bg either), a FocusRing border when true.
+        let owner = Owner::new();
+        owner.set();
+
+        let (read, write) = signal(false);
+        let mut root = div()
+            .border_w_2()
+            .border_color(rx(move || read.get().then_some(ColorRole::FocusRing)))
+            .size(Size { w: 10.0, h: 10.0 })
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::light();
+        let damage = Arc::new(DamageState::default());
+        let viewport = Size { w: 50.0, h: 50.0 };
+        let render = |root: &mut AnyElement,
+                      arena: &mut Arena,
+                      layout: &mut LayoutTree,
+                      text: &mut TextSystem,
+                      damage: &Arc<DamageState>,
+                      theme: &Theme|
+         -> Scene {
+            let mut scene = Scene::new();
+            render_tree(
+                root, arena, layout, text, None, None, None, None, None, None, &mut scene,
+                viewport, damage, theme,
+            )
+            .unwrap();
+            scene
+        };
+
+        let scene = render(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            &damage,
+            &theme,
+        );
+        assert!(
+            scene.quads.is_empty(),
+            "unfocused (signal=false) emits no border and no quad"
+        );
+
+        write.set(true);
+        let scene = render(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            &damage,
+            &theme,
+        );
+        assert_eq!(
+            scene.quads.len(),
+            1,
+            "focused (signal=true) emits the ring quad"
+        );
+        assert_eq!(
+            scene.quads[0].border.color,
+            theme.resolve_color(ColorRole::FocusRing)
+        );
+        assert!(scene.quads[0].border.widths.top > 0.0);
+        drop(owner);
     }
 }

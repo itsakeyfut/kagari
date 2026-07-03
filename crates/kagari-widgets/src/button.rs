@@ -2,20 +2,19 @@
 //! variant-constructor builder that returns `impl IntoElement`, hides `Styled`, and composes core
 //! elements with **semantic tokens**.
 //!
-//! **Lean MVP scope**: variant (primary/ghost/danger) + [`ControlSize`] + disabled + `on_click` (mouse
-//! **and** Space/Enter) + a controlled `toggle` signal + focusability ([`use_focus_handle`], #218). The
-//! *visual* state feedback (focus-ring outline, toggle-pressed color, icon) needs infra that is not yet
-//! built (border rendering is deferred; `Text` color is static; there is no icon element) — those are
-//! relocated to follow-up prerequisites; here `toggle`/focus are wired functionally without the visuals.
+//! **Scope**: variant (primary/ghost/danger) + [`ControlSize`] + disabled + `on_click` (mouse **and**
+//! Space/Enter) + a controlled `toggle` signal + focusability ([`use_focus_handle`], #218), with the
+//! visual state feedback wired via #245: a **focus-ring** border shown while focused, a **toggle-pressed**
+//! color bound to the toggle signal, and a theme-reactive **role-based** label color. (Icon-button
+//! `.icon()` still awaits the icon element, #246.)
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use kagari_base::SharedString;
 use kagari_core::reactive::prelude::*;
-use kagari_core::reactive::{ReadSignal, RwSignal, use_context};
+use kagari_core::reactive::{RwSignal, rx};
 use kagari_core::{AnyElement, IntoElement, KeyCode, Role, div, text, use_focus_handle};
-use kagari_style::{ColorRole, Styled, Theme};
+use kagari_style::{ColorRole, Styled};
 
 use crate::control::{ControlSize, apply_size, label_px};
 
@@ -88,8 +87,8 @@ impl Button {
         self
     }
 
-    /// Binds a toggle state: activation flips `signal` (controlled, D2). The pressed *visual* is a
-    /// follow-up (reactive state styling); this wires the state flip functionally.
+    /// Binds a toggle state: activation flips `signal` (controlled, D2), and the pressed *visual* follows
+    /// it — pressed uses the variant's active roles, unpressed a subtle Surface (reactive, #245).
     pub fn toggle(mut self, signal: RwSignal<bool>) -> Self {
         self.toggle = Some(signal);
         self
@@ -108,15 +107,6 @@ fn roles(variant: Variant, disabled: bool) -> (ColorRole, ColorRole) {
     }
 }
 
-/// Resolves a role to a concrete label color at build time from the theme in context (the app provides
-/// it, #45), falling back to the default theme when absent (GPU-free tests). The background *role*
-/// stays theme-reactive (resolved at paint from `cx.theme`); a swap-reactive label color is a follow-up.
-fn resolve_label_color(role: ColorRole) -> kagari_base::Color {
-    use_context::<ReadSignal<Arc<Theme>>>()
-        .map(|theme| theme.get_untracked().resolve_color(role))
-        .unwrap_or_else(|| Theme::default().resolve_color(role))
-}
-
 impl IntoElement for Button {
     fn into_element(self) -> AnyElement {
         let Button {
@@ -128,19 +118,51 @@ impl IntoElement for Button {
             toggle,
         } = self;
         let (bg_role, fg_role) = roles(variant, disabled);
-        let fg_color = resolve_label_color(fg_role);
-        let handle = use_focus_handle();
 
         let mut root = div()
             .flex()
             .items_center()
             .justify_center()
-            .bg(bg_role)
             .rounded_md()
-            .track_focus(&handle)
             .role(Role::Button)
             .a11y_label(label.clone());
+        // Focusability + focus ring only when enabled (#245, RK-027): a disabled control is inert and
+        // must skip the tab order — and so must not paint a focus ring. The ring reuses the element
+        // border, shown only while focused (`is_focused()` is a tracked read → fine-grained repaint).
+        if !disabled {
+            let handle = use_focus_handle();
+            let h = handle.clone();
+            root = root
+                .border_w_2()
+                .border_color(rx(move || h.is_focused().then_some(ColorRole::FocusRing)))
+                .track_focus(&handle);
+        }
         root = apply_size(root, size);
+
+        // Background + label color. A toggle binds them reactively to its signal (pressed = the variant's
+        // active roles, unpressed = a subtle Surface/Text); otherwise they are static roles (theme-reactive
+        // at paint, muted when disabled).
+        let label_el = match toggle {
+            Some(signal) if !disabled => {
+                let (on_bg, on_fg) = roles(variant, false);
+                root = root.bg(rx(move || {
+                    if signal.get() {
+                        on_bg
+                    } else {
+                        ColorRole::Surface
+                    }
+                }));
+                text(label)
+                    .color_role(rx(
+                        move || if signal.get() { on_fg } else { ColorRole::Text },
+                    ))
+                    .size(label_px(size))
+            }
+            _ => {
+                root = root.bg(bg_role);
+                text(label).color_role(fg_role).size(label_px(size))
+            }
+        };
 
         if !disabled {
             // One shared activation closure for both the pointer click and Space/Enter: flip the toggle
@@ -172,8 +194,7 @@ impl IntoElement for Button {
                 });
         }
 
-        root.child(text(label).color(fg_color).size(label_px(size)))
-            .into_element()
+        root.child(label_el).into_element()
     }
 }
 
@@ -181,15 +202,16 @@ impl IntoElement for Button {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::Arc;
 
     use kagari_base::{Point, Size};
     use kagari_core::arena::Arena;
     use kagari_core::damage::DamageState;
     use kagari_core::paint::render_tree;
-    use kagari_core::reactive::Owner;
+    use kagari_core::reactive::{Owner, provide_context};
     use kagari_core::{
-        DispatchState, HitTest, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
-        dispatch_key, dispatch_mouse,
+        DispatchState, FocusRegistry, HitTest, KeyEvent, Modifiers, MouseButton, MouseEvent,
+        MouseKind, dispatch_key, dispatch_mouse,
     };
     use kagari_layout::LayoutTree;
     use kagari_render::{Background, Scene};
@@ -360,6 +382,124 @@ mod tests {
         );
         press_key(&mut b, KeyCode::Enter);
         assert!(!pressed.get_untracked(), "activation flips it back off");
+        drop(owner);
+    }
+
+    #[test]
+    fn button_toggle_pressed_should_change_bg_role() {
+        // The toggle-pressed visual (#245): the background role follows the toggle signal — unpressed
+        // paints Surface, pressed paints the variant's active role (Accent). Two frames, signal written
+        // between them (RK-009); serial + `owner` alive (RK-005).
+        let owner = Owner::new();
+        owner.set();
+        let pressed = RwSignal::new(false);
+        let mut root = button("Bold").toggle(pressed).into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage = Arc::new(DamageState::default());
+
+        let render = |root: &mut AnyElement,
+                      arena: &mut Arena,
+                      layout: &mut LayoutTree,
+                      text: &mut TextSystem| {
+            let mut scene = Scene::new();
+            render_tree(
+                root, arena, layout, text, None, None, None, None, None, None, &mut scene,
+                VIEWPORT, &damage, &theme,
+            )
+            .unwrap();
+            scene
+        };
+
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text);
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::Surface))),
+            "unpressed toggle paints a Surface background"
+        );
+
+        pressed.set(true);
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text);
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::Accent))),
+            "pressed toggle paints an Accent background"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn button_focused_should_paint_focus_ring() {
+        // The focus-ring visual (#245): a focused button paints a FocusRing-colored border; an unfocused
+        // one paints none. Drives Button's own focus composition (use_focus_handle from a context
+        // FocusRegistry + track_focus + is_focused), not just the Div-level mechanism. `Theme::light`
+        // has a real FocusRing color + B2 width. Serial + `owner` alive (RK-005).
+        let owner = Owner::new();
+        owner.set();
+        let mut registry = FocusRegistry::new();
+        provide_context(registry.clone());
+        let mut root = button("OK").into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::light();
+        let damage = Arc::new(DamageState::default());
+        let ring = theme.resolve_color(ColorRole::FocusRing);
+
+        let render = |root: &mut AnyElement,
+                      arena: &mut Arena,
+                      layout: &mut LayoutTree,
+                      text: &mut TextSystem,
+                      registry: &mut FocusRegistry| {
+            let mut scene = Scene::new();
+            render_tree(
+                root,
+                arena,
+                layout,
+                text,
+                None,
+                None,
+                None,
+                Some(registry),
+                None,
+                None,
+                &mut scene,
+                VIEWPORT,
+                &damage,
+                &theme,
+            )
+            .unwrap();
+            scene
+        };
+        let has_ring = |scene: &Scene| {
+            scene
+                .quads
+                .iter()
+                .any(|q| q.border.color == ring && q.border.widths.top > 0.0)
+        };
+
+        // Frame 1: unfocused → no focus ring.
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
+        assert!(
+            !has_ring(&scene),
+            "an unfocused button paints no focus ring"
+        );
+
+        // Focus the button (the only registered focusable) and repaint.
+        registry.focus_next();
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
+        assert!(
+            has_ring(&scene),
+            "a focused button paints a FocusRing border"
+        );
         drop(owner);
     }
 }
