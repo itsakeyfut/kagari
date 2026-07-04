@@ -222,6 +222,9 @@ impl IntoElement for Switch {
         };
         let knob_el = div()
             .rounded_full()
+            // A drop shadow delineates the light knob against both the (light) off track and the
+            // (blue) on track — the same trick real switches use.
+            .shadow_sm()
             .size(Size {
                 w: knob_px.0,
                 h: knob_px.0,
@@ -236,14 +239,17 @@ impl IntoElement for Switch {
             w: track_w.0,
             h: track_h.0,
         });
+        // The off/disabled track uses a gray border role, not `SurfaceRaised` — in the light theme
+        // `SurfaceRaised` resolves to white (same as the page `Surface`), which made the off switch
+        // invisible. `Accent` (blue) when on.
         track = if disabled {
-            track.bg(ColorRole::SurfaceRaised)
+            track.bg(ColorRole::Border)
         } else {
             track.bg(rx(move || {
                 if value.get() {
                     ColorRole::Accent
                 } else {
-                    ColorRole::SurfaceRaised
+                    ColorRole::BorderStrong
                 }
             }))
         };
@@ -422,6 +428,30 @@ mod tests {
                 .iter()
                 .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::Accent))),
             "an on switch paints an Accent track"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn switch_off_should_paint_a_visible_track() {
+        // Regression: the off track must be a gray border role, not `SurfaceRaised` — in the light
+        // theme `SurfaceRaised` resolves to white (== the page `Surface`), which made the off switch
+        // invisible (white track + white knob on a white page).
+        let owner = Owner::new();
+        owner.set();
+        let theme = Theme::light();
+        let off = build(switch(RwSignal::new(false)), &theme);
+        assert!(
+            off.scene
+                .quads
+                .iter()
+                .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::BorderStrong))),
+            "an off switch paints a visible (BorderStrong) track"
+        );
+        assert_ne!(
+            theme.resolve_color(ColorRole::BorderStrong),
+            theme.resolve_color(ColorRole::Surface),
+            "the off track color is distinct from the page Surface"
         );
         drop(owner);
     }
