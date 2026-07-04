@@ -1,8 +1,8 @@
-//! Widget gallery (#70) — a manual visual check of the kagari widget set. Grows as widgets land
-//! (Button is the first). Opens a real window via the App shell, so it is a **manual/local** check
-//! (like `kagari-core`'s `hello`/`a11y_demo`), not a CI test.
+//! Button example (#70) — a manual visual check of the [`Button`](kagari_widgets::Button) widget (and
+//! icons, #246). Opens a real window via the App shell, so it is a **manual/local** check (like
+//! `kagari-core`'s `hello`/`a11y_demo`), not a CI test.
 //!
-//! Run with: `cargo run -p kagari-widgets --example gallery`
+//! Run with: `cargo run -p kagari-widgets --example button`
 //!
 //! Interactive state visuals are wired (#245): focus a button (Tab, once focus navigation is on) to
 //! see the focus-ring border, and click the toggle button to see its pressed (Accent) color. Clicking
@@ -11,12 +11,12 @@
 use kagari_core::reactive::RwSignal;
 use kagari_core::{App, IconId, WindowOptions, div, icon};
 use kagari_style::{ColorRole, Styled};
-use kagari_widgets::{ControlSize, button, checkbox, switch};
+use kagari_widgets::{ControlSize, button};
 
 fn main() -> Result<(), kagari_core::AppError> {
     let mut app = App::new()?;
     app.open_window(
-        WindowOptions::default().title("kagari — widget gallery"),
+        WindowOptions::default().title("kagari — button"),
         || {
             div()
                 .flex_col()
@@ -63,18 +63,6 @@ fn main() -> Result<(), kagari_core::AppError> {
                         .child(button("Confirm").icon(IconId::Check))
                         .child(icon(IconId::Close))
                         .child(icon(IconId::ChevronDown).color_role(ColorRole::Accent)),
-                )
-                // Checkbox / Switch (#73): a bool bound to a signal; click or Space toggles it.
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_4()
-                        .child(checkbox(RwSignal::new(true)).label("Enabled"))
-                        .child(checkbox(RwSignal::new(false)).label("Off"))
-                        .child(checkbox(RwSignal::new(true)).disabled(true).label("Locked"))
-                        .child(switch(RwSignal::new(true)).label("Dark mode"))
-                        .child(switch(RwSignal::new(false))),
                 )
         },
     )?;
