@@ -1,34 +1,25 @@
-//! The [`Checkbox`] and [`Switch`] widgets (#73): a `bool` bound to an `RwSignal<bool>` (controlled),
-//! toggled by a click or Space/Enter. They compose the #245 state visuals (reactive role colors +
-//! focus-ring border) and, for the checkbox, the #246 [`icon`] checkmark.
+//! The [`Checkbox`] widget (#73): a `bool` bound to an `RwSignal<bool>` (controlled), toggled by a click
+//! or Space/Enter. Composes the #245 state visuals (reactive role colors + focus-ring border) and the
+//! #246 [`icon`] checkmark. Shares the size/disabled/label builders and the focusable root with the
+//! sibling [`Switch`](crate::Switch) via `control` (`control_builders!` / `control_root`).
 //!
 //! **Instant, not yet animated**: the app does not drive `Animated::tick` live yet (the deferred frame
-//! loop that `scroll` also awaits), so the check/knob switch state *instantly* — a live-correct MVP. The
+//! loop that `scroll` also awaits), so the check state switches *instantly* — a live-correct MVP. The
 //! animated transition is relocated to a follow-up (it would leave the value visually stuck otherwise).
 
 use kagari_base::{SharedString, Size};
-use kagari_core::element::Div;
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{
-    AnyElement, IconId, IntoElement, KeyCode, Role, div, icon, text, use_focus_handle,
-};
+use kagari_core::{AnyElement, IconId, IntoElement, div, icon};
 use kagari_style::{ColorRole, Styled};
 
-use crate::control::{ControlSize, check_glyph_px, checkbox_box_px, label_px, switch_dims};
+use crate::control::{
+    ControlSize, check_glyph_px, checkbox_box_px, control_builders, control_root,
+};
 
 /// A checkbox bound to a `bool` signal (#73). Build with [`checkbox`]; chain `.size(..)`,
 /// `.disabled(..)`, `.label(..)`. Returns `impl IntoElement`.
 pub struct Checkbox {
-    value: RwSignal<bool>,
-    size: ControlSize,
-    disabled: bool,
-    label: Option<SharedString>,
-}
-
-/// A switch (toggle) bound to a `bool` signal (#73) — the same controlled model as [`Checkbox`], drawn
-/// as a track + sliding knob. Build with [`switch`].
-pub struct Switch {
     value: RwSignal<bool>,
     size: ControlSize,
     disabled: bool,
@@ -45,90 +36,7 @@ pub fn checkbox(value: RwSignal<bool>) -> Checkbox {
     }
 }
 
-/// Creates a medium switch bound to `value` (controlled: activation flips `value`).
-pub fn switch(value: RwSignal<bool>) -> Switch {
-    Switch {
-        value,
-        size: ControlSize::Md,
-        disabled: false,
-        label: None,
-    }
-}
-
-macro_rules! control_builders {
-    ($t:ty) => {
-        impl $t {
-            /// Sets the control size (D3).
-            pub fn size(mut self, size: ControlSize) -> Self {
-                self.size = size;
-                self
-            }
-
-            /// Disables the control: muted styling, inert (no toggle), and not focusable.
-            pub fn disabled(mut self, disabled: bool) -> Self {
-                self.disabled = disabled;
-                self
-            }
-
-            /// Adds a trailing text label (clickable together with the control).
-            pub fn label(mut self, label: impl Into<SharedString>) -> Self {
-                self.label = Some(label.into());
-                self
-            }
-        }
-    };
-}
 control_builders!(Checkbox);
-control_builders!(Switch);
-
-/// Wraps a control's `indicator` (checkbox box / switch track) with the shared root: a focusable,
-/// clickable row with an optional label. The focus ring (a reactive `FocusRing` border) and
-/// focusability are attached only when enabled (RK-027); activation (click **or** Space/Enter) flips
-/// `value`. Mirrors [`Button`](crate::Button).
-fn control_root(
-    value: RwSignal<bool>,
-    size: ControlSize,
-    disabled: bool,
-    label: Option<SharedString>,
-    indicator: Div,
-) -> Div {
-    let mut root = div().flex().items_center().gap_2().role(Role::CheckBox);
-    if let Some(l) = &label {
-        root = root.a11y_label(l.clone());
-    }
-    if !disabled {
-        let handle = use_focus_handle();
-        let h = handle.clone();
-        root = root
-            .rounded_md()
-            .border_w_2()
-            .border_color(rx(move || {
-                h.is_focus_visible().then_some(ColorRole::FocusRing)
-            }))
-            .track_focus(&handle)
-            .on_click(move |_ev, _cx| value.set(!value.get_untracked()))
-            .on_key_down(move |kev, _cx| {
-                if !kev.repeat
-                    && matches!(
-                        kev.code,
-                        KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter
-                    )
-                {
-                    value.set(!value.get_untracked());
-                }
-            });
-    }
-    root = root.child(indicator);
-    if let Some(l) = label {
-        let color = if disabled {
-            ColorRole::TextMuted
-        } else {
-            ColorRole::Text
-        };
-        root = root.child(text(l).color_role(color).size(label_px(size)));
-    }
-    root
-}
 
 impl IntoElement for Checkbox {
     fn into_element(self) -> AnyElement {
@@ -198,69 +106,6 @@ impl IntoElement for Checkbox {
     }
 }
 
-impl IntoElement for Switch {
-    fn into_element(self) -> AnyElement {
-        let Switch {
-            value,
-            size,
-            disabled,
-            label,
-        } = self;
-        let (track_w, track_h, knob_px) = switch_dims(size);
-        // The knob is inset 2px on the left (off) and slides right by `on_w - off_w` when on.
-        let off_w = 2.0;
-        let on_w = track_w.0 - knob_px.0 - 2.0;
-
-        // A reactive-width spacer before the knob positions it left (off) / right (on) — instant (a
-        // reactive `.size` relayouts on toggle). The knob is a light circle on both track colors.
-        let spacer = if disabled {
-            let w = if value.get_untracked() { on_w } else { off_w };
-            div().size(Size { w, h: track_h.0 })
-        } else {
-            div().size(rx(move || Size {
-                w: if value.get() { on_w } else { off_w },
-                h: track_h.0,
-            }))
-        };
-        let knob_el = div()
-            .rounded_full()
-            // A drop shadow delineates the light knob against both the (light) off track and the
-            // (blue) on track — the same trick real switches use.
-            .shadow_sm()
-            .size(Size {
-                w: knob_px.0,
-                h: knob_px.0,
-            })
-            .bg(if disabled {
-                ColorRole::Surface
-            } else {
-                ColorRole::AccentFg
-            });
-
-        let mut track = div().flex().items_center().rounded_full().size(Size {
-            w: track_w.0,
-            h: track_h.0,
-        });
-        // The off/disabled track uses a gray border role, not `SurfaceRaised` — in the light theme
-        // `SurfaceRaised` resolves to white (same as the page `Surface`), which made the off switch
-        // invisible. `Accent` (blue) when on.
-        track = if disabled {
-            track.bg(ColorRole::Border)
-        } else {
-            track.bg(rx(move || {
-                if value.get() {
-                    ColorRole::Accent
-                } else {
-                    ColorRole::BorderStrong
-                }
-            }))
-        };
-        track = track.child(spacer).child(knob_el);
-
-        control_root(value, size, disabled, label, track).into_element()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,7 +121,7 @@ mod tests {
         MouseEvent, MouseKind, dispatch_key, dispatch_mouse,
     };
     use kagari_layout::LayoutTree;
-    use kagari_render::{Background, Scene};
+    use kagari_render::Scene;
     use kagari_style::{ColorRole, Theme};
     use kagari_text::{FontDb, TextSystem};
 
@@ -408,57 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_should_toggle_signal_on_click() {
-        let owner = Owner::new();
-        owner.set();
-        let value = RwSignal::new(false);
-        let mut b = build(switch(value), &Theme::light());
-        click(&mut b);
-        assert!(value.get_untracked(), "a click turns the switch on");
-        drop(owner);
-    }
-
-    #[test]
-    fn switch_on_should_paint_accent_track() {
-        let owner = Owner::new();
-        owner.set();
-        let theme = Theme::light();
-        let on = build(switch(RwSignal::new(true)), &theme);
-        assert!(
-            on.scene
-                .quads
-                .iter()
-                .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::Accent))),
-            "an on switch paints an Accent track"
-        );
-        drop(owner);
-    }
-
-    #[test]
-    fn switch_off_should_paint_a_visible_track() {
-        // Regression: the off track must be a gray border role, not `SurfaceRaised` — in the light
-        // theme `SurfaceRaised` resolves to white (== the page `Surface`), which made the off switch
-        // invisible (white track + white knob on a white page).
-        let owner = Owner::new();
-        owner.set();
-        let theme = Theme::light();
-        let off = build(switch(RwSignal::new(false)), &theme);
-        assert!(
-            off.scene
-                .quads
-                .iter()
-                .any(|q| q.bg == Background::Solid(theme.resolve_color(ColorRole::BorderStrong))),
-            "an off switch paints a visible (BorderStrong) track"
-        );
-        assert_ne!(
-            theme.resolve_color(ColorRole::BorderStrong),
-            theme.resolve_color(ColorRole::Surface),
-            "the off track color is distinct from the page Surface"
-        );
-        drop(owner);
-    }
-
-    #[test]
     fn checkbox_external_write_should_update_check() {
         // A write to the bound signal between frames updates the visual (the check appears).
         let owner = Owner::new();
@@ -562,32 +356,6 @@ mod tests {
         assert!(
             has_ring(&scene),
             "a focus-visible checkbox paints a FocusRing border"
-        );
-        drop(owner);
-    }
-
-    #[test]
-    fn switch_knob_should_shift_when_on() {
-        // The knob (the AccentFg circle) sits further right when the switch is on (the reactive spacer
-        // widens). Compare the knob quad's x between a fresh off and on switch.
-        let owner = Owner::new();
-        owner.set();
-        let theme = Theme::light();
-        let knob_bg = Background::Solid(theme.resolve_color(ColorRole::AccentFg));
-        let knob_x = |on: bool| {
-            let b = build(switch(RwSignal::new(on)), &theme);
-            b.scene
-                .quads
-                .iter()
-                .find(|q| q.bg == knob_bg)
-                .expect("the knob paints an AccentFg quad")
-                .bounds
-                .origin
-                .x
-        };
-        assert!(
-            knob_x(true) > knob_x(false),
-            "the on knob sits right of the off knob"
         );
         drop(owner);
     }

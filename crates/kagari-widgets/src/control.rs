@@ -1,9 +1,13 @@
-//! Shared control primitives (D3): the [`ControlSize`] scale every interactive widget accepts, plus the
-//! per-size layout/label metrics that map it onto the kagari-style spacing scale (§3.6).
+//! Shared control primitives (D3): the [`ControlSize`] scale every interactive widget accepts, the
+//! per-size layout/label metrics that map it onto the kagari-style spacing scale (§3.6), and the shared
+//! builders + focusable root that [`Checkbox`](crate::Checkbox) and [`Switch`](crate::Switch) compose.
 
-use kagari_base::Px;
+use kagari_base::{Px, SharedString};
 use kagari_core::element::Div;
-use kagari_style::Styled;
+use kagari_core::reactive::prelude::*;
+use kagari_core::reactive::{RwSignal, rx};
+use kagari_core::{KeyCode, Role, div, text, use_focus_handle};
+use kagari_style::{ColorRole, Styled};
 
 /// The size of an interactive control (button / input / checkbox / …), shared across kagari-widgets so a
 /// form's controls line up on one scale (D3). `Md` is the default.
@@ -80,4 +84,80 @@ pub(crate) fn radio_dot_px(size: ControlSize) -> Px {
         ControlSize::Md => Px(10.0),
         ControlSize::Lg => Px(12.0),
     }
+}
+
+/// Adds the shared `size`/`disabled`/`label` builder methods to a control type that has those three
+/// fields ([`Checkbox`](crate::Checkbox) / [`Switch`](crate::Switch)) — one definition for both.
+macro_rules! control_builders {
+    ($t:ty) => {
+        impl $t {
+            /// Sets the control size (D3).
+            pub fn size(mut self, size: ControlSize) -> Self {
+                self.size = size;
+                self
+            }
+
+            /// Disables the control: muted styling, inert (no toggle), and not focusable.
+            pub fn disabled(mut self, disabled: bool) -> Self {
+                self.disabled = disabled;
+                self
+            }
+
+            /// Adds a trailing text label (clickable together with the control).
+            pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+                self.label = Some(label.into());
+                self
+            }
+        }
+    };
+}
+pub(crate) use control_builders;
+
+/// Wraps a control's `indicator` (checkbox box / switch track) with the shared root: a focusable,
+/// clickable row with an optional label. The focus ring (a reactive `FocusRing` border) and
+/// focusability are attached only when enabled (RK-027); activation (click **or** Space/Enter) flips
+/// `value`. Mirrors [`Button`](crate::Button).
+pub(crate) fn control_root(
+    value: RwSignal<bool>,
+    size: ControlSize,
+    disabled: bool,
+    label: Option<SharedString>,
+    indicator: Div,
+) -> Div {
+    let mut root = div().flex().items_center().gap_2().role(Role::CheckBox);
+    if let Some(l) = &label {
+        root = root.a11y_label(l.clone());
+    }
+    if !disabled {
+        let handle = use_focus_handle();
+        let h = handle.clone();
+        root = root
+            .rounded_md()
+            .border_w_2()
+            .border_color(rx(move || {
+                h.is_focus_visible().then_some(ColorRole::FocusRing)
+            }))
+            .track_focus(&handle)
+            .on_click(move |_ev, _cx| value.set(!value.get_untracked()))
+            .on_key_down(move |kev, _cx| {
+                if !kev.repeat
+                    && matches!(
+                        kev.code,
+                        KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter
+                    )
+                {
+                    value.set(!value.get_untracked());
+                }
+            });
+    }
+    root = root.child(indicator);
+    if let Some(l) = label {
+        let color = if disabled {
+            ColorRole::TextMuted
+        } else {
+            ColorRole::Text
+        };
+        root = root.child(text(l).color_role(color).size(label_px(size)));
+    }
+    root
 }
