@@ -65,3 +65,19 @@ pub(crate) fn switch_dims(size: ControlSize) -> (Px, Px, Px) {
         ControlSize::Lg => (Px(42.0), Px(24.0), Px(20.0)),
     }
 }
+
+/// The radio mark's outer-circle diameter (logical px) for `size` — matched to the checkbox box scale.
+pub(crate) fn radio_mark_px(size: ControlSize) -> Px {
+    checkbox_box_px(size)
+}
+
+/// The radio mark's inner-dot diameter (logical px) for `size` — about half the outer circle. Kept
+/// **even** (like the even outer diameters from `checkbox_box_px`) so `(outer − dot)/2` is a whole
+/// number: an odd dot in an even circle centers at a half-pixel and snaps off-center on the pixel grid.
+pub(crate) fn radio_dot_px(size: ControlSize) -> Px {
+    match size {
+        ControlSize::Sm => Px(8.0),
+        ControlSize::Md => Px(10.0),
+        ControlSize::Lg => Px(12.0),
+    }
+}

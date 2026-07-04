@@ -6,7 +6,9 @@
 pub mod button;
 pub mod checkbox;
 pub mod control;
+pub mod radio;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, Switch, checkbox, switch};
 pub use control::ControlSize;
+pub use radio::{RadioGroup, radio_group};

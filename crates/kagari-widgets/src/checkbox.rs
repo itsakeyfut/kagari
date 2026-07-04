@@ -102,7 +102,9 @@ fn control_root(
         root = root
             .rounded_md()
             .border_w_2()
-            .border_color(rx(move || h.is_focused().then_some(ColorRole::FocusRing)))
+            .border_color(rx(move || {
+                h.is_focus_visible().then_some(ColorRole::FocusRing)
+            }))
             .track_focus(&handle)
             .on_click(move |_ev, _cx| value.set(!value.get_untracked()))
             .on_key_down(move |kev, _cx| {
@@ -547,11 +549,19 @@ mod tests {
             !has_ring(&scene),
             "an unfocused checkbox paints no focus ring"
         );
+        // Focused via a non-keyboard modality → the ring stays hidden (`:focus-visible`).
         registry.focus_next();
         let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
         assert!(
+            !has_ring(&scene),
+            "a focused-but-not-focus-visible checkbox paints no ring"
+        );
+        // A key press marks keyboard modality → the ring appears.
+        registry.set_focus_visible(true);
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
+        assert!(
             has_ring(&scene),
-            "a focused checkbox paints a FocusRing border"
+            "a focus-visible checkbox paints a FocusRing border"
         );
         drop(owner);
     }

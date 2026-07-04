@@ -201,6 +201,13 @@ impl Div {
         self
     }
 
+    /// Aligns children to the start of the cross axis (`align-items: flex-start`) — so children size to
+    /// their content instead of stretching to fill the cross axis. Damage kind: static layout.
+    pub fn items_start(mut self) -> Self {
+        self.layout.align_items = Some(AlignItems::Start);
+        self
+    }
+
     /// Centers children on the cross axis (`align-items: center`). Damage kind: static layout.
     pub fn items_center(mut self) -> Self {
         self.layout.align_items = Some(AlignItems::Center);
