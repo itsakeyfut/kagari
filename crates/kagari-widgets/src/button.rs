@@ -92,7 +92,9 @@ impl Button {
     }
 
     /// Binds a toggle state: activation flips `signal` (controlled, D2), and the pressed *visual* follows
-    /// it — pressed uses the variant's active roles, unpressed a subtle Surface (reactive, #245).
+    /// it — pressed uses the variant's active roles, unpressed a subtle Surface (reactive, #245). This is
+    /// a **button that stays pressed** (e.g. a toolbar Bold/Italic button); for a settings-style on/off
+    /// track + sliding knob, use [`Switch`](crate::Switch) instead.
     pub fn toggle(mut self, signal: RwSignal<bool>) -> Self {
         self.toggle = Some(signal);
         self

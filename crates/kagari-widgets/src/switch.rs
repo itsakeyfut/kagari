@@ -15,9 +15,15 @@ use kagari_style::{ColorRole, Styled};
 
 use crate::control::{ControlSize, control_builders, control_root, switch_dims};
 
-/// A switch (toggle) bound to a `bool` signal (#73) — the same controlled model as
-/// [`Checkbox`](crate::Checkbox), drawn as a track + sliding knob. Build with [`switch`]; chain
-/// `.size(..)`, `.disabled(..)`, `.label(..)`. Returns `impl IntoElement`.
+/// A switch bound to a `bool` signal (#73) — the same controlled model as [`Checkbox`](crate::Checkbox),
+/// drawn as a track + sliding knob. Build with [`switch`]; chain `.size(..)`, `.disabled(..)`,
+/// `.label(..)`. Returns `impl IntoElement`.
+///
+/// **`Switch` vs [`Button::toggle`](crate::Button::toggle)** — both bind an on/off `bool`, but they are
+/// different controls: a `Switch` is the settings-style **track + sliding knob** (a distinct `switch`
+/// role in a11y), whereas `Button::toggle` is a **button that stays pressed** when active (e.g. a
+/// toolbar Bold/Italic button). Pick `Switch` for an on/off setting, the toggle button for a
+/// button-shaped two-state action.
 pub struct Switch {
     value: RwSignal<bool>,
     size: ControlSize,
