@@ -27,12 +27,14 @@ use crate::reactive::{RwSignal, use_context};
 pub struct FocusId(u64);
 
 /// A clone-able handle to a focusable target. Holds the [`FocusId`] plus the registry's current-focus
-/// signal, so [`is_focused`](Self::is_focused) / [`focus`](Self::focus) work standalone (no context
-/// needed). Bind it to an element with `div().track_focus(&handle)`.
+/// and focus-visible signals, so [`is_focused`](Self::is_focused) / [`is_focus_visible`](Self::is_focus_visible)
+/// / [`focus`](Self::focus) work standalone (no context needed). Bind it to an element with
+/// `div().track_focus(&handle)`.
 #[derive(Clone)]
 pub struct FocusHandle {
     id: FocusId,
     current: RwSignal<Option<FocusId>>,
+    visible: RwSignal<bool>,
 }
 
 impl FocusHandle {
@@ -45,6 +47,14 @@ impl FocusHandle {
     /// it inside a reactive prop closure makes focus-driven styling update on focus changes.
     pub fn is_focused(&self) -> bool {
         self.current.get() == Some(self.id)
+    }
+
+    /// Whether this handle holds focus **and** the focus indicator should be shown — i.e. the most
+    /// recent input was a keyboard, not a pointer (the `:focus-visible` heuristic). A **tracked** read
+    /// (of both the focus and focus-visible signals), so it drives fine-grained repaint. Use this for
+    /// focus-ring styling so the ring appears on keyboard focus and stays hidden for pointer focus.
+    pub fn is_focus_visible(&self) -> bool {
+        self.is_focused() && self.visible.get()
     }
 
     /// Moves focus to this handle's target.
@@ -60,6 +70,7 @@ impl FocusHandle {
         FocusHandle {
             id: FocusId(u64::MAX),
             current: RwSignal::new(None),
+            visible: RwSignal::new(false),
         }
     }
 }
@@ -83,15 +94,19 @@ struct FocusInner {
 #[derive(Clone)]
 pub struct FocusRegistry {
     current: RwSignal<Option<FocusId>>,
+    /// Whether the focus indicator should be shown — set by the App at the input boundary to the most
+    /// recent modality (`true` on a key press, `false` on a pointer press): the `:focus-visible` state.
+    visible: RwSignal<bool>,
     inner: Arc<Mutex<FocusInner>>,
 }
 
 impl FocusRegistry {
-    /// Creates an empty registry. Creates the current-focus [`RwSignal`], so it must be called under
-    /// an ambient reactive `Owner` (the app root owner; tests establish one — RK-005).
+    /// Creates an empty registry. Creates the current-focus and focus-visible [`RwSignal`]s, so it must
+    /// be called under an ambient reactive `Owner` (the app root owner; tests establish one — RK-005).
     pub fn new() -> Self {
         Self {
             current: RwSignal::new(None),
+            visible: RwSignal::new(false),
             inner: Arc::new(Mutex::new(FocusInner {
                 next: 0,
                 order: Vec::new(),
@@ -111,6 +126,18 @@ impl FocusRegistry {
         self.current
     }
 
+    /// Sets whether the focus indicator should be shown (the `:focus-visible` state). The App calls this
+    /// at the input boundary: `true` on a key press (keyboard modality), `false` on a pointer press. The
+    /// widget focus ring reads [`FocusHandle::is_focus_visible`], so it appears on keyboard focus and
+    /// stays hidden for pointer focus. Deduped against the current value: key auto-repeat and pointer
+    /// floods would otherwise write the signal every event, each notifying subscribers and marking
+    /// paint-dirty — only a modality *change* should repaint.
+    pub fn set_focus_visible(&self, visible: bool) {
+        if self.visible.get_untracked() != visible {
+            self.visible.set(visible);
+        }
+    }
+
     /// Mints a new [`FocusHandle`] and appends it to the tab order. Components mint handles in
     /// pre-order (parent before children), so the tab order is tree order.
     pub fn handle(&self) -> FocusHandle {
@@ -121,6 +148,7 @@ impl FocusRegistry {
         FocusHandle {
             id,
             current: self.current,
+            visible: self.visible,
         }
     }
 
@@ -291,6 +319,67 @@ mod tests {
         a.focus();
         assert!(a.is_focused(), "a is focused after focus()");
         assert!(!b.is_focused(), "b is not focused");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn is_focus_visible_should_require_focus_and_keyboard_modality() {
+        let owner = Owner::new();
+        owner.set();
+
+        let reg = FocusRegistry::new();
+        let a = reg.handle();
+        a.focus();
+
+        // Focused, but no keyboard input yet (default modality) → the ring must not show.
+        assert!(a.is_focused(), "a holds focus");
+        assert!(
+            !a.is_focus_visible(),
+            "focus alone does not make the indicator visible (pointer/default modality)"
+        );
+
+        // A key press marks the modality keyboard → the ring shows.
+        reg.set_focus_visible(true);
+        assert!(
+            a.is_focus_visible(),
+            "keyboard modality shows the indicator"
+        );
+
+        // A pointer press hides it again, even while still focused.
+        reg.set_focus_visible(false);
+        assert!(
+            !a.is_focus_visible(),
+            "pointer modality hides the indicator while focus stays"
+        );
+
+        // With the keyboard modality set, losing focus still hides it (both conditions required).
+        reg.set_focus_visible(true);
+        reg.current().set(None);
+        assert!(
+            !a.is_focus_visible(),
+            "no focus means no indicator regardless of modality"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn set_focus_visible_should_dedupe_unchanged() {
+        let owner = Owner::new();
+        owner.set();
+
+        let reg = FocusRegistry::new();
+        let a = reg.handle();
+        a.focus();
+        reg.set_focus_visible(true);
+        // Repeating the same modality (as key auto-repeat does) leaves the state true — the dedupe is a
+        // repaint optimization, not a behavior change.
+        reg.set_focus_visible(true);
+        assert!(
+            a.is_focus_visible(),
+            "repeated same-modality stamps are stable"
+        );
 
         drop(owner);
     }

@@ -994,6 +994,9 @@ impl WindowState {
         let button = map_mouse_button(button);
         match state {
             ElementState::Pressed => {
+                // A pointer press marks the input modality as pointer, so focus rings stay hidden for
+                // click-initiated focus (`:focus-visible`). Deduped inside `set_focus_visible`.
+                self.focus.set_focus_visible(false);
                 // Interactive overlay dismiss (#219): a press outside every open overlay's content
                 // dismisses the topmost dismissible overlay (innermost-first). A dismissal — or an open
                 // modal backdrop — consumes the press so it does not reach content beneath. A press
@@ -1097,6 +1100,12 @@ impl WindowState {
     /// [`route_key`] decision (keymap-first-consume, #177 Q2) says whether to consume the chord as an
     /// `Action` or deliver the raw key to the focused node.
     fn on_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        // Any key press marks the input modality as keyboard, so focus rings become visible
+        // (`:focus-visible`). Stamped before the IME/Escape early-returns so every press counts;
+        // deduped inside `set_focus_visible`, so auto-repeat does not churn.
+        if event.state.is_pressed() {
+            self.focus.set_focus_visible(true);
+        }
         if ime_owns_key(event.physical_key) {
             tracing::trace!(key = ?event.physical_key, "ime-owned key passed through");
             return;

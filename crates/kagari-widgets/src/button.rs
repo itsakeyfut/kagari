@@ -140,13 +140,15 @@ impl IntoElement for Button {
             .a11y_label(label.clone());
         // Focusability + focus ring only when enabled (#245, RK-027): a disabled control is inert and
         // must skip the tab order — and so must not paint a focus ring. The ring reuses the element
-        // border, shown only while focused (`is_focused()` is a tracked read → fine-grained repaint).
+        // border, shown only while focus-visible (keyboard modality; a tracked read → fine-grained repaint).
         if !disabled {
             let handle = use_focus_handle();
             let h = handle.clone();
             root = root
                 .border_w_2()
-                .border_color(rx(move || h.is_focused().then_some(ColorRole::FocusRing)))
+                .border_color(rx(move || {
+                    h.is_focus_visible().then_some(ColorRole::FocusRing)
+                }))
                 .track_focus(&handle);
         }
         root = apply_size(root, size);
@@ -516,12 +518,21 @@ mod tests {
             "an unfocused button paints no focus ring"
         );
 
-        // Focus the button (the only registered focusable) and repaint.
+        // Frame 2: focused but via a non-keyboard modality (`focus_next` without a key stamp) → the ring
+        // stays hidden (`:focus-visible`).
         registry.focus_next();
         let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
         assert!(
+            !has_ring(&scene),
+            "a focused-but-not-focus-visible button paints no ring"
+        );
+
+        // Frame 3: a key press marks keyboard modality → the focus ring appears.
+        registry.set_focus_visible(true);
+        let scene = render(&mut root, &mut arena, &mut layout, &mut text, &mut registry);
+        assert!(
             has_ring(&scene),
-            "a focused button paints a FocusRing border"
+            "a focus-visible button paints a FocusRing border"
         );
         drop(owner);
     }
