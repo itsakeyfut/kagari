@@ -200,6 +200,11 @@ const DEBUG_OVERLAY_ACTION: &str = "kagari.debug.toggle-overlay";
 /// burst of `Moved`/`Resized` events (e.g. a window drag) into one write once the burst settles.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// The per-frame animation `dt` (#253) is clamped to this so a long idle gap, a paused window, or a
+/// stalled frame cannot advance a spring by a huge step (a visible jump / instability). The spring
+/// integrator also sub-steps internally.
+const MAX_FRAME_DT: Duration = Duration::from_millis(64);
+
 /// Resolves the persisted theme id to a [`Theme`] at startup (#68). Only built-in `light`/`dark` are
 /// applied; an unknown id (a custom theme) is kept persisted but falls back to the default until a
 /// theme registry exists (post-MVP).
@@ -286,6 +291,11 @@ struct WindowState {
     // tokens. Writing happens App-side (hot-reload); the per-window theme→damage effect reskins.
     theme: RwSignal<Arc<Theme>>,
     scheduler: Scheduler,
+    // The per-window animation ticker (#253): drivers (`Animated<T>`) register themselves when they
+    // start; `redraw` advances them each frame. Provided into the window's reactive context so
+    // `Animated::new` captures it. `last_frame` gives the tick its `dt`.
+    ticker: crate::scheduler::Ticker,
+    last_frame: Option<Instant>,
     ime_enabled: bool,
     // Set once a panic is caught in this window's frame/event work (#65): a degraded window skips all
     // further frames + events (its last-good frame stays on screen; it can still be closed), rather
@@ -679,6 +689,8 @@ impl App {
         let child_owner = self.root_owner.child();
         let theme = self.theme;
         let damage = Arc::new(DamageState::default());
+        let scheduler = Scheduler::new();
+        let ticker = crate::scheduler::Ticker::new();
         let (root, focus, overlay_layers) = child_owner.with(|| {
             bind_window_theme_damage(theme, Arc::clone(&damage));
             // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
@@ -693,6 +705,14 @@ impl App {
             // the child owner on close.
             let overlay_layers = OverlayLayers::new();
             provide_context(overlay_layers.clone());
+            // The scheduler active-source handle (#36/#253): provide it so `Animated::new` captures the
+            // *same* counter `about_to_wait` reads via `has_active_sources` — a started animation keeps the
+            // window on continuous per-vsync redraw until it settles. Without this the ticker only advances
+            // on incidental repaints (the knob would crawl one frame per unrelated click).
+            provide_context(scheduler.active_sources());
+            // The animation ticker (#253): provide a clone so `Animated::new` (widget / scroll build)
+            // captures it and registers itself when it starts; `redraw` drives it each frame.
+            provide_context(ticker.clone());
             let root = (pending.root)();
             (root, focus, overlay_layers)
         });
@@ -749,7 +769,9 @@ impl App {
                 damage,
                 _owner: child_owner,
                 theme,
-                scheduler: Scheduler::new(),
+                scheduler,
+                ticker,
+                last_frame: None,
                 ime_enabled: false,
                 hit_test: HitTest::new(),
                 focus,
@@ -1337,12 +1359,25 @@ impl WindowState {
         // last frame's stack during input, so it is cleared here at the start of the next paint (#219).
         self.overlay_layers.clear();
 
+        // Advance active animations (#253) by the elapsed `dt` **before** building/painting, so each
+        // `Animated`'s signal write resolves into its paint slot this frame (ADR 0001 synchronous
+        // effects). `dt` is clamped so a long idle gap (or a paused window) cannot fling a spring; the
+        // integrator sub-steps besides. A settled animation's `tick` returns `false` and the ticker drops
+        // it — dropping the active source, so the window returns to idle. Ticked every redraw (not just
+        // animating ones) so a `snap_to`-orphaned entry is pruned on its own damage-driven repaint.
+        let now = Instant::now();
+        let dt = self.last_frame.map_or(Duration::ZERO, |last| {
+            now.saturating_duration_since(last).min(MAX_FRAME_DT)
+        });
+        self.last_frame = Some(now);
+
         // Build + paint under the window owner (#219): build-once reactive-prop effects (overlay
         // open-state, reactive positions) register under it and live for the window, rather than dying
         // with no ambient owner (RK-008). Cloning the owner handle sidesteps borrowing `self._owner`
         // while the closure mutably borrows the rest of `self` (as `drag_owner` does for the drag-image).
         let owner = self._owner.clone();
         let root_id = match owner.with(|| {
+            self.ticker.tick_all(dt);
             render_tree(
                 &mut self.root,
                 &mut self.arena,

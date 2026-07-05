@@ -3,17 +3,17 @@
 //! Shares the size/disabled/label builders and the focusable root via `control` (`control_builders!` /
 //! `control_root`).
 //!
-//! **Instant, not yet animated**: the app does not drive `Animated::tick` live yet (the deferred frame
-//! loop that `scroll` also awaits), so the knob switches *instantly* — a live-correct MVP. The animated
-//! transition is relocated to a follow-up (it would leave the value visually stuck otherwise).
+//! **Animated knob (#253)**: the knob *slides* via an `Animated<f32>` spacer width, retargeted on toggle
+//! and driven by the app's per-frame ticker. Without an App context (a GPU-free test) it reaches the
+//! target on the next manual `Ticker::tick_all` (like `scroll`).
 
 use kagari_base::{SharedString, Size};
 use kagari_core::reactive::prelude::*;
-use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IntoElement, Role, div};
+use kagari_core::reactive::{RwSignal, create_effect, rx};
+use kagari_core::{Animated, AnyElement, IntoElement, Role, div};
 use kagari_style::{ColorRole, Styled};
 
-use crate::control::{ControlSize, control_builders, control_root, switch_dims};
+use crate::control::{CONTROL_SPRING, ControlSize, control_builders, control_root, switch_dims};
 
 /// A switch bound to a `bool` signal (#73) — the same controlled model as [`Checkbox`](crate::Checkbox),
 /// drawn as a track + sliding knob. Build with [`switch`]; chain `.size(..)`, `.disabled(..)`,
@@ -56,14 +56,29 @@ impl IntoElement for Switch {
         let off_w = 2.0;
         let on_w = track_w.0 - knob_px.0 - 2.0;
 
-        // A reactive-width spacer before the knob positions it left (off) / right (on) — instant (a
-        // reactive `.size` relayouts on toggle). The knob is a light circle on both track colors.
+        // A reactive-width spacer before the knob positions it left (off) / right (on). The knob is a
+        // light circle on both track colors.
         let spacer = if disabled {
             let w = if value.get_untracked() { on_w } else { off_w };
             div().size(Size { w, h: track_h.0 })
         } else {
+            // The knob **slides** on toggle (#253): an `Animated<f32>` spacer width, retargeted by an
+            // effect on the bound signal. Live once the app drives the ticker; a GPU-free test without an
+            // App context reaches the target on the next manual tick (like `scroll`). The guard avoids a
+            // spurious start when the effect first runs at the already-current value.
+            let anim = Animated::new(
+                if value.get_untracked() { on_w } else { off_w },
+                CONTROL_SPRING,
+            );
+            let retarget = anim.clone();
+            create_effect(move || {
+                let target = if value.get() { on_w } else { off_w };
+                if retarget.target() != target {
+                    retarget.set_target(target);
+                }
+            });
             div().size(rx(move || Size {
-                w: if value.get() { on_w } else { off_w },
+                w: anim.get(),
                 h: track_h.0,
             }))
         };
@@ -259,6 +274,59 @@ mod tests {
         assert!(
             knob_x(true) > knob_x(false),
             "the on knob sits right of the off knob"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn switch_knob_should_slide_toward_target_on_toggle() {
+        // End-to-end (#253): with a `Ticker` in context, toggling on retargets the knob's `Animated`;
+        // driving the ticker one frame slides the knob right (vs its off position) — no manual anim
+        // access. Mirrors how the app's redraw drives it.
+        use kagari_core::Ticker;
+        use kagari_core::reactive::provide_context;
+        use std::time::Duration;
+
+        let owner = Owner::new();
+        owner.set();
+        let ticker = Ticker::new();
+        provide_context(ticker.clone());
+        let value = RwSignal::new(false);
+        let theme = Theme::light();
+        let knob_bg = Background::Solid(theme.resolve_color(ColorRole::AccentFg));
+
+        let mut root = switch(value).into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let knob_x = |root: &mut AnyElement,
+                      arena: &mut Arena,
+                      layout: &mut LayoutTree,
+                      text: &mut TextSystem| {
+            let mut scene = Scene::new();
+            render_tree(
+                root, arena, layout, text, None, None, None, None, None, None, &mut scene,
+                VIEWPORT, &damage, &theme,
+            )
+            .unwrap();
+            scene
+                .quads
+                .iter()
+                .find(|q| q.bg == knob_bg)
+                .expect("the knob paints an AccentFg quad")
+                .bounds
+                .origin
+                .x
+        };
+
+        let x_off = knob_x(&mut root, &mut arena, &mut layout, &mut text);
+        value.set(true); // the retarget effect fires set_target(on) → registers into the ticker
+        ticker.tick_all(Duration::from_millis(16)); // one frame toward the on position
+        let x_mid = knob_x(&mut root, &mut arena, &mut layout, &mut text);
+        assert!(
+            x_mid > x_off,
+            "one tick after toggling on, the knob has slid right: off={x_off} mid={x_mid}"
         );
         drop(owner);
     }
