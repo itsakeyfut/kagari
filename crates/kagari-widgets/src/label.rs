@@ -7,7 +7,7 @@
 //! it is tracked in #260, which will add `Label::wrap(bool)` on top of this.
 
 use kagari_base::SharedString;
-use kagari_core::{AnyElement, IntoElement, text};
+use kagari_core::{AnyElement, IntoElement, Role, div, text};
 use kagari_style::ColorRole;
 
 use crate::control::{ControlSize, label_px};
@@ -52,9 +52,17 @@ impl Label {
 
 impl IntoElement for Label {
     fn into_element(self) -> AnyElement {
-        text(self.content)
-            .color_role(self.color)
-            .size(label_px(self.size))
+        // Wrap the glyph text in a `Role::Label` node so the label surfaces in the accesskit tree (a
+        // bare `text()` leaf carries no a11y — kagari's a11y is Div-based, #257 / RK-032). The wrapper
+        // sizes to the text, so layout is unchanged.
+        div()
+            .role(Role::Label)
+            .a11y_label(self.content.clone())
+            .child(
+                text(self.content)
+                    .color_role(self.color)
+                    .size(label_px(self.size)),
+            )
             .into_element()
     }
 }

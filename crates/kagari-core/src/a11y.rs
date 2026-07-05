@@ -33,6 +33,13 @@ pub enum Role {
     TextInput,
     /// A checkbox.
     CheckBox,
+    /// A switch (on/off toggle) — distinct from [`CheckBox`](Role::CheckBox) so a screen reader
+    /// announces "switch" rather than "checkbox".
+    Switch,
+    /// A radio button (one exclusive option within a [`RadioGroup`](Role::RadioGroup)).
+    Radio,
+    /// A group of mutually-exclusive [`Radio`](Role::Radio) buttons.
+    RadioGroup,
     /// A list container (its items are [`Role::ListItem`]).
     List,
     /// An item within a [`Role::List`].
@@ -53,6 +60,9 @@ impl Role {
             Role::Label => accesskit::Role::Label,
             Role::TextInput => accesskit::Role::TextInput,
             Role::CheckBox => accesskit::Role::CheckBox,
+            Role::Switch => accesskit::Role::Switch,
+            Role::Radio => accesskit::Role::RadioButton,
+            Role::RadioGroup => accesskit::Role::RadioGroup,
             Role::List => accesskit::Role::List,
             Role::ListItem => accesskit::Role::ListItem,
             Role::Image => accesskit::Role::Image,
@@ -69,6 +79,10 @@ pub(crate) struct A11y {
     pub(crate) role: Role,
     pub(crate) label: Option<SharedString>,
     pub(crate) value: Option<SharedString>,
+    /// The toggle/selection state of a toggleable control (checkbox/switch/radio). `None` for elements
+    /// that are not toggleable. Populated at paint from the reactive `a11y_checked` prop (not at build),
+    /// so it mirrors the widget's current signal value.
+    pub(crate) checked: Option<bool>,
 }
 
 impl Default for A11y {
@@ -77,6 +91,7 @@ impl Default for A11y {
             role: Role::Label,
             label: None,
             value: None,
+            checked: None,
         }
     }
 }
@@ -162,6 +177,11 @@ impl A11yTree {
                         node.set_value(value.as_str());
                     }
                 }
+            }
+            // A toggleable control (checkbox/switch/radio) carries its state as accesskit `Toggled`
+            // (ARIA checked semantics — radio buttons use checked, not list-style `selected`).
+            if let Some(checked) = n.a11y.checked {
+                node.set_toggled(accesskit::Toggled::from(checked));
             }
             node.set_bounds(to_ak_rect(n.bounds));
             nodes.push((ak_id, node));
@@ -395,6 +415,126 @@ mod tests {
             1,
             "only the synthetic window root; no annotated element"
         );
+    }
+
+    #[test]
+    fn a11y_should_map_radio_group_and_switch_roles() {
+        // The #257 roles map to their accesskit kinds (a RadioGroup > Radio, and a sibling Switch).
+        let (a11y, arena) = derive(
+            div()
+                .child(
+                    div()
+                        .role(Role::RadioGroup)
+                        .child(div().role(Role::Radio).a11y_label("opt")),
+                )
+                .child(div().role(Role::Switch).a11y_label("sw"))
+                .into_element(),
+        );
+        let update = a11y.build_update(&arena, None, 1.0);
+        let has = |r: accesskit::Role| update.nodes.iter().any(|(_, n)| n.role() == r);
+        assert!(has(accesskit::Role::RadioGroup), "RadioGroup role maps");
+        assert!(
+            has(accesskit::Role::RadioButton),
+            "Radio maps to RadioButton"
+        );
+        assert!(has(accesskit::Role::Switch), "Switch role maps");
+    }
+
+    #[test]
+    fn a11y_should_carry_checked_state() {
+        // A static `a11y_checked` propagates to the node's accesskit `Toggled` (checked semantics).
+        let (on, arena_on) = derive(div().role(Role::CheckBox).a11y_checked(true).into_element());
+        let up_on = on.build_update(&arena_on, None, 1.0);
+        let (_, cb_on) = up_on
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == accesskit::Role::CheckBox)
+            .expect("a CheckBox node");
+        assert_eq!(
+            cb_on.toggled(),
+            Some(accesskit::Toggled::True),
+            "checked → Toggled::True"
+        );
+
+        let (off, arena_off) = derive(
+            div()
+                .role(Role::CheckBox)
+                .a11y_checked(false)
+                .into_element(),
+        );
+        let up_off = off.build_update(&arena_off, None, 1.0);
+        let (_, cb_off) = up_off
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == accesskit::Role::CheckBox)
+            .expect("a CheckBox node");
+        assert_eq!(
+            cb_off.toggled(),
+            Some(accesskit::Toggled::False),
+            "unchecked → Toggled::False"
+        );
+    }
+
+    #[test]
+    fn a11y_checked_should_update_on_signal() {
+        // A reactive `a11y_checked` re-resolves at paint, so a signal write flips the announced state
+        // (this is the whole point of #257 — the a11y state mirrors the widget signal). RK-005: serial
+        // + owner alive.
+        use crate::reactive::prelude::*;
+        use crate::reactive::{Owner, RwSignal, rx};
+
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(false);
+        let mut root = div()
+            .role(Role::CheckBox)
+            .a11y_checked(rx(move || value.get()))
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let theme = Theme::default();
+
+        let mut toggled = || {
+            let mut a11y = A11yTree::default();
+            let mut scene = Scene::new();
+            render_tree(
+                &mut root,
+                &mut arena,
+                &mut layout,
+                &mut text,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut a11y),
+                &mut scene,
+                Size { w: 50.0, h: 50.0 },
+                &damage,
+                &theme,
+            )
+            .unwrap();
+            a11y.build_update(&arena, None, 1.0)
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == accesskit::Role::CheckBox)
+                .and_then(|(_, n)| n.toggled())
+        };
+
+        assert_eq!(
+            toggled(),
+            Some(accesskit::Toggled::False),
+            "frame 1: unchecked"
+        );
+        value.set(true);
+        assert_eq!(
+            toggled(),
+            Some(accesskit::Toggled::True),
+            "frame 2: checked after the signal write"
+        );
+        drop(owner);
     }
 
     #[test]

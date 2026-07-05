@@ -10,7 +10,7 @@
 use kagari_base::{SharedString, Size};
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IntoElement, div};
+use kagari_core::{AnyElement, IntoElement, Role, div};
 use kagari_style::{ColorRole, Styled};
 
 use crate::control::{ControlSize, control_builders, control_root, switch_dims};
@@ -102,7 +102,7 @@ impl IntoElement for Switch {
         };
         track = track.child(spacer).child(knob_el);
 
-        control_root(value, size, disabled, label, track).into_element()
+        control_root(value, size, disabled, label, Role::Switch, track).into_element()
     }
 }
 

@@ -74,7 +74,11 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> IntoElement for RadioGroup<T>
 
         // `items_start` so each option row hugs its content (mark + label) instead of stretching to the
         // group's full width — otherwise the focus-ring border would frame the whole row width.
-        let mut group = div().flex_col().gap_2().items_start().role(Role::Group);
+        let mut group = div()
+            .flex_col()
+            .gap_2()
+            .items_start()
+            .role(Role::RadioGroup);
 
         // Arrow keys move the selection within the group (wrapping); the group is the focused node.
         if let Some(h) = &handle {
@@ -146,8 +150,17 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> IntoElement for RadioGroup<T>
             };
 
             // Option row: the focus-ring follows the selected option while the group is focused; a click
-            // selects this option and focuses the group (so subsequent arrows work).
-            let mut row = div().flex().items_center().gap_2().rounded_md();
+            // selects this option and focuses the group (so subsequent arrows work). a11y: each row is a
+            // `Radio` announcing its label + reactive selected state (#257), even when disabled.
+            let opt_a11y = opt_val.clone();
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .role(Role::Radio)
+                .a11y_label(label.clone())
+                .a11y_checked(rx(move || value.get() == opt_a11y));
             if let Some(h) = &handle {
                 let hring = h.clone();
                 let ovr = opt_val.clone();

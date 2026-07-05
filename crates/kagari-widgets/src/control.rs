@@ -122,9 +122,17 @@ pub(crate) fn control_root(
     size: ControlSize,
     disabled: bool,
     label: Option<SharedString>,
+    role: Role,
     indicator: Div,
 ) -> Div {
-    let mut root = div().flex().items_center().gap_2().role(Role::CheckBox);
+    // `a11y_checked` is reactive and set even when disabled — a disabled control still announces its
+    // on/off state to a screen reader (#257).
+    let mut root = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .role(role)
+        .a11y_checked(rx(move || value.get()));
     if let Some(l) = &label {
         root = root.a11y_label(l.clone());
     }
