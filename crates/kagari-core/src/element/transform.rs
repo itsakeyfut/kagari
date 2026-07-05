@@ -16,6 +16,28 @@ use crate::reactive::{Prop, create_effect};
 /// zero-area subtree. A caller asking for `<= 0` is clamped to this.
 const MIN_SCALE: f32 = 1.0e-3;
 
+/// Where a scale pivots (#266). The default [`WindowOrigin`](Self::WindowOrigin) is the legacy zoom pivot
+/// (paint-space origin); an [`Anchor`](Self::Anchor) makes the scale pivot about a point of the child's own
+/// laid-out box, so a widget can *pop* / *press* about its own center without moving off-place.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum TransformOrigin {
+    /// Scale about window `(0, 0)` — `map(p) = p·scale + offset`. The `offset` (pan) then positions the
+    /// result. This is the #221 / #237 zoom behavior and stays the default so zoom is unchanged.
+    #[default]
+    WindowOrigin,
+    /// Scale about a **normalized point of the child's laid-out box**: `(0,0)` = top-left, `(0.5,0.5)` =
+    /// center, `(1,1)` = bottom-right. Resolved to a window-space pivot from the child's absolute bounds at
+    /// paint, so the child grows/shrinks in place.
+    Anchor(Point),
+}
+
+impl TransformOrigin {
+    /// Pivot about the child's center — the common widget pop/press origin.
+    pub const CENTER: Self = TransformOrigin::Anchor(Point { x: 0.5, y: 0.5 });
+    /// Pivot about the child's top-left (the child's own origin).
+    pub const TOP_LEFT: Self = TransformOrigin::Anchor(Point { x: 0.0, y: 0.0 });
+}
+
 /// A subtree painted + hit-tested under a uniform scale + translate (#221). Build with [`transform`] and
 /// set `.scale(..)` / `.offset(..)` (static or reactive). The child lays out at base scale; the mapping
 /// is paint/hit only, so zoom never relayouts. Nesting composes (`outer(inner(p))`).
@@ -37,6 +59,8 @@ pub struct Transformed {
     /// Shared + `'static` so the effect can own a handle (mirrors `Scroll`'s `resolved_offset`).
     resolved_scale: Arc<Mutex<Option<f32>>>,
     resolved_offset: Arc<Mutex<Option<Point>>>,
+    /// Where the scale pivots (#266). Structural (not animated) → a plain value, not a `Prop`.
+    origin: TransformOrigin,
     id: Option<NodeId>,
     child_id: Option<NodeId>,
 }
@@ -49,6 +73,7 @@ pub fn transform(child: impl IntoElement) -> Transformed {
         offset: None,
         resolved_scale: Arc::new(Mutex::new(None)),
         resolved_offset: Arc::new(Mutex::new(None)),
+        origin: TransformOrigin::WindowOrigin,
         id: None,
         child_id: None,
     }
@@ -65,6 +90,14 @@ impl Transformed {
     /// Sets the pan offset (translate; static [`Point`] or reactive), applied after scaling.
     pub fn offset(mut self, offset: impl Into<Prop<Point>>) -> Self {
         self.offset = Some(offset.into());
+        self
+    }
+
+    /// Sets the scale pivot (#266). The default [`WindowOrigin`](TransformOrigin::WindowOrigin) keeps the
+    /// legacy zoom behavior; [`CENTER`](TransformOrigin::CENTER) makes a scale pop/press about the child's
+    /// own center. Structural (not animated), so it takes a plain value — only `scale`/`offset` are reactive.
+    pub fn origin(mut self, origin: TransformOrigin) -> Self {
+        self.origin = origin;
         self
     }
 
@@ -124,21 +157,38 @@ impl Transformed {
         }
     }
 
-    /// The current transform (resolved scale/offset; identity defaults when unset).
-    fn current_transform(&self) -> Transform {
+    /// The paint transform (resolved scale + offset) with the [`origin`](Self::origin) applied against the
+    /// child's absolute `child_bounds`. For [`WindowOrigin`](TransformOrigin::WindowOrigin) this is the
+    /// legacy `p·scale + offset`; for an [`Anchor`](TransformOrigin::Anchor) the scale pivots about the
+    /// anchor point of the child's box (`(p − pivot)·scale + pivot = p·scale + pivot·(1 − scale)`), so the
+    /// child grows/shrinks in place — plus any user offset. Identity defaults when scale/offset are unset.
+    fn effective_transform(&self, child_bounds: Rect) -> Transform {
         let scale = self
             .resolved_scale
             .lock()
             .ok()
             .and_then(|s| *s)
             .unwrap_or(1.0);
-        let offset = self
+        let user = self
             .resolved_offset
             .lock()
             .ok()
             .and_then(|o| *o)
             .unwrap_or(Point::new(0.0, 0.0));
-        Transform::new(scale, offset)
+        match self.origin {
+            TransformOrigin::WindowOrigin => Transform::new(scale, user),
+            TransformOrigin::Anchor(frac) => {
+                let pivot = Point::new(
+                    child_bounds.origin.x + frac.x * child_bounds.size.w,
+                    child_bounds.origin.y + frac.y * child_bounds.size.h,
+                );
+                let offset = Point::new(
+                    pivot.x * (1.0 - scale) + user.x,
+                    pivot.y * (1.0 - scale) + user.y,
+                );
+                Transform::new(scale, offset)
+            }
+        }
     }
 }
 
@@ -182,9 +232,9 @@ impl Element for Transformed {
         let Some(child_id) = self.child_id else {
             return;
         };
-        let t = self.current_transform();
         // Paint the child at its base (untransformed) absolute bounds (RK-007: parent origin + child
-        // local origin); `push_transform` maps its emitted primitives + hit regions on pop.
+        // local origin); `push_transform` maps its emitted primitives + hit regions on pop. The transform
+        // is resolved against these absolute bounds so an anchored (#266) scale can pivot about the child.
         let local = cx.layout.layout(child_id);
         let child_bounds = Rect {
             origin: Point {
@@ -193,6 +243,7 @@ impl Element for Transformed {
             },
             size: local.size,
         };
+        let t = self.effective_transform(child_bounds);
         cx.push_transform(t);
         if let Some(child) = self.child.as_mut() {
             child.paint(child_bounds, cx);
@@ -284,6 +335,35 @@ mod tests {
         assert_eq!(
             q.content_mask.rect.size.w, 40.0,
             "the content mask is scaled with the quad"
+        );
+    }
+
+    #[test]
+    fn transformed_should_scale_about_center_origin() {
+        // A 20x20 green quad at the origin (center (10,10)) under scale=0.5 with origin CENTER shrinks
+        // *about its center* → a 10x10 quad centered at (10,10) = bounds (5,5,10,10). Contrast the default
+        // WindowOrigin, which pins the top-left → (0,0,10,10). This proves the anchor pivot (#266).
+        let mut centered = transform(div().size(Size { w: 20.0, h: 20.0 }).background(green()))
+            .scale(0.5)
+            .origin(TransformOrigin::CENTER)
+            .into_element();
+        let (scene, _hit) = build_paint(&mut centered, Size { w: 200.0, h: 200.0 });
+        assert_eq!(
+            scene.quads[0].bounds,
+            Rect::from_xywh(5.0, 5.0, 10.0, 10.0),
+            "center-origin scale shrinks about the child's center (10,10)"
+        );
+
+        // Default (WindowOrigin) scales about window (0,0): same size, but pinned at the top-left.
+        let mut window_origin =
+            transform(div().size(Size { w: 20.0, h: 20.0 }).background(green()))
+                .scale(0.5)
+                .into_element();
+        let (scene, _hit) = build_paint(&mut window_origin, Size { w: 200.0, h: 200.0 });
+        assert_eq!(
+            scene.quads[0].bounds,
+            Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            "the default WindowOrigin pins the top-left (legacy zoom behavior)"
         );
     }
 

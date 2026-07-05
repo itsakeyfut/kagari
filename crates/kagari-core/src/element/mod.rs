@@ -25,7 +25,7 @@ pub use icon::{Icon, icon};
 pub use overlay::{AnchorHandle, Overlay, Placement, overlay};
 pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};
-pub use transform::{Transformed, transform};
+pub use transform::{TransformOrigin, Transformed, transform};
 pub use virtualized::{VirtualizedList, virtualized_list};
 
 use kagari_base::{NodeId, Rect};

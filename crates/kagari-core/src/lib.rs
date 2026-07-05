@@ -31,8 +31,8 @@ pub use app::{App, Decorations, WindowOptions};
 pub use bridge::UiProxy;
 pub use damage::DamageState;
 pub use element::{
-    AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, Transformed,
-    div, icon, overlay, scroll, text, transform, virtualized_list,
+    AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, TransformOrigin,
+    Transformed, div, icon, overlay, scroll, text, transform, virtualized_list,
 };
 pub use error::AppError;
 pub use event::{
