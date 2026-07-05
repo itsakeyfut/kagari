@@ -10,7 +10,7 @@
 use kagari_base::{SharedString, Size};
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IconId, IntoElement, div, icon};
+use kagari_core::{AnyElement, IconId, IntoElement, Role, div, icon};
 use kagari_style::{ColorRole, Styled};
 
 use crate::control::{
@@ -102,7 +102,7 @@ impl IntoElement for Checkbox {
                 );
         }
 
-        control_root(value, size, disabled, label, boxed).into_element()
+        control_root(value, size, disabled, label, Role::CheckBox, boxed).into_element()
     }
 }
 

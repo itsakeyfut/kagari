@@ -95,6 +95,10 @@ pub struct Div {
     /// sink at paint (with the node's absolute bounds) when set, so the derived accesskit tree carries
     /// this element. `None` = not exposed to accessibility.
     a11y: Option<A11y>,
+    /// The reactive toggle/selection state (#257): a static or reactive `bool` resolved at paint into
+    /// [`A11y::checked`], so a control's a11y state mirrors its signal (checkbox/switch/radio).
+    a11y_checked: Option<Prop<bool>>,
+    resolved_a11y_checked: Arc<Mutex<Option<bool>>>,
 }
 
 /// Creates an empty [`Div`].
@@ -126,6 +130,8 @@ pub fn div() -> Div {
         cursor: None,
         anchor_handle: None,
         a11y: None,
+        a11y_checked: None,
+        resolved_a11y_checked: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -424,6 +430,17 @@ impl Div {
         self
     }
 
+    /// Sets this element's toggle/selection state (#257) — a static or reactive `bool` announced to a
+    /// screen reader (checkbox/switch checked, radio selected). Reactive so it mirrors the control's
+    /// signal: resolved at paint into the recorded a11y state, like the #245 role props. Also exposes
+    /// the element (default role [`Role::Label`]) if no [`role`](Self::role) was set, so the recorded
+    /// node carries the state.
+    pub fn a11y_checked(mut self, checked: impl Into<Prop<bool>>) -> Self {
+        self.a11y_mut();
+        self.a11y_checked = Some(checked.into());
+        self
+    }
+
     /// Resolves the background prop into `resolved_bg`. A static prop writes its value once; a
     /// reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure,
     /// writes the cell, and flags paint-damage for `id` — the #35 hook.
@@ -497,6 +514,41 @@ impl Div {
 
     fn current_bg_role(&self) -> Option<ColorRole> {
         self.resolved_bg_role.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Resolves the reactive `a11y_checked` prop into `resolved_a11y_checked` (#257) — same paint-dirty
+    /// effect discipline as [`bind_bg_role`](Self::bind_bg_role). `paint` injects the resolved value into
+    /// the recorded [`A11y::checked`], so a toggle repaints and the accesskit tree re-derives with the
+    /// new state.
+    fn bind_a11y_checked(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.a11y_checked.take() {
+            Some(Prop::Static(checked)) => {
+                if let Ok(mut slot) = self.resolved_a11y_checked.lock() {
+                    *slot = Some(checked);
+                }
+            }
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_a11y_checked);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let checked = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != Some(checked) {
+                            *slot = Some(checked);
+                            damage.mark_paint_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn current_a11y_checked(&self) -> Option<bool> {
+        self.resolved_a11y_checked
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
     }
 
     /// Resolves the *optional* border-color-**role** prop into `resolved_border_role` (#245). Same
@@ -633,6 +685,7 @@ impl Element for Div {
                 self.bind_background(&cx.damage, id);
                 self.bind_bg_role(&cx.damage, id);
                 self.bind_border_role(&cx.damage, id);
+                self.bind_a11y_checked(&cx.damage, id);
                 self.bind_size(&cx.damage, id);
                 // Record this focus target's FocusId → NodeId so keyboard dispatch / focus-within
                 // can resolve the focused node (#49). No-op when no registry is attached (the app
@@ -823,7 +876,11 @@ impl Element for Div {
         // accesskit tree carries it with laid-out geometry. No-op when this div has no a11y info or
         // no a11y sink is attached (GPU-free tests / the paths before live wiring).
         if let (Some(a11y), Some(id)) = (&self.a11y, self.id) {
-            cx.record_a11y(id, a11y.clone(), bounds);
+            // Inject the reactive toggle state (#257) resolved this frame — `A11y::checked` is not set
+            // at build, only here at paint, so it mirrors the control's current signal.
+            let mut a11y = a11y.clone();
+            a11y.checked = self.current_a11y_checked();
+            cx.record_a11y(id, a11y, bounds);
         }
 
         // Paint each child at its absolute bounds. `LayoutTree::layout` returns parent-relative
