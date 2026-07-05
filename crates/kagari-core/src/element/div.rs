@@ -9,6 +9,7 @@ use kagari_style::{ColorRole, SpacingStep, Style, Styled, Theme};
 
 use crate::a11y::{A11y, Role};
 
+use super::reactive_prop::ReactiveProp;
 use super::{
     AnchorHandle, AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx,
 };
@@ -32,26 +33,22 @@ pub struct Div {
     layout: LayoutStyle,
     /// Recorded Tailwind-style tokens (resolved against the theme at layout/paint).
     style: Style,
-    bg: Option<Prop<Background>>,
+    /// Background (raw color): a reactive prop resolved to a paint slot (#251). Read by `paint`.
+    bg: ReactiveProp<Background>,
     /// Assigned on the first `request_layout`; the build-once rebuild lifecycle is #32.
     id: Option<NodeId>,
     /// Child node ids in `children` order, assigned at build; `paint` reads each child's bounds
     /// from the layout tree by id.
     child_ids: Vec<NodeId>,
-    /// Resolved background: written by the bound reactive effect (or once, for a static prop),
-    /// read by `paint`. Shared + `'static` so the effect can own a handle to it.
-    resolved_bg: Arc<Mutex<Option<Background>>>,
     /// Semantic background **role** (static or reactive, #245) — the theme-reactive counterpart of
     /// `bg`: the effect resolves the *role* (not the color) and flags paint-dirty; `paint` resolves
     /// role → color via `cx.theme`, so it follows both a signal (state) and a theme swap. Takes
     /// precedence over the raw `bg` when set. Bound by [`Styled::bg`]-style `.bg(role)` / `.bg(rx(..))`.
-    bg_role: Option<Prop<ColorRole>>,
-    resolved_bg_role: Arc<Mutex<Option<ColorRole>>>,
+    bg_role: ReactiveProp<ColorRole>,
     /// Semantic border-color **role**, *optional* so it can vanish (e.g. a focus ring shown only while
     /// focused): the resolved value is `Option<ColorRole>` — `None` = no border this frame. Paired with
     /// the static `border_width` token; resolved to a color at paint via `cx.theme`. Paint-dirty (#245).
-    border_role: Option<Prop<Option<ColorRole>>>,
-    resolved_border_role: Arc<Mutex<Option<Option<ColorRole>>>>,
+    border_role: ReactiveProp<Option<ColorRole>>,
     /// Raw/reactive fixed size (#146). A reactive size's bind effect flags **layout-dirty** (vs `bg`'s
     /// paint-dirty), so a signal-driven size change triggers relayout.
     size: Option<Prop<Size>>,
@@ -96,9 +93,8 @@ pub struct Div {
     /// this element. `None` = not exposed to accessibility.
     a11y: Option<A11y>,
     /// The reactive toggle/selection state (#257): a static or reactive `bool` resolved at paint into
-    /// [`A11y::checked`], so a control's a11y state mirrors its signal (checkbox/switch/radio).
-    a11y_checked: Option<Prop<bool>>,
-    resolved_a11y_checked: Arc<Mutex<Option<bool>>>,
+    /// the recorded a11y state, so a control's a11y state mirrors its signal (checkbox/switch/radio).
+    a11y_checked: ReactiveProp<bool>,
 }
 
 /// Creates an empty [`Div`].
@@ -107,14 +103,11 @@ pub fn div() -> Div {
         children: Vec::new(),
         layout: LayoutStyle::default(),
         style: Style::default(),
-        bg: None,
+        bg: ReactiveProp::default(),
         id: None,
         child_ids: Vec::new(),
-        resolved_bg: Arc::new(Mutex::new(None)),
-        bg_role: None,
-        resolved_bg_role: Arc::new(Mutex::new(None)),
-        border_role: None,
-        resolved_border_role: Arc::new(Mutex::new(None)),
+        bg_role: ReactiveProp::default(),
+        border_role: ReactiveProp::default(),
         size: None,
         resolved_size: Arc::new(Mutex::new(None)),
         applied_layout: None,
@@ -130,8 +123,7 @@ pub fn div() -> Div {
         cursor: None,
         anchor_handle: None,
         a11y: None,
-        a11y_checked: None,
-        resolved_a11y_checked: Arc::new(Mutex::new(None)),
+        a11y_checked: ReactiveProp::default(),
     }
 }
 
@@ -164,7 +156,7 @@ impl Div {
     /// literal color/gradient or a signal-driven background; use `.bg(role)` for theme tokens.
     /// **Damage kind: paint-dirty** (appearance only, no relayout — contrast [`size`](Self::size)).
     pub fn background(mut self, bg: impl Into<Prop<Background>>) -> Self {
-        self.bg = Some(bg.into());
+        self.bg.set(bg);
         self
     }
 
@@ -173,7 +165,7 @@ impl Div {
     /// `.bg(rx(move || if h.is_focused() { .. } else { .. }))` re-resolves on the signal. The role
     /// (not a raw color) is stored, so a theme swap still re-resolves it at paint. **Damage: paint-dirty.**
     pub fn bg(mut self, role: impl Into<Prop<ColorRole>>) -> Self {
-        self.bg_role = Some(role.into());
+        self.bg_role.set(role);
         self
     }
 
@@ -184,7 +176,7 @@ impl Div {
     /// costs no layout and shifts no content. Takes **precedence** over the always-on
     /// [`Styled::border`](kagari_style::Styled::border) when both are set. **Damage: paint-dirty.**
     pub fn border_color(mut self, role: impl Into<Prop<Option<ColorRole>>>) -> Self {
-        self.border_role = Some(role.into());
+        self.border_role.set(role);
         self
     }
 
@@ -437,157 +429,13 @@ impl Div {
     /// node carries the state.
     pub fn a11y_checked(mut self, checked: impl Into<Prop<bool>>) -> Self {
         self.a11y_mut();
-        self.a11y_checked = Some(checked.into());
+        self.a11y_checked.set(checked);
         self
     }
 
-    /// Resolves the background prop into `resolved_bg`. A static prop writes its value once; a
-    /// reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure,
-    /// writes the cell, and flags paint-damage for `id` — the #35 hook.
-    ///
-    /// The effect is registered **once** at build (the prop closure is moved into it) and stays
-    /// alive via its signal subscription; it is owner-scoped to the *current* ambient owner (the
-    /// App root in #36). Per-node owners — so a removed node disposes its effect — and the real
-    /// damage tracking arrive with #32/#35; see RK-005.
-    fn bind_background(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
-        match self.bg.take() {
-            Some(Prop::Static(bg)) => self.store_bg(bg),
-            Some(Prop::Reactive(read)) => {
-                let cell = Arc::clone(&self.resolved_bg);
-                let damage = Arc::clone(damage);
-                create_effect(move || {
-                    let bg = read();
-                    if let Ok(mut slot) = cell.lock() {
-                        // Only flag damage when the resolved value actually changed: a plain
-                        // signal re-runs subscribers even on an equal-value write, and idle
-                        // re-paints violate the damage discipline (design.md §9).
-                        if *slot != Some(bg) {
-                            *slot = Some(bg);
-                            damage.mark_paint_dirty(id);
-                        }
-                    }
-                });
-            }
-            None => {}
-        }
-    }
-
-    fn store_bg(&self, bg: Background) {
-        if let Ok(mut slot) = self.resolved_bg.lock() {
-            *slot = Some(bg);
-        }
-    }
-
-    fn current_bg(&self) -> Option<Background> {
-        self.resolved_bg.lock().ok().and_then(|slot| *slot)
-    }
-
-    /// Resolves the background-**role** prop into `resolved_bg_role` (#245) — the theme-reactive
-    /// counterpart of [`bind_background`](Self::bind_background). A static prop writes the role once;
-    /// a reactive prop registers a synchronous effect (ADR 0001) that re-resolves the closure and,
-    /// only when the *role* changed (design.md §9), writes the cell and flags **paint**-dirty. The
-    /// role → color resolution happens later, in `paint` against `cx.theme`, so both a state signal
-    /// and a theme swap are reflected.
-    fn bind_bg_role(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
-        match self.bg_role.take() {
-            Some(Prop::Static(role)) => {
-                if let Ok(mut slot) = self.resolved_bg_role.lock() {
-                    *slot = Some(role);
-                }
-            }
-            Some(Prop::Reactive(read)) => {
-                let cell = Arc::clone(&self.resolved_bg_role);
-                let damage = Arc::clone(damage);
-                create_effect(move || {
-                    let role = read();
-                    if let Ok(mut slot) = cell.lock() {
-                        if *slot != Some(role) {
-                            *slot = Some(role);
-                            damage.mark_paint_dirty(id);
-                        }
-                    }
-                });
-            }
-            None => {}
-        }
-    }
-
-    fn current_bg_role(&self) -> Option<ColorRole> {
-        self.resolved_bg_role.lock().ok().and_then(|slot| *slot)
-    }
-
-    /// Resolves the reactive `a11y_checked` prop into `resolved_a11y_checked` (#257) — same paint-dirty
-    /// effect discipline as [`bind_bg_role`](Self::bind_bg_role). `paint` injects the resolved value into
-    /// the recorded [`A11y::checked`], so a toggle repaints and the accesskit tree re-derives with the
-    /// new state.
-    fn bind_a11y_checked(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
-        match self.a11y_checked.take() {
-            Some(Prop::Static(checked)) => {
-                if let Ok(mut slot) = self.resolved_a11y_checked.lock() {
-                    *slot = Some(checked);
-                }
-            }
-            Some(Prop::Reactive(read)) => {
-                let cell = Arc::clone(&self.resolved_a11y_checked);
-                let damage = Arc::clone(damage);
-                create_effect(move || {
-                    let checked = read();
-                    if let Ok(mut slot) = cell.lock() {
-                        if *slot != Some(checked) {
-                            *slot = Some(checked);
-                            damage.mark_paint_dirty(id);
-                        }
-                    }
-                });
-            }
-            None => {}
-        }
-    }
-
-    fn current_a11y_checked(&self) -> Option<bool> {
-        self.resolved_a11y_checked
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-    }
-
-    /// Resolves the *optional* border-color-**role** prop into `resolved_border_role` (#245). Same
-    /// paint-dirty effect discipline as [`bind_bg_role`](Self::bind_bg_role); the resolved value is an
-    /// `Option<ColorRole>` (`None` = no border this frame), stored behind an outer `Option` (`None` =
-    /// never resolved). `paint` flattens it via [`current_border_role`](Self::current_border_role).
-    fn bind_border_role(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
-        match self.border_role.take() {
-            Some(Prop::Static(role)) => {
-                if let Ok(mut slot) = self.resolved_border_role.lock() {
-                    *slot = Some(role);
-                }
-            }
-            Some(Prop::Reactive(read)) => {
-                let cell = Arc::clone(&self.resolved_border_role);
-                let damage = Arc::clone(damage);
-                create_effect(move || {
-                    let role = read();
-                    if let Ok(mut slot) = cell.lock() {
-                        if *slot != Some(role) {
-                            *slot = Some(role);
-                            damage.mark_paint_dirty(id);
-                        }
-                    }
-                });
-            }
-            None => {}
-        }
-    }
-
-    fn current_border_role(&self) -> Option<ColorRole> {
-        self.resolved_border_role
-            .lock()
-            .ok()
-            .and_then(|slot| slot.flatten())
-    }
-
-    /// Resolves the size prop into `resolved_size` (#146), the **layout-dirty** counterpart of
-    /// [`bind_background`](Self::bind_background). A static prop writes the cell once; a reactive prop
+    /// Resolves the size prop into `resolved_size` (#146), the **layout-dirty** counterpart of the
+    /// paint-dirty [`ReactiveProp`](super::reactive_prop::ReactiveProp) bindings — kept separate here
+    /// because a size change needs relayout, not just a repaint. A static prop writes the cell once; a reactive prop
     /// registers a synchronous effect (ADR 0001) that re-resolves the closure and — only when the
     /// value changed (design.md §9) — writes the cell and flags **layout**-damage for `id`. The new
     /// size reaches taffy on the next `request_layout` via the dedup `set_style` path (#43); the
@@ -682,10 +530,10 @@ impl Element for Div {
                 let id = cx.arena.insert(Node::default());
                 self.id = Some(id);
                 cx.layout.insert(id, None);
-                self.bind_background(&cx.damage, id);
-                self.bind_bg_role(&cx.damage, id);
-                self.bind_border_role(&cx.damage, id);
-                self.bind_a11y_checked(&cx.damage, id);
+                self.bg.bind(&cx.damage, id);
+                self.bg_role.bind(&cx.damage, id);
+                self.border_role.bind(&cx.damage, id);
+                self.a11y_checked.bind(&cx.damage, id);
                 self.bind_size(&cx.damage, id);
                 // Record this focus target's FocusId → NodeId so keyboard dispatch / focus-within
                 // can resolve the focused node (#49). No-op when no registry is attached (the app
@@ -789,16 +637,19 @@ impl Element for Div {
         // generic `impl Styled` caller of `Styled::bg` (which writes `paint.bg`) — the inherent
         // `Div::bg` shadows it and writes `bg_role`, so direct Div callers never hit `paint.bg`.
         let bg = self
-            .current_bg_role()
+            .bg_role
+            .current()
             .or(self.style.paint.bg)
             .map(|role| Background::Solid(cx.theme.resolve_color(role)))
-            .or_else(|| self.current_bg());
+            .or_else(|| self.bg.current());
         // Border (#245): the optional border-color role (reactive/static; `None` = no border this
         // frame) resolved to a color, plus the `border_w_*` width token. The border is drawn inset,
         // reusing the quad's per-edge border — so its width is applied only when a color is present
         // (an unfocused focus ring adds no inset), and it costs no layout / shifts no content.
         let border_color = self
-            .current_border_role()
+            .border_role
+            .current()
+            .flatten()
             .or(self.style.paint.border_color)
             .map(|role| cx.theme.resolve_color(role));
         let border_width = self
@@ -879,7 +730,7 @@ impl Element for Div {
             // Inject the reactive toggle state (#257) resolved this frame — `A11y::checked` is not set
             // at build, only here at paint, so it mirrors the control's current signal.
             let mut a11y = a11y.clone();
-            a11y.checked = self.current_a11y_checked();
+            a11y.checked = self.a11y_checked.current();
             cx.record_a11y(id, a11y, bounds);
         }
 
