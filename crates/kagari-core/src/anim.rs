@@ -17,7 +17,7 @@ use kagari_base::{Color, Point, Size};
 
 use crate::reactive::prelude::*;
 use crate::reactive::{RwSignal, use_context};
-use crate::scheduler::ActiveSources;
+use crate::scheduler::{ActiveSources, Tickable, Ticker};
 
 /// Convergence threshold on both the value-to-target distance and the velocity magnitude.
 const EPS: f32 = 0.001;
@@ -167,6 +167,11 @@ struct Inner<T> {
     elapsed: Duration,
     /// Whether a scheduler active source is currently registered.
     animating: bool,
+    /// Whether a live tick entry for this animation is in the [`Ticker`] (#253). Distinct from
+    /// `animating`: a `snap_to` clears `animating` but leaves the entry pending (the `Ticker` has no
+    /// remove — it is pruned when `tick` next returns `false`). This flag stops a retarget in that window
+    /// from registering a **duplicate** entry that would double-drive the value.
+    ticker_registered: bool,
 }
 
 /// A spring/easing-driven, retargetable value, signal-backed for reactive reads (#59). Build with
@@ -178,6 +183,10 @@ pub struct Animated<T: Animatable + Send + Sync + 'static> {
     inner: Arc<Mutex<Inner<T>>>,
     /// The scheduler active-source handle captured from context at build (`None` if unprovided).
     active: Option<ActiveSources>,
+    /// The per-window ticker captured from context at build (#253); `None` if unprovided (no App / a
+    /// test). On the rest→animating transition the animation registers itself so the app's redraw drives
+    /// its [`tick`](Self::tick) each frame.
+    ticker: Option<Ticker>,
 }
 
 impl<T: Animatable + Send + Sync + 'static> Animated<T> {
@@ -200,8 +209,33 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
                 start: initial,
                 elapsed: Duration::ZERO,
                 animating: false,
+                ticker_registered: false,
             })),
             active: use_context::<ActiveSources>(),
+            ticker: use_context::<Ticker>(),
+        }
+    }
+
+    /// Registers this animation as running — a scheduler active source (continuous redraw) when it was at
+    /// rest (`start_active`), plus a [`Ticker`] entry when one is not already live (`register_ticker`).
+    /// Called after releasing the `inner` lock (#253).
+    fn register_running(&self, start_active: bool, register_ticker: bool) {
+        if start_active {
+            if let Some(active) = &self.active {
+                active.register();
+            }
+        }
+        if register_ticker {
+            if let Some(ticker) = &self.ticker {
+                // Store a **ticker-less** clone: the entry only needs to `tick` (advance the shared
+                // `inner`/value and release the active source), never to re-register. Keeping the `Ticker`
+                // here would make the registry `Vec` strongly reference the very `Arc<Mutex<Vec>>` that
+                // holds it — a self-cycle that leaks the whole registry (Vec + entries + inners) if the
+                // window closes mid-animation.
+                let mut running = self.clone();
+                running.ticker = None;
+                ticker.register(Box::new(running));
+            }
         }
     }
 
@@ -231,20 +265,22 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
     /// restarts from the current value. Starting (from rest) registers a scheduler active source.
     pub fn set_target(&self, target: T) {
         let current = self.value.get_untracked();
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        inner.target = target;
-        if let AnimationSpec::Easing { .. } = inner.spec {
-            inner.start = current;
-            inner.elapsed = Duration::ZERO;
-        }
-        if !inner.animating {
-            inner.animating = true;
-            if let Some(active) = &self.active {
-                active.register();
+        let (start_active, register_ticker) = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.target = target;
+            if let AnimationSpec::Easing { .. } = inner.spec {
+                inner.start = current;
+                inner.elapsed = Duration::ZERO;
             }
-        }
+            let start_active = !inner.animating;
+            inner.animating = true;
+            let register_ticker = !inner.ticker_registered;
+            inner.ticker_registered = true;
+            (start_active, register_ticker)
+        };
+        self.register_running(start_active, register_ticker);
     }
 
     /// Seeds the spring with an initial `velocity` (a fling / throw) and aims at `target`, registering
@@ -252,20 +288,22 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
     /// velocity, this *sets* the velocity — a release velocity carries the motion forward before it
     /// settles. A no-op for an easing spec (velocity is meaningless there; use `set_target`).
     pub fn fling(&self, velocity: T, target: T) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        if !matches!(inner.spec, AnimationSpec::Spring { .. }) {
-            return;
-        }
-        inner.target = target;
-        inner.velocity = velocity;
-        if !inner.animating {
-            inner.animating = true;
-            if let Some(active) = &self.active {
-                active.register();
+        let (start_active, register_ticker) = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            if !matches!(inner.spec, AnimationSpec::Spring { .. }) {
+                return;
             }
-        }
+            inner.target = target;
+            inner.velocity = velocity;
+            let start_active = !inner.animating;
+            inner.animating = true;
+            let register_ticker = !inner.ticker_registered;
+            inner.ticker_registered = true;
+            (start_active, register_ticker)
+        };
+        self.register_running(start_active, register_ticker);
     }
 
     /// Snaps immediately to `value` without animating: stops a running spring/tween, clears velocity,
@@ -301,6 +339,9 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
                 return false;
             };
             if !inner.animating {
+                // A settled/snapped entry the `Ticker` is about to prune (this `tick` returns `false`):
+                // clear the flag so a later retarget registers a fresh entry.
+                inner.ticker_registered = false;
                 return false;
             }
             let x = self.value.get_untracked();
@@ -321,6 +362,8 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
                     };
                     if done {
                         inner.animating = false;
+                        // Converged: the `Ticker` will drop this entry (`tick` returns `false`).
+                        inner.ticker_registered = false;
                     }
                     (if done { inner.target } else { nx }, done)
                 }
@@ -331,6 +374,8 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
                     let done = inner.elapsed >= duration;
                     if done {
                         inner.animating = false;
+                        // Converged: the `Ticker` will drop this entry (`tick` returns `false`).
+                        inner.ticker_registered = false;
                     }
                     let value = if done {
                         inner.target
@@ -349,6 +394,12 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
             }
         }
         !converged
+    }
+}
+
+impl<T: Animatable + Send + Sync + 'static> Tickable for Animated<T> {
+    fn tick(&self, dt: Duration) -> bool {
+        Animated::tick(self, dt)
     }
 }
 
@@ -538,6 +589,127 @@ mod tests {
             Color::new(0.5, 0.5, 0.5, 1.0),
             "the midpoint is the linear average"
         );
+    }
+
+    #[test]
+    fn animated_should_advance_via_context_ticker() {
+        // The #253 path: with a `Ticker` in context, `set_target` registers the animation and the
+        // ticker's `tick_all` (the app's frame loop) drives it to the target — no manual `tick()`.
+        let owner = Owner::new();
+        owner.set();
+
+        let ticker = Ticker::new();
+        provide_context(ticker.clone());
+        let anim = Animated::new(0.0_f32, spring());
+        anim.set_target(100.0);
+        assert_eq!(
+            anim.get_untracked(),
+            0.0,
+            "not advanced until the ticker runs"
+        );
+
+        ticker.tick_all(frame());
+        assert!(
+            anim.get_untracked() > 0.0,
+            "the ticker advances the animation toward its target"
+        );
+
+        let mut ticks = 0;
+        while (anim.get_untracked() - 100.0).abs() > 0.1 {
+            ticker.tick_all(frame());
+            ticks += 1;
+            assert!(
+                ticks < 10_000,
+                "the context ticker drives it in bounded time"
+            );
+        }
+        // Settled: the ticker dropped the converged animation, so further ticks leave it at the target.
+        for _ in 0..5 {
+            ticker.tick_all(frame());
+        }
+        assert!(
+            (anim.get_untracked() - 100.0).abs() <= 0.1,
+            "the ticker drove it to the target and leaves it there once settled: {}",
+            anim.get_untracked()
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn animated_ticker_drive_should_release_active_source_on_settle() {
+        // The app wiring (#253): both a `Ticker` and an `ActiveSources` in context. Driving to settle
+        // via the ticker must release the active source so the window returns to idle. Guards the
+        // QA-bug class — the two must be provided *and* stay in sync (the ticker's prune ↔ the count).
+        let owner = Owner::new();
+        owner.set();
+
+        let ticker = Ticker::new();
+        let sources = ActiveSources::new();
+        provide_context(ticker.clone());
+        provide_context(sources.clone());
+
+        let anim = Animated::new(0.0_f32, spring());
+        anim.set_target(100.0);
+        assert_eq!(sources.count(), 1, "set_target registers an active source");
+
+        let mut ticks = 0;
+        while sources.count() > 0 {
+            ticker.tick_all(frame());
+            ticks += 1;
+            assert!(
+                ticks < 10_000,
+                "the ticker drives it to settle in bounded time"
+            );
+        }
+        assert!(
+            (anim.get_untracked() - 100.0).abs() <= 0.1,
+            "reached the target before releasing"
+        );
+        // Idle: a further frame keeps the count at zero (no redraw would be requested).
+        ticker.tick_all(frame());
+        assert_eq!(sources.count(), 0, "stays released once settled");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn animated_snap_then_retarget_should_not_double_register() {
+        // Regression (#253): `snap_to` clears `animating` but leaves the ticker entry pending prune; a
+        // retarget before the next `tick_all` must NOT register a *second* entry, or `tick_all` would
+        // advance the shared value twice per frame (2× speed). Verify one frame advances by a single
+        // spring step.
+
+        // Reference: one spring step from 0 → 100 with no ticker (a plain manual tick).
+        let reference = {
+            let owner = Owner::new();
+            owner.set();
+            let a = Animated::new(0.0_f32, spring());
+            a.set_target(100.0);
+            a.tick(frame());
+            let v = a.get_untracked();
+            drop(owner);
+            v
+        };
+
+        let owner = Owner::new();
+        owner.set();
+        let ticker = Ticker::new();
+        provide_context(ticker.clone());
+
+        let anim = Animated::new(0.0_f32, spring());
+        anim.set_target(100.0); // registers ticker entry #1
+        anim.snap_to(0.0); // clears `animating`; entry #1 still pending prune
+        anim.set_target(100.0); // retarget before any tick_all — must NOT push a duplicate
+
+        ticker.tick_all(frame()); // a single entry → exactly one spring step
+        let advanced = anim.get_untracked();
+        assert!(
+            (advanced - reference).abs() < 1e-3,
+            "snap+retarget advances by a single tick, not doubled: got {advanced}, single-step ref {reference}"
+        );
+
+        drop(owner);
     }
 
     #[test]

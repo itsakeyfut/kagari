@@ -6,8 +6,15 @@ use kagari_base::{Px, SharedString};
 use kagari_core::element::Div;
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{KeyCode, Role, div, text, use_focus_handle};
+use kagari_core::{AnimationSpec, KeyCode, Role, div, text, use_focus_handle};
 use kagari_style::{ColorRole, Styled};
+
+/// The spring for control transitions (#253) — snappy and near-critically-damped so a toggle (switch
+/// knob slide, checkbox check pop) settles quickly with only a subtle overshoot.
+pub(crate) const CONTROL_SPRING: AnimationSpec = AnimationSpec::Spring {
+    stiffness: 500.0,
+    damping: 40.0,
+};
 
 /// The size of an interactive control (button / input / checkbox / …), shared across kagari-widgets so a
 /// form's controls line up on one scale (D3). `Md` is the default.

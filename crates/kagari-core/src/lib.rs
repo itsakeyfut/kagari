@@ -49,4 +49,4 @@ pub use overlay::{OverlayEntry, OverlayLayer, OverlayLayers, OverlayRegistry};
 pub use persist::{
     KeymapOverrides, OverrideBinding, PersistedState, PersistenceService, WindowGeometry,
 };
-pub use scheduler::{ActiveSources, Scheduler};
+pub use scheduler::{ActiveSources, Scheduler, Tickable, Ticker};
