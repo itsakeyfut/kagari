@@ -3,22 +3,29 @@
 //! rasterizes it at the resolved physical size (crisp) and draws it tinted. Monochrome bundled icons
 //! are tintable by a semantic role (theme-reactive, #245) or a raw color.
 
+use std::sync::{Arc, Mutex};
+
 use kagari_base::{Color, Corners, NodeId, Px, Rect, Size};
 use kagari_layout::LayoutStyle;
 use kagari_render::{IconId, IconSprite, RoundedRect};
 use kagari_style::ColorRole;
 
 use super::reactive_prop::ReactiveProp;
-use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
-use crate::reactive::Prop;
+use crate::reactive::{Prop, create_effect};
 
 /// An icon leaf: a bundled [`IconId`] drawn at a square logical size, tinted by a semantic role (the
 /// default, [`ColorRole::Text`]) or a raw color. Build with [`icon`]; chain `.size(..)`,
 /// `.color_role(..)`, or `.color(..)`.
 pub struct Icon {
     icon: IconId,
-    size: Px,
+    /// Raw/reactive square logical size (#264). A reactive size's bind effect flags **layout-dirty**
+    /// (a size change needs relayout, not just a repaint — unlike the paint-dirty `color_role`).
+    size: Option<Prop<Px>>,
+    /// Resolved size: written by the bound reactive effect (or once, for a static prop), read by the
+    /// taffy measure each `compute`. Shared + `'static` so both the effect and the measure own a handle.
+    resolved_size: Arc<Mutex<Px>>,
     /// Raw tint fallback; used when no `color_role` is set. Multiplies the monochrome-white icon.
     color: Color,
     /// Semantic tint **role** (static or reactive, #245), resolved to a color at paint via `cx.theme`.
@@ -31,7 +38,8 @@ pub struct Icon {
 pub fn icon(icon: IconId) -> Icon {
     Icon {
         icon,
-        size: Px(16.0),
+        size: Some(Prop::Static(Px(16.0))),
+        resolved_size: Arc::new(Mutex::new(Px(16.0))),
         color: Color::new(1.0, 1.0, 1.0, 1.0),
         color_role: ReactiveProp::new(ColorRole::Text),
         id: None,
@@ -39,9 +47,11 @@ pub fn icon(icon: IconId) -> Icon {
 }
 
 impl Icon {
-    /// Sets the square logical size (both width and height).
-    pub fn size(mut self, size: Px) -> Self {
-        self.size = size;
+    /// Sets the square logical size (both width and height) — a static value or a reactive [`Prop`]
+    /// (#264). **Damage kind: layout-dirty**: a reactive size's bind effect writes the resolved cell and
+    /// marks the node layout-dirty, so a signal-driven size (e.g. an `Animated<f32>`) relayouts the icon.
+    pub fn size(mut self, size: impl Into<Prop<Px>>) -> Self {
+        self.size = Some(size.into());
         self
     }
 
@@ -59,6 +69,38 @@ impl Icon {
         self.color_role.clear();
         self
     }
+
+    /// Resolves the size prop into [`resolved_size`](Self::resolved_size) (#264), the **layout-dirty**
+    /// counterpart of the paint-dirty [`ReactiveProp`](super::reactive_prop::ReactiveProp) tint binding
+    /// — a size change needs relayout, not just a repaint (mirrors [`Div::bind_size`](super::div)). A
+    /// static prop writes the cell once; a reactive prop registers a synchronous effect (ADR 0001) that
+    /// re-reads the closure and — only when the value changed — writes the cell and flags **layout**-damage
+    /// for `id`. The new size reaches taffy on the next `compute` via the measure that reads the cell; the
+    /// `mark_layout_dirty` call is what wakes the scheduler so that frame runs. Registered once at build, so
+    /// the effect only re-fires on external signal writes, keeping the write serial with the frame loop (RK-009).
+    fn bind_size(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.size.take() {
+            Some(Prop::Static(px)) => {
+                if let Ok(mut slot) = self.resolved_size.lock() {
+                    *slot = px;
+                }
+            }
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_size);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let px = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != px {
+                            *slot = px;
+                            damage.mark_layout_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
 }
 
 impl Element for Icon {
@@ -70,13 +112,19 @@ impl Element for Icon {
         self.id = Some(id);
         cx.layout.insert(id, None);
         self.color_role.bind(&cx.damage, id);
+        self.bind_size(&cx.damage, id);
 
-        // A fixed square measure — the icon draws at the requested logical size regardless of content.
-        let size = Size {
-            w: self.size.0,
-            h: self.size.0,
-        };
-        cx.layout.set_measure(id, Box::new(move |_avail| size));
+        // A square measure that reads the resolved-size cell each `compute` — so a reactive size (bound
+        // above, which marks layout-dirty on change) relayouts the icon. The icon draws at its logical
+        // size regardless of content.
+        let cell = Arc::clone(&self.resolved_size);
+        cx.layout.set_measure(
+            id,
+            Box::new(move |_avail| {
+                let s = cell.lock().map(|g| g.0).unwrap_or(0.0);
+                Size { w: s, h: s }
+            }),
+        );
         cx.layout.set_style(id, &LayoutStyle::default());
         id
     }
@@ -241,6 +289,60 @@ mod tests {
             scene.icons[0].tint,
             theme.resolve_color(ColorRole::Danger),
             "the signal write re-resolves the tint role"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn icon_reactive_size_should_relayout_on_signal() {
+        // The #264 counterpart of the reactive-tint test: a reactive `.size` write must flag the node
+        // *layout*-dirty (not just paint) and change the icon's measured bounds on the next frame. The
+        // size signal is written *between* frames (serial with `render_tree`), never during it (RK-009).
+        let owner = Owner::new();
+        owner.set();
+        let theme = Theme::light();
+        let (read, write) = signal(10.0_f32);
+        let mut root = icon(IconId::Check)
+            .size(rx(move || Px(read.get())))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let frame = |root: &mut AnyElement,
+                     arena: &mut Arena,
+                     layout: &mut LayoutTree,
+                     text: &mut TextSystem| {
+            let mut scene = Scene::new();
+            render_tree(
+                root, arena, layout, text, None, None, None, None, None, None, &mut scene,
+                VIEWPORT, &damage, &theme,
+            )
+            .unwrap();
+            scene
+        };
+
+        let scene = frame(&mut root, &mut arena, &mut layout, &mut text);
+        assert_eq!(
+            scene.icons[0].bounds.size.w, 10.0,
+            "the icon measures at the reactive size (frame 1)"
+        );
+
+        write.set(24.0);
+        assert!(
+            damage.is_dirty(),
+            "the reactive size write flags damage (layout-dirty)"
+        );
+
+        let scene = frame(&mut root, &mut arena, &mut layout, &mut text);
+        assert_eq!(
+            scene.icons[0].bounds.size.w, 24.0,
+            "the signal write relayouts the icon to the new size (frame 2)"
+        );
+        assert_eq!(
+            scene.icons[0].bounds.size.h, 24.0,
+            "the reactive size is square"
         );
         drop(owner);
     }
