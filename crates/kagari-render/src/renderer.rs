@@ -13,7 +13,7 @@ use crate::quad::QuadRenderer;
 use crate::scene::{Batch, IconSprite, PolychromeSprite, PrimitiveKind, Scene};
 use crate::shadow::ShadowRenderer;
 use crate::sprite::SpriteRenderer;
-use crate::svg::{IconId, icon_key, rasterize_icon};
+use crate::svg::{IconCache, IconId, icon_key};
 use crate::underline::UnderlineRenderer;
 
 /// Owns the GPU resources for one window's rendering. The device/queue are shared
@@ -45,6 +45,9 @@ pub struct Renderer {
     /// start of each frame. Holds atlas coords (not GPU handles), so device-loss needs no rebuild — the
     /// RGBA atlas re-uploads its cached tiles, keeping the coords valid.
     assets: AssetLoader,
+    /// Parsed-SVG cache for bundled icons (#250): parses each `IconId` once and re-renders per px, so a
+    /// size-animated / zoomed icon does not re-parse every frame. CPU-side → device-loss-safe.
+    icon_cache: IconCache,
     /// Reused across frames so the per-frame painter's-order merge does not allocate
     /// (filled by `Scene::batches_into`; perf.md).
     batches: Vec<Batch>,
@@ -128,6 +131,7 @@ impl Renderer {
             rgba_atlas,
             rgba_atlas_bind,
             assets,
+            icon_cache: IconCache::new(),
             batches: Vec::new(),
         }
     }
@@ -161,7 +165,7 @@ impl Renderer {
     /// crisply. The icon is monochrome white — tint it via the `PolychromeSprite::tint`. A rasterization
     /// failure (not expected for a bundled icon) degrades to a transparent tile, never panics.
     pub fn icon_coord(&mut self, icon: IconId, px: u32) -> AtlasCoord {
-        icon_coord(&mut self.rgba_atlas, icon, px)
+        icon_coord(&mut self.rgba_atlas, &mut self.icon_cache, icon, px)
     }
 
     /// Resolves each deferred [`IconSprite`](crate::IconSprite) in `scene.icons` (#246) into a tinted
@@ -172,7 +176,7 @@ impl Renderer {
         for i in 0..scene.icons.len() {
             let req = scene.icons[i]; // `IconSprite: Copy` — the read releases the `scene.icons` borrow.
             let px = icon_px(req.bounds.size.h, scale);
-            let tex = icon_coord(&mut self.rgba_atlas, req.icon, px);
+            let tex = icon_coord(&mut self.rgba_atlas, &mut self.icon_cache, req.icon, px);
             scene.images.push(resolve_icon(req, tex));
         }
         scene.icons.clear();
@@ -327,10 +331,11 @@ const MAX_ICON_PX: u32 = 4096;
 /// `(icon, px)`, so the icon is available the frame it is requested; a different `px` re-rasterizes
 /// crisply. The icon is monochrome white — tint it via [`PolychromeSprite::tint`]. A rasterization
 /// failure (not expected for a bundled icon) degrades to a transparent tile, never panics.
-fn icon_coord(atlas: &mut Atlas, icon: IconId, px: u32) -> AtlasCoord {
+fn icon_coord(atlas: &mut Atlas, cache: &mut IconCache, icon: IconId, px: u32) -> AtlasCoord {
     let key = icon_key(icon, px);
     let coord = atlas.get_or_insert(key, (px, px), || {
-        rasterize_icon(icon, px)
+        cache
+            .rasterize(icon, px)
             .map(|d| d.rgba)
             .unwrap_or_else(|error| {
                 tracing::warn!(
@@ -356,11 +361,21 @@ fn icon_coord(atlas: &mut Atlas, icon: IconId, px: u32) -> AtlasCoord {
     coord
 }
 
+/// The size a distinct icon tile is rasterized/cached at, in physical px (#250). Rounding the raster px
+/// **up** to a multiple of this bounds the number of distinct atlas tiles a continuous zoom / size
+/// animation produces (fewer render+demultiply+upload+evict cycles), while keeping the raster ≥ the drawn
+/// size so it only ever downsamples (crisp, never upscaled/blurry). The drawn quad still uses the true
+/// float bounds (#266), so the on-screen size stays sub-pixel-smooth — only the sampled texture steps.
+const ICON_PX_QUANTUM: u32 = 4;
+
 /// The physical rasterization size for an icon of logical height `bounds_h` at the frame `scale` (#246).
-/// Floors to 1 (`NaN`/negative/zero → 1, avoiding a 0×0 raster) and clamps to [`MAX_ICON_PX`] (RK-028,
-/// so a huge layout-driven size can't reach an overflowing allocation).
+/// Floors to 1 (`NaN`/negative/zero → 1, avoiding a 0×0 raster), clamps to [`MAX_ICON_PX`] (RK-028, so a
+/// huge layout-driven size can't reach an overflowing allocation), then quantizes up to [`ICON_PX_QUANTUM`]
+/// (#250). Clamping **before** the quantize keeps the result ≤ `MAX_ICON_PX` (a 4-multiple), so
+/// `next_multiple_of` cannot overflow.
 fn icon_px(bounds_h: f32, scale: f32) -> u32 {
-    ((bounds_h * scale).round().max(1.0) as u32).min(MAX_ICON_PX)
+    let raw = (bounds_h * scale).round().max(1.0) as u32;
+    raw.min(MAX_ICON_PX).next_multiple_of(ICON_PX_QUANTUM)
 }
 
 /// Resolves a deferred [`IconSprite`] into a tinted [`PolychromeSprite`] given its atlas `tex` (#246),
@@ -391,14 +406,34 @@ mod tests {
         );
         assert_eq!(
             icon_px(0.0, 1.0),
-            1,
-            "a zero size floors to 1 (avoids a 0x0 raster)"
+            4,
+            "a zero size floors to 1 then quantizes up to the 4px minimum tile"
         );
-        assert_eq!(icon_px(f32::NAN, 1.0), 1, "NaN floors to 1");
+        assert_eq!(
+            icon_px(f32::NAN, 1.0),
+            4,
+            "NaN floors to 1 then quantizes to 4"
+        );
         assert_eq!(
             icon_px(1.0e30, 4.0),
             MAX_ICON_PX,
-            "a pathologically huge size clamps to MAX_ICON_PX (RK-028)"
+            "a pathologically huge size clamps to MAX_ICON_PX (RK-028; a 4-multiple)"
+        );
+    }
+
+    #[test]
+    fn icon_px_should_quantize_up_to_multiple() {
+        // The raster px rounds UP to a multiple of ICON_PX_QUANTUM (#250) so a zoom/animation reuses a
+        // bounded set of tiles; rounding up keeps the raster ≥ the drawn size (downsample-only, crisp).
+        assert_eq!(icon_px(16.0, 1.0), 16, "an exact multiple is unchanged");
+        assert_eq!(icon_px(13.0, 1.0), 16, "13 → next multiple of 4");
+        assert_eq!(icon_px(14.0, 1.0), 16, "14 (the Md check) → 16");
+        assert_eq!(icon_px(17.0, 1.0), 20, "17 → 20");
+        assert_eq!(icon_px(1.0, 1.0), 4, "1 → the 4px minimum tile");
+        assert_eq!(
+            icon_px(4095.0, 1.0),
+            MAX_ICON_PX,
+            "quantizing up near the cap stays ≤ MAX_ICON_PX (no overflow)"
         );
     }
 

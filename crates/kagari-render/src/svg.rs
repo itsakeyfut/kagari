@@ -7,11 +7,16 @@
 //! re-rasterized tile (crisp at any size / DPI). Bundled named icons only; runtime SVG-file loading is a
 //! follow-up.
 //!
+//! **Parse once, render per size (#250)**: the SVG parse ([`parse_svg`]) is the heaviest, `px`-independent
+//! part, so [`IconCache`] parses each [`IconId`] once and re-renders the cached [`usvg::Tree`]
+//! ([`rasterize_tree`]) per `px` — otherwise a size-animated / zoomed icon re-parses every frame.
+//!
 //! Bundled icons are **monochrome white** strokes on transparent ground: the polychrome `tint` *multiplies*
 //! the sampled texel (#55), so a white icon is tinted to any theme color (a black icon could not be), and
 //! `tint = WHITE` draws it white.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::hash::{Hash, Hasher};
 
 use resvg::{tiny_skia, usvg};
@@ -61,16 +66,25 @@ pub(crate) fn icon_key(icon: IconId, px: u32) -> u64 {
     h.finish()
 }
 
-/// Rasterize an SVG to a `px`×`px` straight-alpha sRGB RGBA tile via resvg/tiny_skia. resvg renders
-/// **sRGB premultiplied**; the atlas + polychrome shader expect **straight** sRGB (the shader premultiplies
-/// in linear, #55), so we `demultiply` each pixel here. Parse failure (or a zero `px`) →
+/// Parse an SVG source into a reusable [`usvg::Tree`]. This is the heaviest, **`px`-independent** part of
+/// rasterization (#250), so callers cache the tree and re-render it per size. Parse failure →
 /// [`RenderError::AssetDecode`] (panic-free); `label` describes the source for the error.
-pub(crate) fn rasterize_svg(svg: &str, px: u32, label: &str) -> Result<DecodedImage, RenderError> {
+pub(crate) fn parse_svg(svg: &str, label: &str) -> Result<usvg::Tree, RenderError> {
     let opt = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_data(svg.as_bytes(), &opt).map_err(|_| RenderError::AssetDecode {
-            path: label.to_string(),
-        })?;
+    usvg::Tree::from_data(svg.as_bytes(), &opt).map_err(|_| RenderError::AssetDecode {
+        path: label.to_string(),
+    })
+}
+
+/// Render an already-parsed [`usvg::Tree`] to a `px`×`px` straight-alpha sRGB RGBA tile via
+/// resvg/tiny_skia. resvg renders **sRGB premultiplied**; the atlas + polychrome shader expect **straight**
+/// sRGB (the shader premultiplies in linear, #55), so we `demultiply` each pixel here. A zero `px` →
+/// [`RenderError::AssetDecode`] (panic-free); `label` describes the source for the error.
+pub(crate) fn rasterize_tree(
+    tree: &usvg::Tree,
+    px: u32,
+    label: &str,
+) -> Result<DecodedImage, RenderError> {
     let size = tree.size();
     let mut pixmap = tiny_skia::Pixmap::new(px, px).ok_or_else(|| RenderError::AssetDecode {
         path: label.to_string(),
@@ -78,7 +92,7 @@ pub(crate) fn rasterize_svg(svg: &str, px: u32, label: &str) -> Result<DecodedIm
     // Fit the SVG's viewBox uniformly into the px×px tile (keep aspect; bundled icons are square).
     let scale = (px as f32 / size.width()).min(px as f32 / size.height());
     resvg::render(
-        &tree,
+        tree,
         tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
@@ -94,9 +108,39 @@ pub(crate) fn rasterize_svg(svg: &str, px: u32, label: &str) -> Result<DecodedIm
     })
 }
 
-/// Rasterize a bundled icon at `px` (looks up its SVG source). See [`rasterize_svg`].
-pub(crate) fn rasterize_icon(icon: IconId, px: u32) -> Result<DecodedImage, RenderError> {
-    rasterize_svg(icon_svg(icon), px, "icon")
+/// Caches the parsed [`usvg::Tree`] per [`IconId`] (#250) so a bundled icon is parsed **once** and only
+/// re-rendered per `px`. The parse (the `px`-independent, heaviest part of resvg) otherwise runs on every
+/// atlas miss — each DPI, and every frame of a size-animated / zoomed icon. Owned by the
+/// [`Renderer`](crate::Renderer); CPU-side, so it survives device-loss recovery (the atlas re-uploads its
+/// tiles; the parsed trees stay valid).
+#[derive(Default)]
+pub(crate) struct IconCache {
+    trees: HashMap<IconId, usvg::Tree>,
+}
+
+impl IconCache {
+    /// An empty cache.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The parsed tree for `icon`, parsing (and caching) it on the first request. A parse failure is
+    /// propagated and **not** cached (a bundled icon never fails, so a re-attempt is a non-issue).
+    fn tree(&mut self, icon: IconId) -> Result<&usvg::Tree, RenderError> {
+        match self.trees.entry(icon) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let tree = parse_svg(icon_svg(icon), "icon")?;
+                Ok(e.insert(tree))
+            }
+        }
+    }
+
+    /// Rasterize a bundled `icon` at `px`, reusing the cached parsed tree. See [`rasterize_tree`].
+    pub(crate) fn rasterize(&mut self, icon: IconId, px: u32) -> Result<DecodedImage, RenderError> {
+        let tree = self.tree(icon)?;
+        rasterize_tree(tree, px, "icon")
+    }
 }
 
 #[cfg(test)]
@@ -111,10 +155,11 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_svg_should_produce_rgba() {
+    fn rasterize_tree_should_produce_rgba() {
         // A fully-covered green square: the center texel is opaque green.
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="rgb(10,200,30)"/></svg>"##;
-        let d = rasterize_svg(svg, 16, "test").expect("rasterize the SVG");
+        let tree = parse_svg(svg, "test").expect("parse the SVG");
+        let d = rasterize_tree(&tree, 16, "test").expect("rasterize the tree");
         assert_eq!((d.width, d.height), (16, 16));
         assert_eq!(d.rgba.len(), 16 * 16 * 4);
         let [r, g, b, a] = center(&d);
@@ -126,11 +171,12 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_svg_should_unpremultiply() {
+    fn rasterize_tree_should_unpremultiply() {
         // A 50%-alpha red fill: tiny_skia stores it premultiplied (r≈100), but the decoded tile must be
         // straight alpha (r≈200) — proving the demultiply. (Premultiplied red would be ~100.)
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="rgb(200,0,0)" fill-opacity="0.5"/></svg>"##;
-        let d = rasterize_svg(svg, 16, "test").expect("rasterize the SVG");
+        let tree = parse_svg(svg, "test").expect("parse the SVG");
+        let d = rasterize_tree(&tree, 16, "test").expect("rasterize the tree");
         let [r, _g, _b, a] = center(&d);
         assert!((110..=150).contains(&a), "alpha ~128 (50%), got {a}");
         assert!(
@@ -140,8 +186,8 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_svg_should_error_on_garbage() {
-        let result = rasterize_svg("not an svg <<<", 16, "garbage");
+    fn parse_svg_should_error_on_garbage() {
+        let result = parse_svg("not an svg <<<", "garbage");
         assert!(
             matches!(result, Err(RenderError::AssetDecode { .. })),
             "invalid SVG maps to AssetDecode (no panic)"
@@ -171,14 +217,56 @@ mod tests {
 
     #[test]
     fn every_bundled_icon_should_rasterize() {
+        let mut cache = IconCache::new();
         for &icon in ALL_ICONS {
-            let d =
-                rasterize_icon(icon, 24).unwrap_or_else(|_| panic!("{icon:?} should rasterize"));
+            let d = cache
+                .rasterize(icon, 24)
+                .unwrap_or_else(|_| panic!("{icon:?} should rasterize"));
             assert_eq!((d.width, d.height), (24, 24));
             assert!(
                 d.rgba.chunks_exact(4).any(|p| p[3] > 0),
                 "{icon:?} has some non-transparent pixels"
             );
         }
+    }
+
+    #[test]
+    fn icon_cache_should_parse_tree_once_across_sizes() {
+        // The #250 core: two sizes of the same icon parse the tree once (cached), then re-render per px.
+        let mut cache = IconCache::new();
+        let a = cache.rasterize(IconId::Check, 16).expect("rasterize @16");
+        let b = cache.rasterize(IconId::Check, 32).expect("rasterize @32");
+        assert_eq!((a.width, b.width), (16, 32), "each size renders at its px");
+        assert_eq!(
+            cache.trees.len(),
+            1,
+            "the tree is parsed once and reused across sizes"
+        );
+    }
+
+    #[test]
+    fn icon_cache_should_parse_per_icon() {
+        let mut cache = IconCache::new();
+        cache.rasterize(IconId::Check, 24).expect("check");
+        cache.rasterize(IconId::Close, 24).expect("close");
+        cache.rasterize(IconId::Check, 24).expect("check again");
+        assert_eq!(
+            cache.trees.len(),
+            2,
+            "one cached tree per distinct icon (a repeat request adds nothing)"
+        );
+    }
+
+    #[test]
+    fn icon_cache_rasterize_should_match_uncached() {
+        // The refactor is output-preserving: the cached path equals a fresh parse + render.
+        let mut cache = IconCache::new();
+        let cached = cache.rasterize(IconId::Check, 24).expect("cached");
+        let tree = parse_svg(icon_svg(IconId::Check), "icon").expect("parse");
+        let direct = rasterize_tree(&tree, 24, "icon").expect("direct");
+        assert_eq!(
+            cached.rgba, direct.rgba,
+            "the cached rasterize equals a fresh parse + render"
+        );
     }
 }
