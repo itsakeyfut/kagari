@@ -12,6 +12,7 @@ mod div;
 mod dynamic;
 mod icon;
 mod overlay;
+mod reactive_prop;
 mod scroll;
 mod text;
 mod transform;

@@ -3,16 +3,15 @@
 //! rasterizes it at the resolved physical size (crisp) and draws it tinted. Monochrome bundled icons
 //! are tintable by a semantic role (theme-reactive, #245) or a raw color.
 
-use std::sync::{Arc, Mutex};
-
 use kagari_base::{Color, Corners, NodeId, Px, Rect, Size};
 use kagari_layout::LayoutStyle;
 use kagari_render::{IconId, IconSprite, RoundedRect};
 use kagari_style::ColorRole;
 
-use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::reactive_prop::ReactiveProp;
+use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
-use crate::reactive::{Prop, create_effect};
+use crate::reactive::Prop;
 
 /// An icon leaf: a bundled [`IconId`] drawn at a square logical size, tinted by a semantic role (the
 /// default, [`ColorRole::Text`]) or a raw color. Build with [`icon`]; chain `.size(..)`,
@@ -24,8 +23,7 @@ pub struct Icon {
     color: Color,
     /// Semantic tint **role** (static or reactive, #245), resolved to a color at paint via `cx.theme`.
     /// Takes precedence over `color`. Defaults to [`ColorRole::Text`] so an icon follows the text color.
-    color_role: Option<Prop<ColorRole>>,
-    resolved_color_role: Arc<Mutex<Option<ColorRole>>>,
+    color_role: ReactiveProp<ColorRole>,
     id: Option<NodeId>,
 }
 
@@ -35,8 +33,7 @@ pub fn icon(icon: IconId) -> Icon {
         icon,
         size: Px(16.0),
         color: Color::new(1.0, 1.0, 1.0, 1.0),
-        color_role: Some(Prop::Static(ColorRole::Text)),
-        resolved_color_role: Arc::new(Mutex::new(None)),
+        color_role: ReactiveProp::new(ColorRole::Text),
         id: None,
     }
 }
@@ -52,46 +49,15 @@ impl Icon {
     /// at paint via `cx.theme` (so it follows a theme swap / state signal). Takes precedence over
     /// [`color`](Self::color).
     pub fn color_role(mut self, role: impl Into<Prop<ColorRole>>) -> Self {
-        self.color_role = Some(role.into());
+        self.color_role.set(role);
         self
     }
 
     /// Tints the icon with a raw [`Color`], clearing any role tint (raw then wins at paint).
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
-        self.color_role = None;
+        self.color_role.clear();
         self
-    }
-
-    /// Resolves the tint-role prop into `resolved_color_role` (#245), mirroring `Text::bind_color_role`:
-    /// a static prop writes the role once; a reactive prop registers a synchronous effect that
-    /// re-resolves it and, only on a change (design.md §9), flags paint-dirty.
-    fn bind_color_role(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
-        match self.color_role.take() {
-            Some(Prop::Static(role)) => {
-                if let Ok(mut slot) = self.resolved_color_role.lock() {
-                    *slot = Some(role);
-                }
-            }
-            Some(Prop::Reactive(read)) => {
-                let cell = Arc::clone(&self.resolved_color_role);
-                let damage = Arc::clone(damage);
-                create_effect(move || {
-                    let role = read();
-                    if let Ok(mut slot) = cell.lock() {
-                        if *slot != Some(role) {
-                            *slot = Some(role);
-                            damage.mark_paint_dirty(id);
-                        }
-                    }
-                });
-            }
-            None => {}
-        }
-    }
-
-    fn current_color_role(&self) -> Option<ColorRole> {
-        self.resolved_color_role.lock().ok().and_then(|slot| *slot)
     }
 }
 
@@ -103,7 +69,7 @@ impl Element for Icon {
         let id = cx.arena.insert(Node::default());
         self.id = Some(id);
         cx.layout.insert(id, None);
-        self.bind_color_role(&cx.damage, id);
+        self.color_role.bind(&cx.damage, id);
 
         // A fixed square measure — the icon draws at the requested logical size regardless of content.
         let size = Size {
@@ -120,7 +86,8 @@ impl Element for Icon {
         // precedence over the raw color. Emit a deferred icon request — the renderer rasterizes it at the
         // physical size and draws it; no atlas is touched here (so GPU-free tests still see the request).
         let tint = self
-            .current_color_role()
+            .color_role
+            .current()
             .map(|role| cx.theme.resolve_color(role))
             .unwrap_or(self.color);
         let order = cx.next_order();
@@ -148,6 +115,8 @@ impl IntoElement for Icon {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::arena::Arena;
     use crate::damage::DamageState;
