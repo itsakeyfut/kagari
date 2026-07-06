@@ -61,6 +61,10 @@ pollster = "0.4"           # block_on for wgpu's async init inside winit's sync 
 notify = "8.2.0"               # dev theme hot-reload file watcher (kagari-style, feature: hot-reload)
 
 # dev (each crate references via { workspace = true } under [dev-dependencies]).
-proptest = "1.11"
+# Pinned below 1.11: proptest 1.11.0's rewritten uniform float sampler panics on an
+# internal debug assertion (float_samplers.rs `self.low - result < self.intervals.step`)
+# for some seeds of a bounded f32 range, breaking kagari-base's rect property tests. Bump
+# once a fixed release (>1.11.0) ships.
+proptest = "=1.10.0"
 criterion = "0.8.2"
 tempfile = "3.27.0"             # temp theme files in hot-reload tests
