@@ -26,6 +26,17 @@ pub enum Display {
     None,
 }
 
+/// How a node is positioned relative to normal flow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Position {
+    /// In normal flow (the default): the node participates in layout and pushes siblings.
+    #[default]
+    Relative,
+    /// Out of flow: the node takes no space in its parent (does not push siblings) and sizes to its
+    /// content. Used by the overlay portal so its content-sized child does not collapse.
+    Absolute,
+}
+
 /// Main-axis direction of a flex container.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FlexDirection {
@@ -137,6 +148,7 @@ pub struct LayoutStyle {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub flex_basis: Option<Px>,
+    pub position: Position,
     pub gap: Px,
     pub padding: Edges,
     pub size: Option<Size>,
@@ -184,6 +196,7 @@ impl Default for LayoutStyle {
             // CSS/taffy default: flex items shrink by default.
             flex_shrink: 1.0,
             flex_basis: None,
+            position: Position::default(),
             gap: Px(0.0),
             padding: Edges::default(),
             size: None,
@@ -214,6 +227,10 @@ impl LayoutStyle {
     pub(crate) fn to_taffy(&self) -> taffy::Style {
         taffy::Style {
             display: map_display(self.display),
+            position: match self.position {
+                Position::Relative => taffy::Position::Relative,
+                Position::Absolute => taffy::Position::Absolute,
+            },
             flex_direction: map_flex_direction(self.flex_direction),
             flex_wrap: map_flex_wrap(self.flex_wrap),
             flex_grow: self.flex_grow,
@@ -489,6 +506,25 @@ mod tests {
         assert_eq!(taffy_style.min_size.height, taffy::Dimension::length(4.0));
         assert_eq!(taffy_style.max_size.width, taffy::Dimension::length(50.0));
         assert_eq!(taffy_style.max_size.height, taffy::Dimension::length(60.0));
+    }
+
+    #[test]
+    fn to_taffy_should_map_position() {
+        // #283: the default is Relative (in normal flow); Absolute takes the node out of flow.
+        assert_eq!(
+            LayoutStyle::default().to_taffy().position,
+            taffy::Position::Relative,
+            "the default position is Relative"
+        );
+        let abs = LayoutStyle {
+            position: Position::Absolute,
+            ..LayoutStyle::default()
+        };
+        assert_eq!(
+            abs.to_taffy().position,
+            taffy::Position::Absolute,
+            "Absolute maps to taffy's out-of-flow position"
+        );
     }
 
     #[test]

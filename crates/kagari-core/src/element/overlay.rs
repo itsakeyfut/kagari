@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
-use kagari_layout::{Display, LayoutStyle};
+use kagari_layout::{LayoutStyle, Position};
 use kagari_render::{Background, Border, Quad, RoundedRect};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
@@ -323,14 +323,14 @@ impl Element for Overlay {
                 let id = cx.arena.insert(Node::default());
                 self.id = Some(id);
                 cx.layout.insert(id, None);
-                // Block + zero size: the overlay takes no space in normal flow (it does not push
-                // siblings), while its child lays out at its natural/explicit size (block does not
-                // flex-shrink it) and is painted at the absolute position.
+                // Absolute: the overlay is taken out of normal flow (it does not push siblings) and
+                // sizes to its content, so a content-sized child (a menu/tooltip bubble with no explicit
+                // size) lays out at its natural size instead of collapsing. Painted at the resolved
+                // absolute position (the node's own flow position is ignored).
                 cx.layout.set_style(
                     id,
                     &LayoutStyle {
-                        display: Display::Block,
-                        size: Some(Size { w: 0.0, h: 0.0 }),
+                        position: Position::Absolute,
                         ..LayoutStyle::default()
                     },
                 );
@@ -600,6 +600,77 @@ mod tests {
             "the overlay escapes the scroll clip (masked to itself, not the 100px viewport)"
         );
         assert_eq!(reg.entries().len(), 1, "the overlay registered one entry");
+    }
+
+    #[test]
+    fn overlay_should_content_size_its_child() {
+        // #283: an overlay's content-sized (auto) child lays out at its natural size, not collapsed to
+        // width 0 by the portal node. Here an auto-size outer (green) wraps an explicit 80x16 inner
+        // (blue); the outer must content-size to 80x16. Before the `Position::Absolute` node the outer
+        // laid out 0x16 (invisible) — a real tooltip/menu bubble would vanish.
+        let inner = Background::Solid(Color::new(0.0, 0.0, 1.0, 1.0));
+        let mut root = div()
+            .child(
+                overlay(
+                    div()
+                        .background(green())
+                        .child(div().size(Size { w: 80.0, h: 16.0 }).background(inner)),
+                )
+                .position(Point::new(10.0, 10.0)),
+            )
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 200.0 });
+
+        let bubble = scene
+            .quads
+            .iter()
+            .find(|q| q.bg == green())
+            .expect("the auto-size outer bubble paints a quad");
+        assert!(
+            bubble.order >= 1 << 28,
+            "the bubble draws in the overlay band"
+        );
+        assert_eq!(
+            bubble.bounds.size,
+            Size { w: 80.0, h: 16.0 },
+            "the auto-size overlay child content-sizes to its inner (was 0 wide before #283)"
+        );
+        assert_eq!(
+            bubble.bounds.origin,
+            Point::new(10.0, 10.0),
+            "the bubble still paints at its placed position"
+        );
+    }
+
+    #[test]
+    fn overlay_should_take_no_flow_space() {
+        // #283: the overlay node is out of flow, so content-sizing it (now a non-zero node) must NOT push
+        // siblings. A column of [10px spacer, overlay(50px child), 10px spacer]: the trailing spacer sits
+        // at y=10 (right after the first), as if the overlay took no space — not y=60 (pushed by 50px).
+        let top = Background::Solid(Color::new(1.0, 0.0, 0.0, 1.0));
+        let bottom = Background::Solid(Color::new(0.0, 0.0, 1.0, 1.0));
+        let mut root = div()
+            .flex_col()
+            .child(div().size(Size { w: 10.0, h: 10.0 }).background(top))
+            .child(
+                overlay(div().size(Size { w: 50.0, h: 50.0 }).background(green()))
+                    .position(Point::new(0.0, 0.0)),
+            )
+            .child(div().size(Size { w: 10.0, h: 10.0 }).background(bottom))
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 200.0 });
+
+        let trailing = scene
+            .quads
+            .iter()
+            .find(|q| q.bg == bottom)
+            .expect("the trailing spacer paints");
+        assert_eq!(
+            trailing.bounds.origin.y, 10.0,
+            "the overlay takes no flow space; the trailing sibling is not pushed down"
+        );
     }
 
     #[test]
