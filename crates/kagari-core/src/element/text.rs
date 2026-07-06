@@ -1,20 +1,30 @@
 //! The [`Text`] leaf element (#34): shaped at build, rasterized at paint.
 
+use std::sync::{Arc, Mutex};
+
 use kagari_base::{Color, NodeId, Px, Rect, SharedString};
 use kagari_layout::LayoutStyle;
 use kagari_style::ColorRole;
 use kagari_text::{ShapedText, TextStyle, fontdb};
 
 use super::reactive_prop::ReactiveProp;
-use super::{AnyElement, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
+use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::arena::Node;
-use crate::reactive::Prop;
+use crate::reactive::{Prop, create_effect};
 
 /// A text leaf. Shapes its content once at `request_layout` (caching the result and reporting its
 /// intrinsic size via a [`MeasureFn`](kagari_layout::MeasureFn)), and rasterizes the cached
-/// shaping into glyph sprites at `paint`.
+/// shaping into glyph sprites at `paint`. The content is a static string or a reactive [`Prop`] (#274):
+/// a signal-driven string re-shapes and relayouts live (the layout-dirty counterpart of the paint-dirty
+/// `color_role`), mirroring [`Icon`](super::icon)'s reactive size.
 pub struct Text {
-    text: SharedString,
+    /// Content prop (static or reactive), taken at build by [`bind_content`](Text::bind_content).
+    content: Option<Prop<SharedString>>,
+    /// Resolved content: written once for a static prop, or by the bound reactive effect. Read by the
+    /// measure/paint to shape. Shared + `'static` so both the effect and the measure own a handle.
+    content_cell: Arc<Mutex<SharedString>>,
+    /// Whether the content prop is reactive (set at build) — selects the re-shaping measure path.
+    reactive_content: bool,
     style: TextStyle,
     color: Color,
     /// Semantic color **role** (static or reactive, #245) — the theme-reactive counterpart of `color`:
@@ -27,16 +37,38 @@ pub struct Text {
     wrap: bool,
     id: Option<NodeId>,
     shaped: Option<ShapedText>,
-    /// The width `shaped` was last shaped at, for a wrapping text (#260) — so `paint` re-shapes only when
-    /// the laid-out width changes, reusing the memoized shaping (a borrow) otherwise instead of cloning
-    /// the cached `ShapedText` every frame. Unused on the non-wrap path (`shaped` is the build shaping).
+    /// The width key `shaped` was last shaped at, for the re-shaping paint path (wrap #260 / reactive
+    /// content #274) — `Some(w)` when wrapping, `None` otherwise — so `paint` re-shapes only when the key
+    /// (or the content) changes, reusing the memoized shaping otherwise instead of cloning it every frame.
+    /// Unused on the static non-wrap path (`shaped` is the build shaping).
     shaped_width: Option<f32>,
+    /// The content `shaped` was last shaped from, for the reactive-content paint memo (#274) — so `paint`
+    /// re-shapes when the content cell changes, not only when the width does.
+    shaped_content: Option<SharedString>,
 }
 
-/// Creates a text leaf with the default style (bundled "Noto Sans", 16px) and a light color.
-pub fn text(content: impl Into<SharedString>) -> Text {
+/// `text("literal")` / `text(String)` — the blanket `From<T> for Prop<T>` covers a `SharedString`; these
+/// add the two other common static forms so the reactive-capable `text()` (#274) stays literal-friendly.
+impl From<&'static str> for Prop<SharedString> {
+    fn from(s: &'static str) -> Self {
+        Prop::Static(s.into())
+    }
+}
+impl From<String> for Prop<SharedString> {
+    fn from(s: String) -> Self {
+        Prop::Static(s.into())
+    }
+}
+
+/// Creates a text leaf with the default style (bundled "Noto Sans", 16px) and a light color. The content
+/// is static (`text("hi")`) or reactive (`text(rx(move || sig.get()))`, #274).
+pub fn text(content: impl Into<Prop<SharedString>>) -> Text {
+    let content = content.into();
+    let reactive_content = matches!(content, Prop::Reactive(_));
     Text {
-        text: content.into(),
+        content: Some(content),
+        content_cell: Arc::new(Mutex::new(SharedString::from(""))),
+        reactive_content,
         style: TextStyle {
             family: "Noto Sans".into(),
             size: Px(16.0),
@@ -49,6 +81,7 @@ pub fn text(content: impl Into<SharedString>) -> Text {
         id: None,
         shaped: None,
         shaped_width: None,
+        shaped_content: None,
     }
 }
 
@@ -80,6 +113,38 @@ impl Text {
         self.wrap = wrap;
         self
     }
+
+    /// Resolves the content prop into [`content_cell`](Text::content_cell) (#274), the **layout-dirty**
+    /// counterpart of the paint-dirty [`color_role`](Text::color_role) binding — a content change needs
+    /// relayout, not just a repaint (mirrors [`Icon::bind_size`](super::icon)). A static prop writes the
+    /// cell once; a reactive prop registers a synchronous effect (ADR 0001) that re-reads the closure and
+    /// — only when the value changed — writes the cell and flags **layout**-damage for `id`. The new
+    /// content reaches the shaper on the next `compute` via the measure that reads the cell; the
+    /// `mark_layout_dirty` call wakes the scheduler so that frame runs. Registered once at build, so the
+    /// effect only re-fires on external signal writes, keeping the write serial with the frame loop (RK-009).
+    fn bind_content(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.content.take() {
+            Some(Prop::Static(s)) => {
+                if let Ok(mut slot) = self.content_cell.lock() {
+                    *slot = s;
+                }
+            }
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.content_cell);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let s = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        if *slot != s {
+                            *slot = s;
+                            damage.mark_layout_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
 }
 
 impl Element for Text {
@@ -91,22 +156,37 @@ impl Element for Text {
         self.id = Some(id);
         cx.layout.insert(id, None);
         self.color_role.bind(&cx.damage, id);
+        self.bind_content(&cx.damage, id);
 
-        if self.wrap {
-            // Wrapping text (#260): the measure re-shapes at the available width each `compute` via a
-            // cloned `Shaper` handle — `avail.width == None` (unconstrained) → single line, `Some(w)` →
-            // wrap at `w`. `paint` re-shapes at the laid-out width (cache-deduped), so `shaped` stays `None`.
+        // A reactive content (#274) or a wrapping text (#260) re-shapes each `compute`; a static non-wrap
+        // text keeps the shape-once fast path.
+        if self.reactive_content || self.wrap {
+            // Re-shaping measure: shapes the **current** content (read from the cell) each `compute` via a
+            // cloned `Shaper` handle — at the allotted width when wrapping (`avail.width == None` → single
+            // line, `Some(w)` → wrap at `w`), single-line otherwise. The `Shaper` cache dedupes an unchanged
+            // (content, width); a reactive content write (bound above) marks layout-dirty so the next
+            // `compute` re-measures. `paint` re-shapes at the laid-out width (cache-deduped).
             let shaper = cx.text.shaper();
-            let text = self.text.clone();
+            let cell = Arc::clone(&self.content_cell);
             let style = self.style.clone();
+            let wrap = self.wrap;
             cx.layout.set_measure(
                 id,
-                Box::new(move |avail| shaper.shape(&text, &style, avail.width).size),
+                Box::new(move |avail| {
+                    let content = cell.lock().map(|c| c.clone()).unwrap_or_else(|_| "".into());
+                    let width = if wrap { avail.width } else { None };
+                    shaper.shape(&content, &style, width).size
+                }),
             );
         } else {
             // Shape once at build: cache the result, report its intrinsic size as a constant measure (so
             // `compute` needs no TextSystem), and reuse the cached shaping at paint.
-            let shaped = cx.text.shape(&self.text, &self.style, None);
+            let content = self
+                .content_cell
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_else(|_| "".into());
+            let shaped = cx.text.shape(&content, &self.style, None);
             let size = shaped.size;
             self.shaped = Some(shaped);
             cx.layout.set_measure(id, Box::new(move |_avail| size));
@@ -139,12 +219,23 @@ impl Element for Text {
         let Some(atlas) = cx.atlas.as_deref_mut() else {
             return;
         };
-        // Wrapping text re-shapes at the laid-out width, but **memoized**: only when the width changed
-        // since the last paint (otherwise the build/prev `shaped` is reused by borrow — no per-frame
-        // `ShapedText` clone). Non-wrap reuses the build-time single-line shaping unchanged.
-        if self.wrap && self.shaped_width != Some(bounds.size.w) {
-            self.shaped = Some(cx.text.shape(&self.text, &self.style, Some(bounds.size.w)));
-            self.shaped_width = Some(bounds.size.w);
+        // The re-shaping path (wrap #260 / reactive content #274) re-shapes at the laid-out width, but
+        // **memoized**: only when the content **or** the width key changed since the last paint (otherwise
+        // the build/prev `shaped` is reused by borrow — no per-frame `ShapedText` clone). The width key is
+        // `Some(w)` only when wrapping; a reactive non-wrap text keys on content alone (single-line). A
+        // static non-wrap text reuses the build-time shaping unchanged.
+        if self.reactive_content || self.wrap {
+            let content = self
+                .content_cell
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_else(|_| "".into());
+            let width = self.wrap.then_some(bounds.size.w);
+            if self.shaped_content.as_ref() != Some(&content) || self.shaped_width != width {
+                self.shaped = Some(cx.text.shape(&content, &self.style, width));
+                self.shaped_width = width;
+                self.shaped_content = Some(content);
+            }
         }
         let Some(shaped) = self.shaped.as_ref() else {
             return;
@@ -390,5 +481,162 @@ mod tests {
             "the wrapped text keeps its full multi-line height (min-height stays auto), not clipped to the \
              short column: text_h={text_h} col_h={short_h}"
         );
+    }
+
+    #[test]
+    fn text_reactive_content_should_reshape_on_signal() {
+        // #274: a reactive content string re-shapes and relayouts live — a signal write flags layout-dirty
+        // and the next frame measures the new (wider) content. Mirrors `icon_reactive_size_should_relayout`.
+        // The content signal is written *between* frames (serial with `render_tree`), never during (RK-009).
+        let owner = Owner::new();
+        owner.set();
+        let (read, write) = signal(SharedString::from("Hi"));
+        let mut root = crate::element::div()
+            .size(BSize { w: 400.0, h: 200.0 })
+            .items_start()
+            .child(text(rx(move || read.get())))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut ts = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let frame = |root: &mut AnyElement,
+                     arena: &mut Arena,
+                     layout: &mut LayoutTree,
+                     ts: &mut TextSystem|
+         -> f32 {
+            let mut scene = Scene::new();
+            let root_id = render_tree(
+                root,
+                arena,
+                layout,
+                ts,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut scene,
+                BSize { w: 400.0, h: 200.0 },
+                &damage,
+                &Theme::default(),
+            )
+            .unwrap();
+            let text_id = arena
+                .get(root_id)
+                .and_then(|n| n.children.first().copied())
+                .expect("the parent has the text as its child");
+            layout.layout(text_id).size.w
+        };
+
+        let w0 = frame(&mut root, &mut arena, &mut layout, &mut ts);
+        write.set("A much longer string of text".into());
+        assert!(
+            damage.is_dirty(),
+            "the reactive content write flags damage (layout-dirty)"
+        );
+        let w1 = frame(&mut root, &mut arena, &mut layout, &mut ts);
+        assert!(
+            w1 > w0,
+            "the signal write re-shapes the text to the new (longer) content: w0={w0} w1={w1}"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_static_content_should_measure_to_content() {
+        // Regression: the `Prop` unification (#274) keeps the static shape-once path — longer static
+        // content still lays out wider. (No reactive owner needed; a static text registers no effect.)
+        let measure = |content: &'static str| -> f32 {
+            let mut root = crate::element::div()
+                .size(BSize { w: 400.0, h: 200.0 })
+                .items_start()
+                .child(text(content))
+                .into_element();
+            let mut arena = Arena::new();
+            let mut layout = LayoutTree::new();
+            let mut ts = TextSystem::new(FontDb::new());
+            let mut scene = Scene::new();
+            let damage = Arc::new(DamageState::default());
+            let root_id = render_tree(
+                &mut root,
+                &mut arena,
+                &mut layout,
+                &mut ts,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut scene,
+                BSize { w: 400.0, h: 200.0 },
+                &damage,
+                &Theme::default(),
+            )
+            .unwrap();
+            let text_id = arena
+                .get(root_id)
+                .and_then(|n| n.children.first().copied())
+                .expect("the parent has the text as its child");
+            layout.layout(text_id).size.w
+        };
+        let short = measure("Hi");
+        let long = measure("Hi there, a much longer static string");
+        assert!(
+            long > short,
+            "static content shapes to its size (shape-once path intact): short={short} long={long}"
+        );
+    }
+
+    #[test]
+    fn text_reactive_content_should_compose_with_reactive_color_role() {
+        // #274 + #245: reactive content and reactive `color_role` are independent bindings on one `Text` —
+        // a content write updates the shaped content (via the cell, read by the measure), a role write
+        // re-resolves the tint. Built via `request_layout` so both bindings can be inspected directly.
+        let owner = Owner::new();
+        owner.set();
+        let (rc, wc) = signal(SharedString::from("Hi"));
+        let (rr, wr) = signal(false);
+        let mut t = text(rx(move || rc.get())).color_role(rx(move || {
+            if rr.get() {
+                ColorRole::Danger
+            } else {
+                ColorRole::Text
+            }
+        }));
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut ts = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let sink: Arc<dyn DamageSink> = damage.clone();
+        t.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut ts,
+            damage: sink,
+            theme: &Theme::default(),
+            focus: None,
+            cursor: None,
+        });
+
+        // Initial: both props resolved.
+        assert_eq!(t.color_role.current(), Some(ColorRole::Text));
+        assert_eq!(*t.content_cell.lock().unwrap(), SharedString::from("Hi"));
+
+        // A role write re-resolves the tint (independent of content).
+        wr.set(true);
+        assert_eq!(t.color_role.current(), Some(ColorRole::Danger));
+
+        // A content write updates the cell (the measure reads it on the next `compute`).
+        wc.set("Hello, world".into());
+        assert_eq!(
+            *t.content_cell.lock().unwrap(),
+            SharedString::from("Hello, world")
+        );
+        drop(owner);
     }
 }
