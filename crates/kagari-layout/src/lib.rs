@@ -17,6 +17,6 @@ pub use measure::{AvailableSize, MeasureFn};
 pub use scroll::ScrollState;
 pub use style::{
     AlignItems, Display, FlexDirection, FlexWrap, GridAutoFlow, GridLine, GridPlacement,
-    JustifyContent, LayoutStyle, Overflow, TrackSizing,
+    JustifyContent, LayoutStyle, Overflow, Position, TrackSizing,
 };
 pub use tree::LayoutTree;
