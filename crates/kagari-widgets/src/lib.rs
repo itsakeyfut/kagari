@@ -13,6 +13,7 @@ pub mod radio;
 pub mod segmented;
 pub mod spinner;
 pub mod switch;
+pub mod tabs;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
@@ -24,3 +25,4 @@ pub use radio::{RadioGroup, radio_group};
 pub use segmented::{SegmentContent, Segmented, ToggleGroup, segmented, toggle_group};
 pub use spinner::{Spinner, spinner};
 pub use switch::{Switch, switch};
+pub use tabs::{Tabs, tabs};
