@@ -63,6 +63,14 @@ pub fn use_context<T: Clone + 'static>() -> Option<T> {
     reactive_graph::owner::use_context()
 }
 
+/// Registers `f` to run when the current reactive owner scope is disposed (the subtree "removed" — a
+/// `dyn_if`/`dyn_list` branch cleanup, or window close). Used by a continuously-driven widget (e.g. a
+/// spinner) to release its scheduler active source / stop its ticker driver when it goes away (#87). A
+/// no-op if there is no current owner.
+pub fn on_cleanup(f: impl FnOnce() + Send + Sync + 'static) {
+    reactive_graph::owner::on_cleanup(f);
+}
+
 /// A prop that is either a static value or a reactive closure.
 ///
 /// Most props are [`Prop::Static`] and hold their value inline (no runtime reactive node). A
