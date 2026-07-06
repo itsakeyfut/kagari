@@ -14,6 +14,7 @@ pub mod segmented;
 pub mod spinner;
 pub mod switch;
 pub mod tabs;
+pub mod tooltip;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
@@ -26,3 +27,4 @@ pub use segmented::{SegmentContent, Segmented, ToggleGroup, segmented, toggle_gr
 pub use spinner::{Spinner, spinner};
 pub use switch::{Switch, switch};
 pub use tabs::{Tabs, tabs};
+pub use tooltip::{Tooltip, tooltip};
