@@ -481,9 +481,9 @@ impl Div {
         self.resolved_size.lock().ok().and_then(|slot| *slot)
     }
 
-    /// The raw [`LayoutStyle`] overlaid with the resolved layout tokens (gap + padding) from the
-    /// theme. size/margin tokens are not applied yet (LayoutStyle's `size` is a paired value and
-    /// `margin` is not mapped to taffy — a follow-up).
+    /// The raw [`LayoutStyle`] overlaid with the resolved layout tokens (gap + padding + per-axis size:
+    /// `w`/`h`/`min_w`/`min_h`/`max_w`/`max_h`, #280) from the theme. `margin` tokens are still not mapped
+    /// to taffy — a follow-up.
     fn effective_layout(&self, theme: &Theme) -> LayoutStyle {
         let mut ls = self.layout.clone();
         // The reactive/static fixed size (#146) is resolved into a shared cell; overlay it so a
@@ -524,6 +524,27 @@ impl Div {
         }
         if let Some(v) = px(lt.pl) {
             ls.padding.left = v;
+        }
+        // Per-axis size tokens (#280): `w`/`h`/`min_w`/`min_h`/`max_w`/`max_h` each override only their
+        // axis of the `LayoutStyle`, leaving the other axis to the paired `.size()` (or taffy `auto`). This
+        // is what lets e.g. `h_0p5()` fix a height while the width stays content/stretch.
+        if let Some(v) = px(lt.w) {
+            ls.width = Some(v);
+        }
+        if let Some(v) = px(lt.h) {
+            ls.height = Some(v);
+        }
+        if let Some(v) = px(lt.min_w) {
+            ls.min_width = Some(v);
+        }
+        if let Some(v) = px(lt.min_h) {
+            ls.min_height = Some(v);
+        }
+        if let Some(v) = px(lt.max_w) {
+            ls.max_width = Some(v);
+        }
+        if let Some(v) = px(lt.max_h) {
+            ls.max_height = Some(v);
         }
         ls
     }
@@ -1249,6 +1270,111 @@ mod tests {
         assert_eq!(
             scene.quads[1].bounds.origin.y, 26.0,
             "after the swap the gap re-resolves to S2=16 → reskin without a rebuild"
+        );
+    }
+
+    #[test]
+    fn h_token_should_set_height_only() {
+        // #280: `h_4()` fixes the child's height (S4=16) while its width stays stretched to the parent
+        // (cross-axis of the column). The paired `.size()` could not express "fixed height, auto width".
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let mut root = div()
+            .flex_col()
+            .size(Size { w: 100.0, h: 100.0 })
+            .child(div().h_4().background(green))
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::from_ron(
+            r##"( primitives: ( colors: {}, spacing: { S4: 16.0 } ), roles: ( colors: {} ) )"##,
+        )
+        .unwrap();
+
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme);
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 16.0,
+            "h_4 fixes the height to the resolved S4=16"
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 100.0,
+            "the width axis stays auto → stretches to the parent"
+        );
+    }
+
+    #[test]
+    fn w_token_should_set_width_only() {
+        // Symmetric to `h_token_should_set_height_only`: in a row, `w_4()` fixes the width while the
+        // height stretches to the parent (cross-axis).
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let mut root = div()
+            .flex()
+            .size(Size { w: 100.0, h: 100.0 })
+            .child(div().w_4().background(green))
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::from_ron(
+            r##"( primitives: ( colors: {}, spacing: { S4: 16.0 } ), roles: ( colors: {} ) )"##,
+        )
+        .unwrap();
+
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme);
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 16.0,
+            "w_4 fixes the width to the resolved S4=16"
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 100.0,
+            "the height axis stays auto → stretches to the parent"
+        );
+    }
+
+    #[test]
+    fn min_max_h_tokens_should_bound_height() {
+        // `min_h` raises a content-less child to its min; `max_h` caps an over-tall one. Both resolve
+        // from the theme spacing scale (S4=16, S8=40).
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let theme = Theme::from_ron(
+            r##"( primitives: ( colors: {}, spacing: { S4: 16.0, S8: 40.0 } ), roles: ( colors: {} ) )"##,
+        )
+        .unwrap();
+
+        // min: a child with no height and `min_h_4` clamps up to 16.
+        let mut min_root = div()
+            .flex_col()
+            .size(Size { w: 100.0, h: 100.0 })
+            .child(div().min_h_4().background(green))
+            .into_element();
+        let scene = render_retained(
+            &mut min_root,
+            &mut Arena::new(),
+            &mut LayoutTree::new(),
+            &mut TextSystem::new(FontDb::new()),
+            &theme,
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 16.0,
+            "min_h_4 raises the content-less height to S4=16"
+        );
+
+        // max: a child asking for h_8 (40) is capped by max_h_4 (16).
+        let mut max_root = div()
+            .flex_col()
+            .size(Size { w: 100.0, h: 100.0 })
+            .child(div().h_8().max_h_4().background(green))
+            .into_element();
+        let scene = render_retained(
+            &mut max_root,
+            &mut Arena::new(),
+            &mut LayoutTree::new(),
+            &mut TextSystem::new(FontDb::new()),
+            &theme,
+        );
+        assert_eq!(
+            scene.quads[0].bounds.size.h, 16.0,
+            "max_h_4 caps the h_8=40 height to S4=16"
         );
     }
 

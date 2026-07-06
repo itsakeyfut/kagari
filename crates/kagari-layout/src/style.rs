@@ -140,13 +140,25 @@ pub struct LayoutStyle {
     pub gap: Px,
     pub padding: Edges,
     pub size: Option<Size>,
+    /// Per-axis width (#280), overriding [`size`](Self::size)'s width axis when set — so a caller can fix
+    /// the width while leaving the height to content (`auto`), which the paired `size` cannot express.
+    pub width: Option<f32>,
+    /// Per-axis height (#280), overriding [`size`](Self::size)'s height axis when set — e.g. a full-width
+    /// bar (cross-axis stretch) that is a fixed 2px tall.
+    pub height: Option<f32>,
     pub min_size: Option<Size>,
     /// Per-axis minimum width (#260), overriding [`min_size`](Self::min_size)'s width axis when set — so a
     /// caller can set `min-width: 0` (to let a flex child shrink and wrap) **without** also zeroing
     /// `min-height` (which `min_size`, being a paired `Size`, would). `None` leaves the width axis to
     /// `min_size` (or taffy's `auto` = min-content).
     pub min_width: Option<f32>,
+    /// Per-axis minimum height (#280), symmetric with [`min_width`](Self::min_width).
+    pub min_height: Option<f32>,
     pub max_size: Option<Size>,
+    /// Per-axis maximum width (#280), overriding [`max_size`](Self::max_size)'s width axis when set.
+    pub max_width: Option<f32>,
+    /// Per-axis maximum height (#280), overriding [`max_size`](Self::max_size)'s height axis when set.
+    pub max_height: Option<f32>,
     pub align_items: Option<AlignItems>,
     pub justify_content: Option<JustifyContent>,
     pub overflow: Overflow,
@@ -175,9 +187,14 @@ impl Default for LayoutStyle {
             gap: Px(0.0),
             padding: Edges::default(),
             size: None,
+            width: None,
+            height: None,
             min_size: None,
             min_width: None,
+            min_height: None,
             max_size: None,
+            max_width: None,
+            max_height: None,
             align_items: None,
             justify_content: None,
             overflow: Overflow::default(),
@@ -212,17 +229,41 @@ impl LayoutStyle {
                 top: taffy::LengthPercentage::length(self.padding.top),
                 bottom: taffy::LengthPercentage::length(self.padding.bottom),
             },
-            size: taffy_size(self.size),
+            size: {
+                // Per-axis `width`/`height` (#280) override only their axis, leaving the other to the
+                // paired `size` (or `auto`) — so e.g. a fixed height can coexist with an auto width.
+                let mut s = taffy_size(self.size);
+                if let Some(w) = self.width {
+                    s.width = taffy::Dimension::length(w);
+                }
+                if let Some(h) = self.height {
+                    s.height = taffy::Dimension::length(h);
+                }
+                s
+            },
             min_size: {
-                // Per-axis `min_width` (#260) overrides only the width axis, leaving the height axis to
-                // `min_size` (or `auto`) so `min-width: 0` doesn't also zero `min-height`.
+                // Per-axis `min_width` (#260) / `min_height` (#280) override only their axis, leaving the
+                // other to `min_size` (or `auto`) so `min-width: 0` doesn't also zero `min-height`.
                 let mut ms = taffy_size(self.min_size);
                 if let Some(w) = self.min_width {
                     ms.width = taffy::Dimension::length(w);
                 }
+                if let Some(h) = self.min_height {
+                    ms.height = taffy::Dimension::length(h);
+                }
                 ms
             },
-            max_size: taffy_size(self.max_size),
+            max_size: {
+                // Per-axis `max_width`/`max_height` (#280) override only their axis.
+                let mut xs = taffy_size(self.max_size);
+                if let Some(w) = self.max_width {
+                    xs.width = taffy::Dimension::length(w);
+                }
+                if let Some(h) = self.max_height {
+                    xs.height = taffy::Dimension::length(h);
+                }
+                xs
+            },
             align_items: self.align_items.map(map_align_items),
             justify_content: self.justify_content.map(map_justify_content),
             overflow: taffy::Point {
@@ -424,5 +465,51 @@ mod tests {
     fn layout_style_default_should_shrink() {
         // CSS/taffy default: flex items shrink (1.0), not 0.0 (the naive numeric default).
         assert_eq!(LayoutStyle::default().flex_shrink, 1.0);
+    }
+
+    #[test]
+    fn to_taffy_should_override_per_axis_size_dimensions() {
+        // #280: each per-axis field overrides only its own axis of the paired dimension, leaving the
+        // other axis to the pair (or `auto`). Here `height` is fixed while the width stays `auto`.
+        let style = LayoutStyle {
+            height: Some(2.0),
+            min_height: Some(4.0),
+            max_width: Some(50.0),
+            max_height: Some(60.0),
+            ..LayoutStyle::default()
+        };
+        let taffy_style = style.to_taffy();
+
+        assert_eq!(taffy_style.size.height, taffy::Dimension::length(2.0));
+        assert_eq!(
+            taffy_style.size.width,
+            taffy::Dimension::auto(),
+            "the unset width axis stays auto"
+        );
+        assert_eq!(taffy_style.min_size.height, taffy::Dimension::length(4.0));
+        assert_eq!(taffy_style.max_size.width, taffy::Dimension::length(50.0));
+        assert_eq!(taffy_style.max_size.height, taffy::Dimension::length(60.0));
+    }
+
+    #[test]
+    fn to_taffy_per_axis_should_override_paired_size_axis() {
+        // A per-axis `width` overrides the paired `size`'s width axis, but the paired height survives.
+        let style = LayoutStyle {
+            size: Some(Size { w: 100.0, h: 50.0 }),
+            width: Some(20.0),
+            ..LayoutStyle::default()
+        };
+        let taffy_style = style.to_taffy();
+
+        assert_eq!(
+            taffy_style.size.width,
+            taffy::Dimension::length(20.0),
+            "per-axis width wins over the paired size's width"
+        );
+        assert_eq!(
+            taffy_style.size.height,
+            taffy::Dimension::length(50.0),
+            "the paired size's height axis is untouched"
+        );
     }
 }
