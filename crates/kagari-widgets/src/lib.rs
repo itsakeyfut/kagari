@@ -7,12 +7,16 @@ pub mod button;
 pub mod checkbox;
 pub mod control;
 pub mod label;
+pub mod progress;
 pub mod radio;
+pub mod spinner;
 pub mod switch;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
 pub use control::ControlSize;
 pub use label::{Label, label};
+pub use progress::{Progress, progress};
 pub use radio::{RadioGroup, radio_group};
+pub use spinner::{Spinner, spinner};
 pub use switch::{Switch, switch};

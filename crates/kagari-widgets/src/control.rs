@@ -82,6 +82,28 @@ pub(crate) fn radio_mark_px(size: ControlSize) -> Px {
     checkbox_box_px(size)
 }
 
+/// The progress-bar track `(width, height)` (logical px) for `size` — a thin, wide pill (#87).
+pub(crate) fn progress_dims(size: ControlSize) -> (Px, Px) {
+    match size {
+        ControlSize::Sm => (Px(96.0), Px(4.0)),
+        ControlSize::Md => (Px(128.0), Px(6.0)),
+        ControlSize::Lg => (Px(160.0), Px(8.0)),
+    }
+}
+
+/// The spinner metrics `(track_w, track_h, segment_w)` (logical px) for `size` — an indeterminate pill
+/// with a segment that bounces across the track (#87).
+pub(crate) fn spinner_dims(size: ControlSize) -> (Px, Px, Px) {
+    match size {
+        ControlSize::Sm => (Px(48.0), Px(4.0), Px(16.0)),
+        ControlSize::Md => (Px(64.0), Px(6.0), Px(22.0)),
+        ControlSize::Lg => (Px(80.0), Px(8.0), Px(28.0)),
+    }
+}
+
+/// Seconds per spinner bounce cycle (#87) — how long the segment takes to travel across and back.
+pub(crate) const SPINNER_PERIOD: f32 = 1.2;
+
 /// The radio mark's inner-dot diameter (logical px) for `size` — about half the outer circle. Kept
 /// **even** (like the even outer diameters from `checkbox_box_px`) so `(outer − dot)/2` is a whole
 /// number: an odd dot in an even circle centers at a half-pixel and snaps off-center on the pixel grid.
