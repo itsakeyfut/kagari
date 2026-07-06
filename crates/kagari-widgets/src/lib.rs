@@ -9,6 +9,7 @@ pub mod control;
 pub mod label;
 pub mod progress;
 pub mod radio;
+pub mod segmented;
 pub mod spinner;
 pub mod switch;
 
@@ -18,5 +19,6 @@ pub use control::ControlSize;
 pub use label::{Label, label};
 pub use progress::{Progress, progress};
 pub use radio::{RadioGroup, radio_group};
+pub use segmented::{SegmentContent, Segmented, ToggleGroup, segmented, toggle_group};
 pub use spinner::{Spinner, spinner};
 pub use switch::{Switch, switch};
