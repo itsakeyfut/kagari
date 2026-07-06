@@ -33,6 +33,11 @@ struct DamageInner {
     layout: Vec<NodeId>,
     /// Nodes needing repaint only (appearance changed).
     paint: Vec<NodeId>,
+    /// `dyn_if`/`dyn_list` nodes that staged a structural change (#278): the frame loop runs a reconcile
+    /// pass to apply their mount/unmount. Modeled as the staged node ids (like `layout`/`paint`, not the
+    /// node-less `full`) so the wake *is* the payload — a targeted work-list survives, and `is_dirty()`
+    /// derives from it rather than a separate flag that could drift.
+    structure: Vec<NodeId>,
     /// A whole-tree repaint is pending (e.g. a theme swap, #43): every token must re-resolve. Not
     /// tied to specific nodes — the layout reskin happens as elements re-apply their resolved style
     /// during the next `request_layout`; this flag only wakes the loop and drives a full repaint.
@@ -51,6 +56,12 @@ impl DamageSink for DamageState {
             inner.layout.push(id);
         }
     }
+
+    fn mark_structure_dirty(&self, id: NodeId) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.structure.push(id);
+        }
+    }
 }
 
 impl DamageState {
@@ -59,7 +70,12 @@ impl DamageState {
     pub fn is_dirty(&self) -> bool {
         self.inner
             .lock()
-            .map(|inner| inner.full || !inner.layout.is_empty() || !inner.paint.is_empty())
+            .map(|inner| {
+                inner.full
+                    || !inner.layout.is_empty()
+                    || !inner.paint.is_empty()
+                    || !inner.structure.is_empty()
+            })
             .unwrap_or(false)
     }
 
@@ -77,6 +93,17 @@ impl DamageState {
     pub fn take_layout_dirty(&self) -> Vec<NodeId> {
         match self.inner.lock() {
             Ok(mut inner) => std::mem::take(&mut inner.layout),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Drains and returns the `dyn` nodes that staged a structural change (#278). The frame loop
+    /// ([`render_tree`](crate::paint::render_tree)) checks this before `compute`: a non-empty result
+    /// gates a reconcile pass (`Element::reconcile` over the tree) that applies the staged mount/unmount;
+    /// an empty result skips the walk (no per-frame reconcile during animation).
+    pub fn take_structure_dirty(&self) -> Vec<NodeId> {
+        match self.inner.lock() {
+            Ok(mut inner) => std::mem::take(&mut inner.structure),
             Err(_) => Vec::new(),
         }
     }
@@ -134,6 +161,7 @@ impl DamageState {
         if let Ok(mut inner) = self.inner.lock() {
             inner.layout.clear();
             inner.paint.clear();
+            inner.structure.clear();
             inner.full = false;
         }
     }

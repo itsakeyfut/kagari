@@ -72,6 +72,28 @@ impl LayoutTree {
         let _ = self.taffy.set_children(parent_id, &child_ids);
     }
 
+    /// Removes `node` and its whole subtree from the tree (taffy nodes + `fwd`/`measures` entries),
+    /// freeing the layout plane on a live unmount (#278). `set_children` only *detaches* a node from
+    /// its taffy parent — without this, an unmounted `dyn_if`/`dyn_list` child would leak its taffy
+    /// node and measure closure on every reconcile (build-once never exercised removal). Bottom-up:
+    /// recurse into taffy children (recovered as kagari [`NodeId`]s via each node's context) before
+    /// removing the node itself. No-op if `node` is unknown.
+    pub fn remove_subtree(&mut self, node: NodeId) {
+        let Some(&taffy_id) = self.fwd.get(&node) else {
+            return;
+        };
+        // Snapshot the children first, then recurse — removing a child mutates the parent's list.
+        let children = self.taffy.children(taffy_id).unwrap_or_default();
+        for child_taffy in children {
+            if let Some(&child_node) = self.taffy.get_node_context(child_taffy) {
+                self.remove_subtree(child_node);
+            }
+        }
+        let _ = self.taffy.remove(taffy_id);
+        self.fwd.remove(&node);
+        self.measures.remove(&node);
+    }
+
     /// Recomputes layout for the `root` subtree against `viewport`. Leaves with a measure
     /// function report their intrinsic size.
     pub fn compute(&mut self, root: NodeId, viewport: Size) -> Result<(), LayoutError> {
@@ -472,5 +494,47 @@ mod tests {
         // An unknown node is a silent zero rect (no panic), mirroring `layout`/`is_dirty`.
         let tree = LayoutTree::new();
         assert_eq!(tree.absolute_layout(node(99)), Rect::default());
+    }
+
+    #[test]
+    fn remove_subtree_should_free_node_and_descendants() {
+        // #278: a live unmount must free the whole layout subtree (taffy node + fwd/measures), not
+        // just detach it. After removal the parent and its child are unknown (zero rect), the root
+        // still computes, and re-removal / measure lookups are silent no-ops.
+        let mut tree = LayoutTree::new();
+        let (root, parent, child) = (node(1), node(2), node(3));
+        tree.insert(root, None);
+        tree.insert(parent, Some(root));
+        tree.insert(child, Some(parent));
+        let sized = LayoutStyle {
+            size: Some(Size { w: 20.0, h: 20.0 }),
+            ..LayoutStyle::default()
+        };
+        tree.set_style(root, &LayoutStyle::default());
+        tree.set_style(parent, &sized);
+        tree.set_style(child, &sized);
+        tree.compute(root, Size { w: 100.0, h: 100.0 }).unwrap();
+        assert_ne!(
+            tree.layout(parent),
+            Rect::default(),
+            "parent is laid out before removal"
+        );
+
+        tree.remove_subtree(parent);
+        assert_eq!(
+            tree.layout(parent),
+            Rect::default(),
+            "the removed parent is freed (unknown → zero rect)"
+        );
+        assert_eq!(
+            tree.layout(child),
+            Rect::default(),
+            "the whole subtree is freed, not just the parent node"
+        );
+        // The root survives and recomputes with the subtree detached.
+        tree.set_children(root, &[]);
+        tree.compute(root, Size { w: 100.0, h: 100.0 }).unwrap();
+        // Re-removal of a now-unknown node is a silent no-op.
+        tree.remove_subtree(parent);
     }
 }

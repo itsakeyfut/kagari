@@ -65,6 +65,16 @@ impl CursorRegistry {
         self.cursors.insert(node, icon);
     }
 
+    /// Deregisters every node within `root`'s subtree — a live unmount (#278) — so the cursor map does not
+    /// grow unbounded across mount/unmount cycles and a stale (removed) `NodeId` cannot be resolved. Uses
+    /// the arena while the subtree still exists, so call it **before** `arena.remove_subtree`. Reuses the
+    /// focus registry's allocation-free `is_within` (parent-walk, short-circuits) rather than allocating a
+    /// `Vec` per entry via `ancestor_path`.
+    pub fn deregister_subtree(&mut self, arena: &Arena, root: NodeId) {
+        self.cursors
+            .retain(|&node, _| !super::focus::is_within(arena, node, root));
+    }
+
     /// The cursor at `pos`: the topmost hit's nearest cursor-declaring node, found by walking the arena
     /// ancestor chain from that node up to the root (innermost first). Returns [`CursorIcon::default`]
     /// when `pos` hits no region, or no node on the chain declares a cursor.
@@ -198,6 +208,46 @@ mod tests {
             reg.resolve(&hit, &arena, Point::new(50.0, 50.0)),
             CursorIcon::Default,
             "outside every region the cursor is the default"
+        );
+    }
+
+    #[test]
+    fn deregister_subtree_should_remove_cursors_within_root() {
+        // #278: a live unmount removes the subtree's cursor declarations so a stale NodeId can't resolve
+        // and the map doesn't leak; nodes outside the removed subtree keep theirs.
+        let mut arena = Arena::new();
+        let root = arena.insert(Node::default());
+        let scope = arena.insert(Node {
+            parent: Some(root),
+            children: Vec::new(),
+        });
+        let inner = arena.insert(Node {
+            parent: Some(scope),
+            children: Vec::new(),
+        });
+        let outside = arena.insert(Node {
+            parent: Some(root),
+            children: Vec::new(),
+        });
+        let mut reg = CursorRegistry::new();
+        reg.register(inner, CursorIcon::Pointer);
+        reg.register(outside, CursorIcon::Text);
+
+        reg.deregister_subtree(&arena, scope);
+
+        let mut hit = HitTest::new();
+        hit.push(region(inner, 0.0, 0.0, 10.0, 10.0, 0));
+        assert_eq!(
+            reg.resolve(&hit, &arena, Point::new(5.0, 5.0)),
+            CursorIcon::Default,
+            "the unmounted inner node's cursor is deregistered"
+        );
+        let mut hit2 = HitTest::new();
+        hit2.push(region(outside, 0.0, 0.0, 10.0, 10.0, 0));
+        assert_eq!(
+            reg.resolve(&hit2, &arena, Point::new(5.0, 5.0)),
+            CursorIcon::Text,
+            "a node outside the removed subtree keeps its cursor"
         );
     }
 

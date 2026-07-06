@@ -58,6 +58,11 @@ pub trait DamageSink: Send + Sync {
     /// no-op so paint-only sinks need not implement it; the first reactive layout setter that
     /// calls this lands in #146.
     fn mark_layout_dirty(&self, _id: NodeId) {}
+
+    /// Mark that `id` (a `dyn_if`/`dyn_list`) has staged a structural change — its condition or
+    /// collection changed — so the frame loop runs a reconcile pass to apply the mount/unmount
+    /// (#278). Default no-op so paint-only sinks need not implement it.
+    fn mark_structure_dirty(&self, _id: NodeId) {}
 }
 
 /// Context for [`Element::request_layout`](super::Element::request_layout): the arena to build

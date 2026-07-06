@@ -758,6 +758,13 @@ impl Element for Div {
         }
     }
 
+    fn reconcile(&mut self, cx: &mut LayoutCx) {
+        // Container: recurse so nested `dyn_if`/`dyn_list` children reconcile live (#278).
+        for child in &mut self.children {
+            child.reconcile(cx);
+        }
+    }
+
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
         let Some(id) = self.id else {
             return;
