@@ -113,8 +113,11 @@ impl TextSystem {
     /// missing or the glyph has no monochrome outline (e.g. a color/bitmap glyph).
     fn rasterize_glyph(&mut self, glyph: &PlacedGlyph) -> Option<(GlyphMetrics, Vec<u8>)> {
         let ppem = glyph.size_px.round().max(1.0);
-        // The face is fixed by `font_id`; NORMAL weight avoids synthetic bold (MVP).
-        let font = self
+        // The face is fixed by `font_id`; NORMAL weight avoids synthetic bold (MVP). The font system now
+        // lives behind the shaper (#260); borrow it as a **field** so the borrow stays disjoint from
+        // `self.scale_context` (mutably borrowed below).
+        let mut state = self.shaper.state_mut();
+        let font = state
             .font_system
             .get_font(glyph.font_id, fontdb::Weight::NORMAL)?;
         let mut scaler = self

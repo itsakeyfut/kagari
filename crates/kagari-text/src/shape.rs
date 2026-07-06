@@ -3,7 +3,9 @@
 //! result cache so unchanged runs are not re-shaped (specs §5.4). Rasterization
 //! is #22.
 
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap, fontdb};
 use kagari_base::{Px, SharedString, Size};
@@ -13,6 +15,9 @@ use crate::font::FontDb;
 /// Line height applied when `TextStyle::line_height` is `None`, as a multiple of
 /// the font size (a common default until per-style line height is wired through).
 const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.2;
+/// Upper bound on the shape-result cache (#260): with `wrap` widths as keys, a resize would otherwise grow
+/// it unboundedly. On overflow the cache is dropped and re-shaped on demand (a coarse bound; LRU is post-MVP).
+const SHAPE_CACHE_CAP: usize = 512;
 /// Locale used when the system locale cannot be detected (affects Han-unified
 /// glyph selection when multiple CJK fonts are present).
 const FALLBACK_LOCALE: &str = "en-US";
@@ -99,42 +104,28 @@ impl ShapeKey {
     }
 }
 
-/// Owns the cosmic-text `FontSystem`, a shape-result cache, and the swash
-/// rasterization state (#22). `scale_context` and `glyph_cache` are used by
-/// `raster.rs`; the atlas itself (the glyph pixels + LRU) lives in the renderer.
-pub struct TextSystem {
+/// The shape state — the cosmic-text `FontSystem` + the shape-result cache — behind a [`Shaper`]
+/// handle (#260). Kept separate from `TextSystem` so a measure closure can share it.
+pub(crate) struct ShaperState {
     pub(crate) font_system: FontSystem,
     cache: HashMap<ShapeKey, ShapedText>,
-    pub(crate) scale_context: swash::scale::ScaleContext,
-    pub(crate) glyph_cache: HashMap<u64, crate::raster::GlyphMetrics>,
 }
 
-impl TextSystem {
-    /// Build from the #20 font database, using the detected system locale (falling
-    /// back to `en-US`). The database's bundled-first ordering is preserved.
-    pub fn new(font_db: FontDb) -> Self {
-        let locale = sys_locale::get_locale().unwrap_or_else(|| FALLBACK_LOCALE.to_string());
-        Self::with_locale(font_db, locale)
-    }
-
-    /// Build with an explicit locale (controls Han-unified glyph selection).
-    pub fn with_locale(font_db: FontDb, locale: String) -> Self {
-        Self {
-            font_system: FontSystem::new_with_locale_and_db(locale, font_db.into_database()),
-            cache: HashMap::new(),
-            scale_context: swash::scale::ScaleContext::new(),
-            glyph_cache: HashMap::new(),
-        }
-    }
-
-    /// Shape `text` with `style`, wrapping at `wrap` px if given. Identical
-    /// `(text, style, wrap)` inputs reuse the cached result.
-    pub fn shape(&mut self, text: &str, style: &TextStyle, wrap: Option<f32>) -> ShapedText {
+impl ShaperState {
+    /// Shape `text` with `style`, wrapping at `wrap` px if given, reusing the cached result for
+    /// identical `(text, style, wrap)` inputs.
+    fn shape(&mut self, text: &str, style: &TextStyle, wrap: Option<f32>) -> ShapedText {
         let key = ShapeKey::new(text, style, wrap);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
         let shaped = self.shape_uncached(text, style, wrap);
+        // Bound the cache (#260): once `wrap` widths key the cache, a window resize sweeps distinct widths
+        // and would grow it without limit. A coarse cap (drop all on overflow, re-shape on demand) keeps
+        // memory bounded; a proper LRU is a post-MVP refinement.
+        if self.cache.len() >= SHAPE_CACHE_CAP {
+            self.cache.clear();
+        }
         self.cache.insert(key, shaped.clone());
         shaped
     }
@@ -236,6 +227,85 @@ impl TextSystem {
     }
 }
 
+/// A cheaply-cloneable shaping handle (#260): the shape state (font system + shape cache) behind
+/// `Rc<RefCell>`, so a layout **measure** closure can capture a clone and re-shape at *compute* time
+/// against the available width. Cloning shares the same font system + cache, so a measure and the paint
+/// that follows shape once. `!Send` (the UI/reactive runtime is thread-local).
+#[derive(Clone)]
+pub struct Shaper {
+    state: Rc<RefCell<ShaperState>>,
+}
+
+impl Shaper {
+    fn new(font_system: FontSystem) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(ShaperState {
+                font_system,
+                cache: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Shape `text` with `style`, wrapping at `wrap` px if given (`None` → single line). Identical
+    /// `(text, style, wrap)` inputs reuse the cached result.
+    pub fn shape(&self, text: &str, style: &TextStyle, wrap: Option<f32>) -> ShapedText {
+        self.state.borrow_mut().shape(text, style, wrap)
+    }
+
+    /// Mutable access to the shape state's font system, for glyph rasterization (`raster.rs`).
+    pub(crate) fn state_mut(&self) -> RefMut<'_, ShaperState> {
+        self.state.borrow_mut()
+    }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.state.borrow().cache.len()
+    }
+}
+
+/// Owns the shaping handle ([`Shaper`]) and the swash rasterization state (#22). `scale_context` and
+/// `glyph_cache` are used by `raster.rs`; the atlas itself (the glyph pixels + LRU) lives in the renderer.
+pub struct TextSystem {
+    /// `pub(crate)` so `raster.rs` can borrow the font system as a **field** (`self.shaper.state_mut()`),
+    /// keeping that borrow disjoint from `self.scale_context` (a `&self` accessor would borrow all of `self`).
+    pub(crate) shaper: Shaper,
+    pub(crate) scale_context: swash::scale::ScaleContext,
+    pub(crate) glyph_cache: HashMap<u64, crate::raster::GlyphMetrics>,
+}
+
+impl TextSystem {
+    /// Build from the #20 font database, using the detected system locale (falling
+    /// back to `en-US`). The database's bundled-first ordering is preserved.
+    pub fn new(font_db: FontDb) -> Self {
+        let locale = sys_locale::get_locale().unwrap_or_else(|| FALLBACK_LOCALE.to_string());
+        Self::with_locale(font_db, locale)
+    }
+
+    /// Build with an explicit locale (controls Han-unified glyph selection).
+    pub fn with_locale(font_db: FontDb, locale: String) -> Self {
+        Self {
+            shaper: Shaper::new(FontSystem::new_with_locale_and_db(
+                locale,
+                font_db.into_database(),
+            )),
+            scale_context: swash::scale::ScaleContext::new(),
+            glyph_cache: HashMap::new(),
+        }
+    }
+
+    /// Shape `text` with `style`, wrapping at `wrap` px if given. Identical
+    /// `(text, style, wrap)` inputs reuse the cached result.
+    pub fn shape(&mut self, text: &str, style: &TextStyle, wrap: Option<f32>) -> ShapedText {
+        self.shaper.shape(text, style, wrap)
+    }
+
+    /// A cheaply-cloneable [`Shaper`] handle (#260), for a layout measure closure to re-shape at compute
+    /// time (available-width wrapping). Shares this system's font system + shape cache.
+    pub fn shaper(&self) -> Shaper {
+        self.shaper.clone()
+    }
+}
+
 /// The index of the visual line containing byte offset `byte`: the last line whose range starts at or
 /// before `byte` (the final line for a trailing offset). For cursor line-mapping + vertical motion (#220).
 pub(crate) fn line_of_byte(shaped: &ShapedText, byte: usize) -> usize {
@@ -297,12 +367,12 @@ mod tests {
         let mut system = TextSystem::new(FontDb::new());
         let style = style();
         let _ = system.shape("日本語 test", &style, None);
-        assert_eq!(system.cache.len(), 1);
+        assert_eq!(system.shaper.cache_len(), 1);
         // Identical input must reuse the cached result, not add an entry.
         let _ = system.shape("日本語 test", &style, None);
-        assert_eq!(system.cache.len(), 1);
+        assert_eq!(system.shaper.cache_len(), 1);
         // A different string is a distinct key.
         let _ = system.shape("different", &style, None);
-        assert_eq!(system.cache.len(), 2);
+        assert_eq!(system.shaper.cache_len(), 2);
     }
 }

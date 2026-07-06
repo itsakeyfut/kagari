@@ -3,8 +3,8 @@
 //! theme swap, unlike a raw `text()` which uses a fixed light color), with `.color(..)` / `.muted()` for
 //! the color role and `.size(..)` for the font size on the shared control scale (D3).
 //!
-//! **No wrapping yet**: available-width line wrapping needs a core `Text` change (measure-time shaping);
-//! it is tracked in #260, which will add `Label::wrap(bool)` on top of this.
+//! **Wrapping (#260)**: `.wrap(true)` line-breaks the label to its available width (via core `Text`'s
+//! measure-time shaping); off by default, so a label stays single-line unless asked to wrap.
 
 use kagari_base::SharedString;
 use kagari_core::{AnyElement, IntoElement, Role, div, text};
@@ -19,6 +19,7 @@ pub struct Label {
     content: SharedString,
     color: ColorRole,
     size: ControlSize,
+    wrap: bool,
 }
 
 /// Creates a label showing `content` in the theme's `Text` color at the medium size.
@@ -27,6 +28,7 @@ pub fn label(content: impl Into<SharedString>) -> Label {
         content: content.into(),
         color: ColorRole::Text,
         size: ControlSize::Md,
+        wrap: false,
     }
 }
 
@@ -48,6 +50,13 @@ impl Label {
         self.size = size;
         self
     }
+
+    /// Wraps the label to its available width (#260): line-breaks to the container width, staying
+    /// single-line when the width is unconstrained. Off by default.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
 }
 
 impl IntoElement for Label {
@@ -55,13 +64,18 @@ impl IntoElement for Label {
         // Wrap the glyph text in a `Role::Label` node so the label surfaces in the accesskit tree (a
         // bare `text()` leaf carries no a11y — kagari's a11y is Div-based, #257 / RK-032). The wrapper
         // sizes to the text, so layout is unchanged.
-        div()
-            .role(Role::Label)
-            .a11y_label(self.content.clone())
+        let mut wrapper = div().role(Role::Label).a11y_label(self.content.clone());
+        // A wrapping label must let its wrapper shrink below its content too (`min-width: 0`), or the
+        // flex wrapper keeps the text at its single-line width and it never wraps (#260).
+        if self.wrap {
+            wrapper = wrapper.min_w(0.0);
+        }
+        wrapper
             .child(
                 text(self.content)
                     .color_role(self.color)
-                    .size(label_px(self.size)),
+                    .size(label_px(self.size))
+                    .wrap(self.wrap),
             )
             .into_element()
     }
@@ -89,8 +103,8 @@ mod tests {
         h: 200.0,
     };
 
-    /// Lays out `label` alone and returns the root text node's computed size.
-    fn measured(label: Label) -> BSize {
+    /// Lays out `label` alone at `viewport` and returns the root node's computed size.
+    fn measured_at(label: Label, viewport: BSize) -> BSize {
         let mut root = label.into_element();
         let mut arena = Arena::new();
         let mut layout = LayoutTree::new();
@@ -109,12 +123,17 @@ mod tests {
             None,
             None,
             &mut scene,
-            VIEWPORT,
+            viewport,
             &damage,
             &Theme::light(),
         )
         .unwrap();
         layout.layout(root_id).size
+    }
+
+    /// Lays out `label` at the wide default viewport (text never width-clamped).
+    fn measured(label: Label) -> BSize {
+        measured_at(label, VIEWPORT)
     }
 
     #[test]
@@ -136,6 +155,65 @@ mod tests {
         assert!(
             long.w > short.w,
             "longer content should be wider: long={long:?} short={short:?}"
+        );
+    }
+
+    /// Lays out `label` inside a fixed-width (`parent_w` × tall) flex parent whose cross-axis is not
+    /// stretched (`items_start`), so the label sizes to its wrapped content, and returns the label's
+    /// computed size. (A label as the *root* would size a flex container to its content and never see a
+    /// width constraint; the realistic case is a width-constrained parent — #260.)
+    fn measured_in_width(label: Label, parent_w: f32) -> BSize {
+        let mut root = div()
+            .size(BSize {
+                w: parent_w,
+                h: 400.0,
+            })
+            .items_start()
+            .child(label)
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let damage = Arc::new(DamageState::default());
+        let root_id = render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut scene,
+            BSize { w: 400.0, h: 800.0 },
+            &damage,
+            &Theme::light(),
+        )
+        .unwrap();
+        let label_id = arena
+            .get(root_id)
+            .and_then(|n| n.children.first().copied())
+            .expect("the parent has the label as its child");
+        layout.layout(label_id).size
+    }
+
+    #[test]
+    fn label_wrap_should_break_lines() {
+        // In a fixed-width parent, a wrapping label breaks its (long) text to multiple lines — laying out
+        // taller and within the parent width — while a non-wrapping one stays single-line, overflowing (#260).
+        let long = "The quick brown fox jumps over the lazy dog";
+        let wrapped = measured_in_width(label(long).wrap(true), 80.0);
+        let single = measured_in_width(label(long).wrap(false), 80.0);
+        assert!(
+            wrapped.h > single.h,
+            "a wrapped label is taller (multi-line) than a single-line one: wrapped={wrapped:?} single={single:?}"
+        );
+        assert!(
+            wrapped.w <= 80.5 && single.w > 80.5,
+            "the wrapped label fits the parent width while the single-line one overflows: wrapped={wrapped:?} single={single:?}"
         );
     }
 }

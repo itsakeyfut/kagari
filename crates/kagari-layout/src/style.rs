@@ -141,6 +141,11 @@ pub struct LayoutStyle {
     pub padding: Edges,
     pub size: Option<Size>,
     pub min_size: Option<Size>,
+    /// Per-axis minimum width (#260), overriding [`min_size`](Self::min_size)'s width axis when set — so a
+    /// caller can set `min-width: 0` (to let a flex child shrink and wrap) **without** also zeroing
+    /// `min-height` (which `min_size`, being a paired `Size`, would). `None` leaves the width axis to
+    /// `min_size` (or taffy's `auto` = min-content).
+    pub min_width: Option<f32>,
     pub max_size: Option<Size>,
     pub align_items: Option<AlignItems>,
     pub justify_content: Option<JustifyContent>,
@@ -171,6 +176,7 @@ impl Default for LayoutStyle {
             padding: Edges::default(),
             size: None,
             min_size: None,
+            min_width: None,
             max_size: None,
             align_items: None,
             justify_content: None,
@@ -207,7 +213,15 @@ impl LayoutStyle {
                 bottom: taffy::LengthPercentage::length(self.padding.bottom),
             },
             size: taffy_size(self.size),
-            min_size: taffy_size(self.min_size),
+            min_size: {
+                // Per-axis `min_width` (#260) overrides only the width axis, leaving the height axis to
+                // `min_size` (or `auto`) so `min-width: 0` doesn't also zero `min-height`.
+                let mut ms = taffy_size(self.min_size);
+                if let Some(w) = self.min_width {
+                    ms.width = taffy::Dimension::length(w);
+                }
+                ms
+            },
             max_size: taffy_size(self.max_size),
             align_items: self.align_items.map(map_align_items),
             justify_content: self.justify_content.map(map_justify_content),
