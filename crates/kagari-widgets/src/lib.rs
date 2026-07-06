@@ -6,6 +6,7 @@
 pub mod button;
 pub mod checkbox;
 pub mod control;
+pub mod field;
 pub mod label;
 pub mod progress;
 pub mod radio;
@@ -16,6 +17,7 @@ pub mod switch;
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
 pub use control::ControlSize;
+pub use field::{Field, FieldLayout, field};
 pub use label::{Label, label};
 pub use progress::{Progress, progress};
 pub use radio::{RadioGroup, radio_group};
