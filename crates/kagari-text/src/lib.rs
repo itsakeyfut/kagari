@@ -12,7 +12,7 @@ pub use error::TextError;
 pub use font::FontDb;
 pub use ime::{ImeEvent, ImeState};
 pub use input::{Movement, TextBuffer};
-pub use shape::{LineInfo, PlacedGlyph, ShapedText, TextStyle, TextSystem};
+pub use shape::{LineInfo, PlacedGlyph, ShapedText, Shaper, TextStyle, TextSystem};
 
 /// Re-exported so consumers can name the font id/weight types that appear in
 /// `TextStyle`, `PlacedGlyph`, and `FontDb` (cosmic-text and kagari-text share one

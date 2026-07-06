@@ -227,6 +227,15 @@ impl Div {
         self
     }
 
+    /// Sets the minimum width (logical px). Notably `min-width: 0` lets a flex child shrink **below** its
+    /// content width — required for a nested wrapping text to break to its container (flexbox's default
+    /// `min-width: auto` = min-content otherwise keeps the item at its content width). Per-axis: it does
+    /// **not** affect `min-height`. #260.
+    pub fn min_w(mut self, min_w: f32) -> Self {
+        self.layout.min_width = Some(min_w);
+        self
+    }
+
     /// Registers a mouse-button-press handler (#48). Bubble-phase: it runs as the event bubbles
     /// from the target up through this node. The handler writes to signals (design.md §3); call
     /// [`EventCx::stop_propagation`] to halt bubbling or [`EventCx::capture_pointer`] to start a drag

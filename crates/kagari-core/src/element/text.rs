@@ -21,8 +21,16 @@ pub struct Text {
     /// the resolved role is stored, and `paint` resolves role → color via `cx.theme`, so it follows a
     /// theme swap (and, for a reactive `rx(..)`, a state signal). Takes precedence over `color` when set.
     color_role: ReactiveProp<ColorRole>,
+    /// Whether to wrap to the available width (#260). When set, the measure re-shapes at the width taffy
+    /// allots each `compute` (single line when the width is unconstrained); otherwise the text is shaped
+    /// once at build and stays single-line.
+    wrap: bool,
     id: Option<NodeId>,
     shaped: Option<ShapedText>,
+    /// The width `shaped` was last shaped at, for a wrapping text (#260) — so `paint` re-shapes only when
+    /// the laid-out width changes, reusing the memoized shaping (a borrow) otherwise instead of cloning
+    /// the cached `ShapedText` every frame. Unused on the non-wrap path (`shaped` is the build shaping).
+    shaped_width: Option<f32>,
 }
 
 /// Creates a text leaf with the default style (bundled "Noto Sans", 16px) and a light color.
@@ -37,8 +45,10 @@ pub fn text(content: impl Into<SharedString>) -> Text {
         },
         color: Color::new(0.9, 0.9, 0.9, 1.0),
         color_role: ReactiveProp::default(),
+        wrap: false,
         id: None,
         shaped: None,
+        shaped_width: None,
     }
 }
 
@@ -62,6 +72,14 @@ impl Text {
         self.style.size = size;
         self
     }
+
+    /// Wraps the text to its available width (#260): line-breaks to the width taffy allots (the container
+    /// width), and stays single-line when the width is unconstrained. Off by default. **Damage: layout**
+    /// (a width change re-measures via the shaper at `compute` time).
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
 }
 
 impl Element for Text {
@@ -74,13 +92,37 @@ impl Element for Text {
         cx.layout.insert(id, None);
         self.color_role.bind(&cx.damage, id);
 
-        // Shape once at build: cache the result, report its intrinsic size as the measure (so
-        // `compute` needs no TextSystem), and reuse the cached shaping at paint.
-        let shaped = cx.text.shape(&self.text, &self.style, None);
-        let size = shaped.size;
-        self.shaped = Some(shaped);
-        cx.layout.set_measure(id, Box::new(move |_avail| size));
-        cx.layout.set_style(id, &LayoutStyle::default());
+        if self.wrap {
+            // Wrapping text (#260): the measure re-shapes at the available width each `compute` via a
+            // cloned `Shaper` handle — `avail.width == None` (unconstrained) → single line, `Some(w)` →
+            // wrap at `w`. `paint` re-shapes at the laid-out width (cache-deduped), so `shaped` stays `None`.
+            let shaper = cx.text.shaper();
+            let text = self.text.clone();
+            let style = self.style.clone();
+            cx.layout.set_measure(
+                id,
+                Box::new(move |avail| shaper.shape(&text, &style, avail.width).size),
+            );
+        } else {
+            // Shape once at build: cache the result, report its intrinsic size as a constant measure (so
+            // `compute` needs no TextSystem), and reuse the cached shaping at paint.
+            let shaped = cx.text.shape(&self.text, &self.style, None);
+            let size = shaped.size;
+            self.shaped = Some(shaped);
+            cx.layout.set_measure(id, Box::new(move |_avail| size));
+        }
+        // A wrapping text needs `min-width: 0` (flexbox's default `min-width: auto` = min-content keeps a
+        // flex item at its content width, so it would never shrink to wrap). Per-axis, so `min-height`
+        // stays `auto` (no vertical clipping in a height-constrained flex column). #260.
+        let style = if self.wrap {
+            LayoutStyle {
+                min_width: Some(0.0),
+                ..LayoutStyle::default()
+            }
+        } else {
+            LayoutStyle::default()
+        };
+        cx.layout.set_style(id, &style);
         id
     }
 
@@ -94,10 +136,17 @@ impl Element for Text {
             .map(|role| cx.theme.resolve_color(role))
             .unwrap_or(self.color);
         // Without an atlas (GPU-free Scene-structure tests) text emits no glyphs.
-        let Some(shaped) = self.shaped.as_ref() else {
+        let Some(atlas) = cx.atlas.as_deref_mut() else {
             return;
         };
-        let Some(atlas) = cx.atlas.as_deref_mut() else {
+        // Wrapping text re-shapes at the laid-out width, but **memoized**: only when the width changed
+        // since the last paint (otherwise the build/prev `shaped` is reused by borrow — no per-frame
+        // `ShapedText` clone). Non-wrap reuses the build-time single-line shaping unchanged.
+        if self.wrap && self.shaped_width != Some(bounds.size.w) {
+            self.shaped = Some(cx.text.shape(&self.text, &self.style, Some(bounds.size.w)));
+            self.shaped_width = Some(bounds.size.w);
+        }
+        let Some(shaped) = self.shaped.as_ref() else {
             return;
         };
         // Rasterize directly into the scene's glyph buffer (reused across frames) — no per-frame
@@ -138,8 +187,11 @@ mod tests {
     use crate::arena::Arena;
     use crate::damage::DamageState;
     use crate::element::DamageSink;
+    use crate::paint::render_tree;
     use crate::reactive::rx;
+    use kagari_base::Size as BSize;
     use kagari_layout::LayoutTree;
+    use kagari_render::Scene;
     use kagari_style::{ColorRole, Theme};
     use kagari_text::FontDb;
     use kagari_text::TextSystem;
@@ -228,5 +280,115 @@ mod tests {
             "the reactive color-role write flags paint damage"
         );
         drop(owner);
+    }
+
+    /// Lays out `t` inside a fixed-width (`parent_w` × tall) flex parent whose cross-axis is not stretched
+    /// (`items_start`), so the text sizes to its wrapped content, and returns the text's computed size. The
+    /// `render_tree` pass exercises the wrap **measure** (at `compute`); the paint re-shape is not hit here
+    /// (paint early-returns without an atlas, before the re-shape). This is the realistic case: a flex-item
+    /// text needs `min-width: 0` to shrink and wrap to its container (#260).
+    fn text_in_width(t: Text, parent_w: f32) -> BSize {
+        let mut root = crate::element::div()
+            .size(BSize {
+                w: parent_w,
+                h: 400.0,
+            })
+            .items_start()
+            .child(t)
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut ts = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let damage = Arc::new(DamageState::default());
+        let root_id = render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut ts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut scene,
+            BSize { w: 400.0, h: 800.0 },
+            &damage,
+            &Theme::default(),
+        )
+        .unwrap();
+        let text_id = arena
+            .get(root_id)
+            .and_then(|n| n.children.first().copied())
+            .expect("the parent has the text as its child");
+        layout.layout(text_id).size
+    }
+
+    #[test]
+    fn text_wrap_should_break_to_available_width() {
+        // In a fixed-width parent, `.wrap(true)` line-breaks the (long) text — laying out taller
+        // (multi-line) and within the parent width — while `.wrap(false)` stays single-line, wider than
+        // the parent (proving `min-width: 0` let the flex item shrink and wrap). #260.
+        let long = "The quick brown fox jumps over the lazy dog";
+        let wrapped = text_in_width(text(long).wrap(true), 80.0);
+        let single = text_in_width(text(long).wrap(false), 80.0);
+        assert!(
+            wrapped.h > single.h,
+            "wrapped text is taller (multi-line) than single-line: wrapped={wrapped:?} single={single:?}"
+        );
+        assert!(
+            wrapped.w <= 80.5 && single.w > 80.5,
+            "wrapped text fits the parent width while single-line overflows: wrapped={wrapped:?} single={single:?}"
+        );
+    }
+
+    #[test]
+    fn text_wrap_should_not_clip_height_in_short_flex_col() {
+        // #260 regression: `min-width: 0` for wrapping must be **per-axis** (min-height stays `auto`), or a
+        // wrapping text in a height-constrained overflowing flex column gets vertically shrunk/clipped. The
+        // wrapped text keeps its full (multi-line) height, overflowing the short column.
+        let long = "The quick brown fox jumps over the lazy dog wraps to several lines here";
+        let short_h = 24.0; // ~ one line — the wrapped text is much taller
+        let mut root = crate::element::div()
+            .flex_col()
+            .size(BSize {
+                w: 90.0,
+                h: short_h,
+            })
+            .child(text(long).wrap(true))
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut ts = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let damage = Arc::new(DamageState::default());
+        let root_id = render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut ts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut scene,
+            BSize { w: 400.0, h: 400.0 },
+            &damage,
+            &Theme::default(),
+        )
+        .unwrap();
+        let text_id = arena
+            .get(root_id)
+            .and_then(|n| n.children.first().copied())
+            .expect("the column has the text as its child");
+        let text_h = layout.layout(text_id).size.h;
+        assert!(
+            text_h > short_h,
+            "the wrapped text keeps its full multi-line height (min-height stays auto), not clipped to the \
+             short column: text_h={text_h} col_h={short_h}"
+        );
     }
 }
