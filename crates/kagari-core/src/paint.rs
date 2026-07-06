@@ -67,7 +67,17 @@ pub fn render_tree(
             focus,
             cursor,
         };
-        root.request_layout(&mut layout_cx)
+        let id = root.request_layout(&mut layout_cx);
+        // Reconcile pass (#278): if any `dyn_if`/`dyn_list` staged a structural change, apply it now — a
+        // second build pass over the retained tree (`Element::reconcile`), before the layout-dirty drain
+        // + `compute`, so mounts/unmounts take effect this frame (a newly-mounted child registers its
+        // styles/measures/focus/cursor; `apply_staged` marks the parent layout-dirty so `compute` relays
+        // it out). **Gated** on the structure wake, so an animating window (no structure change) skips
+        // the whole-tree walk. Runs under the same `LayoutCx` as the build.
+        if !damage.take_structure_dirty().is_empty() {
+            root.reconcile(&mut layout_cx);
+        }
+        id
     };
 
     // Drain layout-dirty nodes flagged since the last frame so `compute` re-lays-out only those

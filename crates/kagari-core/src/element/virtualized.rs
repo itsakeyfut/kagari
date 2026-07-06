@@ -74,15 +74,9 @@ where
 
 impl VirtualizedList {
     /// Whether the visible range changed since the last reconcile (the offset scrolled). The frame
-    /// scheduler (#36) polls this; tests call it before [`reconcile`](Self::reconcile).
+    /// scheduler polls this; tests poll it before driving [`Element::reconcile`].
     pub fn is_dirty(&self) -> bool {
         self.list.is_dirty()
-    }
-
-    /// Realizes newly-visible rows and releases scrolled-out ones — delegating to the inner keyed
-    /// reconcile, so per-child owner cleanup + `remove_subtree` (RK-005/006) are preserved.
-    pub fn reconcile(&mut self, cx: &mut LayoutCx) {
-        self.list.reconcile(cx);
     }
 }
 
@@ -130,6 +124,15 @@ impl Element for VirtualizedList {
     }
 
     fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
+
+    fn reconcile(&mut self, cx: &mut LayoutCx) {
+        // A container: realize the inner list's staged range change (scrolled-in/out rows) live, then
+        // recurse into the realized rows so nested dyn nodes inside a row reconcile too (#278/#86).
+        self.list.apply_staged(cx);
+        for (_, _, element) in self.list.realized_children() {
+            element.reconcile(cx);
+        }
+    }
 }
 
 impl IntoElement for VirtualizedList {

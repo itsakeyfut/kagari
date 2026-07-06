@@ -164,6 +164,37 @@ impl FocusRegistry {
         self.inner().nodes.get(&id).copied()
     }
 
+    /// Deregisters every focusable whose node is within `root`'s subtree — a live unmount (#278). Removes
+    /// their `FocusId → NodeId` entries and tab-order slots, and clears the current focus if it pointed at
+    /// a removed target (so keyboard dispatch cannot resolve a now-dead node, and the tab order / node map
+    /// do not grow unbounded across mount/unmount cycles). Uses the arena while the subtree still exists,
+    /// so call it **before** `arena.remove_subtree`. No-op if the subtree holds no focusables.
+    pub fn deregister_subtree(&self, arena: &Arena, root: NodeId) {
+        let removed: Vec<FocusId> = {
+            let mut inner = self.inner();
+            let removed: Vec<FocusId> = inner
+                .nodes
+                .iter()
+                .filter(|&(_, &node)| is_within(arena, node, root))
+                .map(|(&id, _)| id)
+                .collect();
+            for id in &removed {
+                inner.nodes.remove(id);
+            }
+            inner.order.retain(|id| !removed.contains(id));
+            removed
+        };
+        // Clear focus if it pointed at a removed target. Done outside the lock: `set` runs subscribers
+        // synchronously and they may read the registry (the mutex is not reentrant), as in `step`.
+        if self
+            .current
+            .get_untracked()
+            .is_some_and(|cur| removed.contains(&cur))
+        {
+            self.current.set(None);
+        }
+    }
+
     /// Moves focus to the next focusable in tab order (wrapping); from no focus, the first.
     pub fn focus_next(&self) {
         self.step(1);
@@ -265,8 +296,9 @@ impl Default for FocusRegistry {
 
 /// Whether `node` is `scope_root` or a descendant of it, walking parents without allocating (unlike
 /// `ancestor_path`, which builds a `Vec`). The focus-trap filter tests this per focusable on every Tab
-/// (#219), so it stays allocation-free and short-circuits on the first match.
-fn is_within(arena: &Arena, mut node: NodeId, scope_root: NodeId) -> bool {
+/// (#219), so it stays allocation-free and short-circuits on the first match. `pub(crate)` so the cursor
+/// registry's subtree deregistration (#278) reuses it instead of allocating via `ancestor_path`.
+pub(crate) fn is_within(arena: &Arena, mut node: NodeId, scope_root: NodeId) -> bool {
     loop {
         if node == scope_root {
             return true;
@@ -603,6 +635,41 @@ mod tests {
             "navigating an empty trap scope leaves focus unchanged"
         );
 
+        drop(owner);
+    }
+
+    #[test]
+    fn deregister_subtree_should_remove_focusables_and_clear_stale_focus() {
+        // #278: a live unmount deregisters the removed subtree's focusables and clears focus if it
+        // pointed at one, so keyboard dispatch cannot resolve a dead node and tab order does not leak.
+        let owner = Owner::new();
+        owner.set();
+        let mut arena = Arena::new();
+        let root = node(&mut arena, None);
+        let scope = node(&mut arena, Some(root));
+        let inner_node = node(&mut arena, Some(scope));
+        let outside = node(&mut arena, Some(root));
+
+        let reg = FocusRegistry::new();
+        let h_in = reg.handle();
+        let h_out = reg.handle();
+        reg.register(h_in.id(), inner_node);
+        reg.register(h_out.id(), outside);
+        h_in.focus();
+        assert_eq!(reg.focused_node(), Some(inner_node));
+
+        reg.deregister_subtree(&arena, scope);
+        assert_eq!(
+            reg.focused_node(),
+            None,
+            "focus on a removed target is cleared"
+        );
+        // The removed focusable is out of tab order; nav now visits only the survivor.
+        reg.focus_next();
+        assert!(
+            h_out.is_focused(),
+            "only the surviving focusable remains in tab order"
+        );
         drop(owner);
     }
 

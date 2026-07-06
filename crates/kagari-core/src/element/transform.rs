@@ -251,6 +251,13 @@ impl Element for Transformed {
         cx.pop_transform();
     }
 
+    fn reconcile(&mut self, cx: &mut LayoutCx) {
+        // Container: recurse so a nested `dyn_if`/`dyn_list` inside the transformed child reconciles live (#278).
+        if let Some(child) = self.child.as_mut() {
+            child.reconcile(cx);
+        }
+    }
+
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
         // Descend toward the target so the child's handlers run (dispatch drives the path).
         let Some(id) = self.id else {

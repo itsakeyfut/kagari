@@ -447,6 +447,13 @@ impl Element for Overlay {
         }
     }
 
+    fn reconcile(&mut self, cx: &mut LayoutCx) {
+        // Container: recurse so nested `dyn_if`/`dyn_list` inside the overlay content reconcile live (#278).
+        if let Some(child) = self.child.as_mut() {
+            child.reconcile(cx);
+        }
+    }
+
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
         // Descend toward the target so the overlay content's handlers run (dispatch drives the path).
         let Some(id) = self.id else {

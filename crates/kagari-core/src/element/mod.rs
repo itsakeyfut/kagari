@@ -43,6 +43,17 @@ pub trait Element {
 
     /// Handle an input event. Minimal seam for Phase 3 (no events exist yet).
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx);
+
+    /// Apply any staged structural change and recurse into children — the frame loop's reconcile pass
+    /// (#278). Runs after `request_layout`, before `compute` (a second, gated *build* pass — hence
+    /// `LayoutCx`, not `PaintCx`). The default is a no-op, correct for **leaves** only.
+    ///
+    /// **Contract: every container element MUST override this to recurse into its children** (mirroring
+    /// its `paint`/`request_layout` child recursion), or a nested `dyn_if`/`dyn_list` beneath it will not
+    /// reconcile live. A `dyn` container additionally applies its own staged mount/unmount first, then
+    /// recurses. This obligation is not compile-enforced (the trait has no children accessor), so the
+    /// crate test `containers_should_recurse_reconcile_into_nested_dyn` guards it.
+    fn reconcile(&mut self, _cx: &mut LayoutCx) {}
 }
 
 /// Conversion into an opaque [`AnyElement`], letting builder methods accept `impl IntoElement`.
