@@ -6,6 +6,7 @@
 pub mod button;
 pub mod checkbox;
 pub mod control;
+pub mod dialog;
 pub mod field;
 pub mod label;
 pub mod popover;
@@ -20,6 +21,7 @@ pub mod tooltip;
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
 pub use control::ControlSize;
+pub use dialog::{Dialog, dialog};
 pub use field::{Field, FieldLayout, field};
 pub use label::{Label, label};
 pub use popover::{Popover, popover};
