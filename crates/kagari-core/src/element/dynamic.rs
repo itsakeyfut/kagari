@@ -228,7 +228,20 @@ where
         }
     }
 
-    fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
+    fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
+        // Descend toward the target so a mounted row's handlers run (dispatch drives the path). Without
+        // this, click/key handlers inside a `dyn_list` row never fire (the event dies at this node).
+        let Some(id) = self.id else {
+            return;
+        };
+        let next = cx.next_child_on_path(id);
+        for (_, child_id, _, element) in &mut self.children {
+            if next == Some(*child_id) {
+                element.handle_event(ev, cx);
+                break;
+            }
+        }
+    }
 
     fn reconcile(&mut self, cx: &mut LayoutCx) {
         // Apply this list's staged collection change (mount/unmount rows), then recurse so nested dyn
@@ -387,7 +400,18 @@ impl Element for DynIf {
         }
     }
 
-    fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
+    fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
+        // Descend toward the target so the mounted child's handlers run (dispatch drives the path).
+        // Without this, click/key handlers inside a `dyn_if` subtree never fire (the event dies here).
+        let Some(id) = self.id else {
+            return;
+        };
+        if let Some((child_id, _, element)) = self.child.as_mut() {
+            if cx.next_child_on_path(id) == Some(*child_id) {
+                element.handle_event(ev, cx);
+            }
+        }
+    }
 
     fn reconcile(&mut self, cx: &mut LayoutCx) {
         // Apply this node's staged mount/unmount, then recurse into the (possibly newly-mounted) child
@@ -1066,6 +1090,106 @@ mod tests {
             reg.resolve(&hit, &arena, pos),
             CursorIcon::Default,
             "after unmount the child's cursor is deregistered (resolves to default, not a stale entry)"
+        );
+        drop(owner);
+    }
+
+    /// Renders one frame with a hit-test attached, then dispatches a left click at `pos`. The caller wires
+    /// a flag into an `on_click` and asserts it after; the harness state is local (nothing to return).
+    fn click_at(root: &mut AnyElement, pos: Point) {
+        use crate::event::{
+            DispatchState, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse,
+        };
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut hit = HitTest::new();
+        let damage = Arc::new(DamageState::default());
+        let mut scene = Scene::new();
+        render_tree(
+            root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            Some(&mut hit),
+            None,
+            None,
+            None,
+            None,
+            &mut scene,
+            VIEWPORT,
+            &damage,
+            &Theme::default(),
+        )
+        .unwrap();
+        let mut dispatch = DispatchState::default();
+        for kind in [
+            MouseKind::Down(MouseButton::Left),
+            MouseKind::Up(MouseButton::Left),
+        ] {
+            let ev = MouseEvent::new(kind, pos, Modifiers::default());
+            dispatch_mouse(root, &arena, &hit, &ev, &mut dispatch);
+        }
+    }
+
+    #[test]
+    fn dyn_if_should_dispatch_click_to_child() {
+        // A click inside a dyn_if's mounted child must reach its handler — dispatch descends through the
+        // dyn node (regression: `handle_event` used to be a no-op, so the event died here).
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let owner = Owner::new();
+        owner.set();
+        let clicked = Rc::new(Cell::new(false));
+        let c = clicked.clone();
+        let mut root = dyn_if(
+            || true,
+            move || {
+                let c = c.clone();
+                div()
+                    .size(Size { w: 40.0, h: 20.0 })
+                    .on_click(move |_, _| c.set(true))
+            },
+        )
+        .into_element();
+
+        click_at(&mut root, Point::new(20.0, 10.0));
+        assert!(
+            clicked.get(),
+            "a click inside a dyn_if child fires its on_click"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn dyn_list_should_dispatch_click_to_row() {
+        // A click inside a dyn_list's mounted row must reach its handler (same regression as dyn_if).
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let owner = Owner::new();
+        owner.set();
+        let clicked = Rc::new(Cell::new(false));
+        let c = clicked.clone();
+        let mut root = dyn_list(
+            || vec![0usize],
+            |k: &usize| *k,
+            move |_| {
+                let c = c.clone();
+                div()
+                    .size(Size { w: 40.0, h: 20.0 })
+                    .on_click(move |_, _| c.set(true))
+            },
+        )
+        .into_element();
+
+        click_at(&mut root, Point::new(20.0, 10.0));
+        assert!(
+            clicked.get(),
+            "a click inside a dyn_list row fires its on_click"
         );
         drop(owner);
     }
