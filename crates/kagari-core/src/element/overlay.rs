@@ -105,6 +105,8 @@ enum OverlayPlacement {
         anchor: AnchorHandle,
         placement: Placement,
     },
+    /// Centered in the viewport (a modal dialog), resolved at paint from the content size + viewport.
+    Centered,
 }
 
 /// A portal overlay: its `child` is deferred-drawn at an absolute window `position` (static or
@@ -188,6 +190,14 @@ impl Overlay {
             anchor: anchor.clone(),
             placement,
         };
+        self.position = None;
+        self
+    }
+
+    /// Centers the overlay's content in the viewport (a modal dialog). Resolved at paint from the
+    /// content size + viewport, so the content stays centered as the window resizes.
+    pub fn center(mut self) -> Self {
+        self.placement = OverlayPlacement::Centered;
         self.position = None;
         self
     }
@@ -387,6 +397,13 @@ impl Element for Overlay {
                 ),
                 None => Point::new(0.0, 0.0),
             },
+            OverlayPlacement::Centered => {
+                let vp = cx.viewport();
+                Point::new(
+                    (vp.w - overlay_size.w).max(0.0) / 2.0,
+                    (vp.h - overlay_size.h).max(0.0) / 2.0,
+                )
+            }
         };
         let child_bounds = Rect {
             origin,
@@ -670,6 +687,41 @@ mod tests {
         assert_eq!(
             trailing.bounds.origin.y, 10.0,
             "the overlay takes no flow space; the trailing sibling is not pushed down"
+        );
+    }
+
+    #[test]
+    fn overlay_center_should_center_content_in_viewport() {
+        // A 50x40 content-sized child in a 200x100 viewport, centered: origin = ((200-50)/2, (100-40)/2)
+        // = (75, 30). Resolved at paint from the content size + viewport (a modal dialog).
+        let mut root = div()
+            .child(overlay(div().size(Size { w: 50.0, h: 40.0 }).background(green())).center())
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 100.0 });
+
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(
+            scene.quads[0].bounds.origin,
+            Point::new(75.0, 30.0),
+            "the overlay content is centered in the viewport"
+        );
+    }
+
+    #[test]
+    fn overlay_center_should_clamp_when_larger_than_viewport() {
+        // Content wider/taller than the viewport clamps to (0, 0) — it stays on-screen at the top-left
+        // rather than centering to a negative origin.
+        let mut root = div()
+            .child(overlay(div().size(Size { w: 300.0, h: 150.0 }).background(green())).center())
+            .into_element();
+
+        let (scene, _hit, _reg, _arena, _id) = build_paint(&mut root, Size { w: 200.0, h: 100.0 });
+
+        assert_eq!(
+            scene.quads[0].bounds.origin,
+            Point::new(0.0, 0.0),
+            "content larger than the viewport clamps to the top-left"
         );
     }
 
