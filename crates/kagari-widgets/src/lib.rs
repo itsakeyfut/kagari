@@ -5,6 +5,7 @@
 
 pub mod button;
 pub mod checkbox;
+pub mod context_menu;
 pub mod control;
 pub mod dialog;
 pub mod field;
@@ -21,6 +22,7 @@ pub mod tooltip;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
+pub use context_menu::{ContextMenu, context_menu};
 pub use control::ControlSize;
 pub use dialog::{Dialog, dialog};
 pub use field::{Field, FieldLayout, field};

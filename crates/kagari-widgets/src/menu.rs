@@ -12,10 +12,10 @@
 
 use std::rc::Rc;
 
-use kagari_base::SharedString;
-use kagari_core::element::dyn_if;
+use kagari_base::{Point, SharedString};
+use kagari_core::element::{Overlay, dyn_if};
 use kagari_core::reactive::prelude::*;
-use kagari_core::reactive::{RwSignal, rx};
+use kagari_core::reactive::{Prop, RwSignal, rx};
 use kagari_core::{
     AnchorHandle, AnyElement, IntoElement, KeyCode, Placement, div, overlay, text, use_focus_handle,
 };
@@ -189,6 +189,34 @@ fn build_panel(entries: Rc<Vec<MenuEntry>>, open: RwSignal<bool>) -> impl IntoEl
     panel
 }
 
+/// Builds the menu's overlay scaffold: a `dyn_if`-gated panel, bound to `open` (paint-gate + focus
+/// save/restore) and dismissed on an outside press. The caller applies positioning — `.anchor()` for the
+/// dropdown ([`Menu::into_element`]), `.position()` for a pointer menu ([`Menu::into_positioned`], #78).
+fn menu_overlay(entries: Vec<MenuEntry>, open: RwSignal<bool>) -> Overlay {
+    let entries = Rc::new(entries);
+    overlay(dyn_if(
+        move || open.get(),
+        move || build_panel(Rc::clone(&entries), open),
+    ))
+    .open(open)
+    .dismiss_on_outside(true)
+}
+
+impl Menu {
+    /// Re-presents this menu at an absolute window `at` point instead of anchored to an element (for
+    /// [`ContextMenu`](crate::ContextMenu), #78). Reuses the same panel (items / nav / focus / dismiss)
+    /// driven by the menu's `open`; the anchor / placement set on the menu are unused on this path.
+    pub(crate) fn into_positioned(self, at: impl Into<Prop<Point>>) -> AnyElement {
+        let Menu { open, entries, .. } = self;
+        menu_overlay(entries, open).position(at).into_element()
+    }
+
+    /// The visibility signal, so a container (ContextMenu) can open the menu itself (e.g. on right-click).
+    pub(crate) fn open_signal(&self) -> RwSignal<bool> {
+        self.open
+    }
+}
+
 impl IntoElement for Menu {
     fn into_element(self) -> AnyElement {
         let Menu {
@@ -197,15 +225,9 @@ impl IntoElement for Menu {
             entries,
             placement,
         } = self;
-        let entries = Rc::new(entries);
-        overlay(dyn_if(
-            move || open.get(),
-            move || build_panel(Rc::clone(&entries), open),
-        ))
-        .anchor(&anchor, placement)
-        .open(open)
-        .dismiss_on_outside(true)
-        .into_element()
+        menu_overlay(entries, open)
+            .anchor(&anchor, placement)
+            .into_element()
     }
 }
 
