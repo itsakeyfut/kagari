@@ -834,6 +834,16 @@ impl Element for Div {
                     }
                 }
             }
+            Event::Ime(_) => {
+                // IME bubbles the focused node's ancestor chain to the editable leaf (#296). Div only
+                // descends — there are no Div-level IME handlers; the editor leaf consumes Event::Ime in its
+                // own handle_event.
+                if let Some(next) = cx.next_child_on_path(id) {
+                    if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
+                        self.children[i].handle_event(ev, cx);
+                    }
+                }
+            }
             Event::Action(action) => {
                 // A resolved action bubbles the focus chain (#50), same descend-then-fire as keyboard;
                 // every action handler fires (it matches the action it cares about).

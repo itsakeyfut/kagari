@@ -37,7 +37,8 @@ use crate::event::{
     Action, CursorIcon, CursorRegistry, CursorState, DispatchState, DragPayload, FileDrop,
     FocusRegistry, GestureRecognizer, HitTest, KeyChord, KeyContext, KeyEvent, Keymap, Modifiers,
     MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_drag_leave, dispatch_drag_over,
-    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
+    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_ime, dispatch_key,
+    dispatch_mouse,
 };
 use crate::overlay::{OverlayLayers, OverlayRegistry};
 use crate::paint::{paint_element_into, render_tree};
@@ -920,8 +921,8 @@ fn route_key(keymap: &Keymap, ev: &KeyEvent) -> KeyRoute {
 }
 
 impl WindowState {
-    /// Handle a winit IME event: track enable state, report the caret area on enable, and forward
-    /// preedit/commit (as `ImeEvent`) to the text layer when enabled.
+    /// Handle a winit IME event: track enable state, report the caret area on enable, and route
+    /// preedit/commit (as `ImeEvent`) to the focused editable element (#296) when enabled.
     fn on_ime(&mut self, ime: Ime) {
         match &ime {
             Ime::Enabled => {
@@ -933,13 +934,16 @@ impl WindowState {
         }
         if let Some(ev) = map_ime_event(ime) {
             if self.ime_enabled {
-                // #25 routes this to the focused TextBuffer. Log only the event shape, never the
-                // composed text (IME content is user input, may include passwords).
+                // Log only the event shape, never the composed text (IME content is user input, may
+                // include passwords).
                 let (kind, text_len) = match &ev {
                     ImeEvent::Preedit { text, .. } => ("preedit", text.len()),
                     ImeEvent::Commit(text) => ("commit", text.len()),
+                    _ => ("ime", 0),
                 };
                 tracing::debug!(kind, text_len, "ime event");
+                // Route to the focused editable element, bubbling its ancestor chain (#296).
+                dispatch_ime(&mut self.root, &self.arena, self.focus.focused_node(), &ev);
             }
         }
     }

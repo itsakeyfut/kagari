@@ -7,7 +7,7 @@ use kagari_base::{NodeId, Rect, Size, Transform};
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
-use kagari_text::TextSystem;
+use kagari_text::{ImeEvent, TextSystem};
 
 use super::AnyElement;
 use crate::a11y::{A11y, A11yTree};
@@ -345,6 +345,9 @@ impl<'a> PaintCx<'a> {
 pub enum Event {
     Mouse(MouseEvent),
     Keyboard(KeyEvent),
+    /// A resolved IME preedit/commit (#296), dispatched up the focus chain to the focused editable element
+    /// (which consumes it in its own `handle_event`); containers only descend toward the focused node.
+    Ime(ImeEvent),
     /// A resolved [`Action`] (#50), dispatched up the focus chain to `on_action` handlers.
     Action(Action),
     /// A recognized [`GestureEvent`] (#51), dispatched up the hit path to `on_gesture` handlers.

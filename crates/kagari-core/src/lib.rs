@@ -40,8 +40,8 @@ pub use event::{
     DropTarget, FileDrop, FocusHandle, FocusId, FocusRegistry, GestureEvent, GestureRecognizer,
     HitRegion, HitTest, InteractFlags, KeyChord, KeyCode, KeyContext, KeyEvent, Keymap, Modifiers,
     MouseButton, MouseEvent, MouseKind, dispatch_action, dispatch_drag_leave, dispatch_drag_over,
-    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_key, dispatch_mouse,
-    use_focus_handle,
+    dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_ime, dispatch_key,
+    dispatch_mouse, use_focus_handle,
 };
 pub use kagari_base::{Transform, WindowId};
 pub use kagari_render::IconId;
