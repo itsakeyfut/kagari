@@ -506,6 +506,23 @@ impl TextBuffer {
         let height = shaped.lines.first().map_or(0.0, |line| line.height);
         Rect::from_xywh(x_at_byte(shaped, self.cursor), 0.0, 1.0, height)
     }
+
+    /// The selection's pixel rect(s), relative to the text origin, for drawing selection background
+    /// quads (#297). Empty when there is no selection. Single-line MVP: one rect spanning the byte
+    /// range (first-line height, like [`caret_rect`](Self::caret_rect)); multi-line per-line geometry
+    /// is post-MVP (the `Vec` return keeps the signature ready for it — `x_at_byte` is single-line
+    /// scoped, RK-024).
+    pub fn selection_rects(&self, shaped: &ShapedText) -> Vec<Rect> {
+        let Some(sel) = self.selection() else {
+            return Vec::new();
+        };
+        // The selection is always normalized (`start < end`) and never empty (a collapse stores `None`),
+        // so `x0 <= x1` for single-line LTR; `.max(0.0)` guards the degenerate case regardless.
+        let height = shaped.lines.first().map_or(0.0, |line| line.height);
+        let x0 = x_at_byte(shaped, sel.start);
+        let x1 = x_at_byte(shaped, sel.end);
+        vec![Rect::from_xywh(x0, 0.0, (x1 - x0).max(0.0), height)]
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +653,54 @@ mod tests {
         let caret = buffer.caret_rect(&shaped);
         assert_eq!(caret.origin.x, x_at_byte(&shaped, 2));
         assert!(caret.size.h > 0.0);
+    }
+
+    #[test]
+    fn selection_rects_should_span_the_selected_range() {
+        let mut system = TextSystem::new(FontDb::new());
+        let style = TextStyle {
+            family: "Noto Sans".into(),
+            size: Px(16.0),
+            weight: fontdb::Weight::NORMAL,
+            line_height: None,
+        };
+        let shaped = system.shape("abc", &style, None);
+        let mut buffer = TextBuffer::with_text("abc");
+        buffer.set_selection(0..2);
+
+        let rects = buffer.selection_rects(&shaped);
+        assert_eq!(rects.len(), 1, "a single-line selection is one rect");
+        let r = rects[0];
+        assert_eq!(
+            r.origin.x,
+            x_at_byte(&shaped, 0),
+            "rect starts at the selection's first byte"
+        );
+        assert_eq!(r.origin.y, 0.0);
+        assert_eq!(
+            r.size.w,
+            x_at_byte(&shaped, 2) - x_at_byte(&shaped, 0),
+            "rect spans the selected byte range"
+        );
+        assert!(r.size.h > 0.0, "rect has the line height");
+    }
+
+    #[test]
+    fn selection_rects_should_be_empty_without_selection() {
+        let mut system = TextSystem::new(FontDb::new());
+        let style = TextStyle {
+            family: "Noto Sans".into(),
+            size: Px(16.0),
+            weight: fontdb::Weight::NORMAL,
+            line_height: None,
+        };
+        let shaped = system.shape("abc", &style, None);
+        let buffer = TextBuffer::with_text("abc");
+
+        assert!(
+            buffer.selection_rects(&shaped).is_empty(),
+            "no selection yields no rects"
+        );
     }
 
     #[test]
