@@ -68,3 +68,13 @@ notify = "8.2.0"               # dev theme hot-reload file watcher (kagari-style
 proptest = "=1.10.0"
 criterion = "0.8.2"
 tempfile = "3.27.0"             # temp theme files in hot-reload tests
+
+# Build ergonomics. This workspace statically links wgpu/winit/cosmic-text into ~40 test/example binaries;
+# full debuginfo (`debug = 2`) makes each link step memory-hungry, and `cargo test` runs many in parallel.
+# `line-tables-only` keeps backtraces (file:line) while slashing link memory + time. On low-RAM / high-core
+# machines also cap parallel jobs (`.cargo/config.toml` → `[build] jobs`).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
