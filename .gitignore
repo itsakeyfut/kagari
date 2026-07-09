@@ -24,6 +24,9 @@ Desktop.ini
 # Ignore build artifacts and lock files
 **/target/
 
+# Machine-specific local build tuning (parallel-jobs cap for low-RAM machines)
+/.cargo/config.toml
+
 
 /Cargo.lock
 
