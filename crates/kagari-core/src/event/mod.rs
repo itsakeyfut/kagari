@@ -19,7 +19,7 @@ pub use cursor::{CursorIcon, CursorRegistry, CursorState};
 pub use dispatch::{
     DispatchState, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
     dispatch_action, dispatch_drag_leave, dispatch_drag_over, dispatch_drag_start, dispatch_drop,
-    dispatch_gesture, dispatch_key, dispatch_mouse,
+    dispatch_gesture, dispatch_ime, dispatch_key, dispatch_mouse,
 };
 pub use dnd::{DragPayload, DragSource, DropTarget, FileDrop};
 pub use focus::{FocusHandle, FocusId, FocusRegistry, use_focus_handle};

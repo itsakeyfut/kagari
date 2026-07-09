@@ -17,6 +17,8 @@ use std::any::TypeId;
 
 use kagari_base::{NodeId, Point};
 
+use kagari_text::ImeEvent;
+
 use crate::arena::Arena;
 use crate::element::{AnyElement, Event, EventCx};
 use crate::event::{DragPayload, HitTest};
@@ -410,6 +412,22 @@ pub fn dispatch_key(root: &mut AnyElement, arena: &Arena, focused: Option<NodeId
     }
 }
 
+/// Dispatches one IME event (preedit/commit) to the `focused` node, bubbling up its ancestor chain (#296).
+/// Like [`dispatch_key`], IME goes to the focus chain (not a pointer hit), so the caller resolves the focused
+/// node from the focus registry; a `None` focus drops the event. The focused editable element consumes
+/// `Event::Ime` in its own `handle_event`; containers only descend toward it.
+pub fn dispatch_ime(root: &mut AnyElement, arena: &Arena, focused: Option<NodeId>, ev: &ImeEvent) {
+    if let Some(node) = focused {
+        let path = ancestor_path(arena, node);
+        deliver(
+            root,
+            arena,
+            Delivery::Bubble { path: &path },
+            &Event::Ime(ev.clone()),
+        );
+    }
+}
+
 /// Dispatches a resolved [`Action`](crate::event::Action) to the `focused` node, bubbling up its
 /// ancestor chain to `on_action` handlers (#50). Like [`dispatch_key`], the caller resolves the
 /// focused node (from the focus registry); a `None` focus drops the action. Reuses the same bubble
@@ -545,7 +563,7 @@ pub fn dispatch_drop(
 mod tests {
     use super::*;
     use crate::arena::{Arena, Node};
-    use crate::element::{DamageSink, Div, IntoElement, LayoutCx, div};
+    use crate::element::{DamageSink, Div, Element, IntoElement, LayoutCx, PaintCx, div};
     use crate::event::{Action, FocusRegistry, GestureEvent, HitRegion, InteractFlags};
     use crate::reactive::Owner;
     use kagari_base::Rect;
@@ -1162,5 +1180,145 @@ mod tests {
         dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>());
         dispatch_drag_leave(&mut root, &arena, id);
         assert_eq!(*log.borrow(), vec!["over", "leave"]);
+    }
+
+    /// A minimal focusable leaf that records the `Event::Ime`s it receives — the stand-in for the future
+    /// editable element (#298), since Div has no IME handler (IME goes to the editor leaf, not Div).
+    struct ImeProbe {
+        log: Rc<RefCell<Vec<ImeEvent>>>,
+    }
+
+    impl Element for ImeProbe {
+        fn request_layout(&mut self, cx: &mut LayoutCx) -> NodeId {
+            let id = cx.arena.insert(Node::default());
+            cx.layout.insert(id, None);
+            id
+        }
+        fn paint(&mut self, _bounds: Rect, _cx: &mut PaintCx) {}
+        fn handle_event(&mut self, ev: &Event, _cx: &mut EventCx) {
+            if let Event::Ime(e) = ev {
+                self.log.borrow_mut().push(e.clone());
+            }
+        }
+    }
+
+    impl IntoElement for ImeProbe {
+        fn into_element(self) -> AnyElement {
+            Box::new(self)
+        }
+    }
+
+    struct NoopDamage;
+    impl DamageSink for NoopDamage {
+        fn mark_paint_dirty(&self, _id: NodeId) {}
+    }
+
+    #[test]
+    fn ime_should_dispatch_to_focused_node() {
+        // An IME event delivered to the focused node reaches its `handle_event` (#296). No Owner needed —
+        // the probe registers no reactive props.
+        let log: Rc<RefCell<Vec<ImeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let probe = ImeProbe {
+            log: Rc::clone(&log),
+        };
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = probe.into_element();
+        let id = root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+
+        let ev = ImeEvent::Commit("あ".into());
+        dispatch_ime(&mut root, &arena, Some(id), &ev);
+
+        assert_eq!(
+            *log.borrow(),
+            vec![ev],
+            "the focused node receives the IME event"
+        );
+    }
+
+    #[test]
+    fn ime_should_descend_through_div_to_focused_leaf() {
+        // A container descends toward the focused leaf on Event::Ime, so an IME event reaches an editor leaf
+        // nested under a `div` — proving the Div pass-through arm. Building a `div` binds reactive props, so
+        // an Owner must be alive (RK-005, serial).
+        let owner = Owner::new();
+        owner.set();
+
+        let log: Rc<RefCell<Vec<ImeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let probe = ImeProbe {
+            log: Rc::clone(&log),
+        };
+        let root = div().child(probe);
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = root.into_element();
+        let div_id = root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+        // The probe is the div's only child.
+        let leaf = arena.get(div_id).unwrap().children[0];
+
+        let ev = ImeEvent::Preedit {
+            text: "に".into(),
+            cursor: Some((0, 3)),
+        };
+        dispatch_ime(&mut root, &arena, Some(leaf), &ev);
+
+        assert_eq!(
+            *log.borrow(),
+            vec![ev],
+            "IME descends through the div to the focused leaf"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn ime_should_drop_when_no_focus() {
+        // A `None` focus drops the IME event (parity with dispatch_key).
+        let log: Rc<RefCell<Vec<ImeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let probe = ImeProbe {
+            log: Rc::clone(&log),
+        };
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = probe.into_element();
+        root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+
+        dispatch_ime(&mut root, &arena, None, &ImeEvent::Commit("x".into()));
+
+        assert!(log.borrow().is_empty(), "no focus drops the IME event");
     }
 }

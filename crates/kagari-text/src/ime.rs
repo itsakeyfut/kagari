@@ -10,8 +10,12 @@ use kagari_render::{Atlas, RoundedRect, Scene, Underline, UnderlineStyle};
 
 use crate::shape::{ShapedText, TextStyle, TextSystem};
 
-/// An abstract IME event: a composing-text (preedit) update or a committed insertion.
+/// An abstract IME event: a composing-text (preedit) update or a committed insertion. `#[non_exhaustive]`:
+/// IME is a growth area (protocols carry further signals such as delete-surrounding-text), so variants can
+/// be added without a breaking change — the outer core `Event` being `#[non_exhaustive]` does not protect an
+/// inner `match Event::Ime(ImeEvent::…)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImeEvent {
     /// The composing (preedit) text plus an optional selection range as byte offsets
     /// into `text`. `cursor == None` hides the cursor; an empty `text` clears preedit.
