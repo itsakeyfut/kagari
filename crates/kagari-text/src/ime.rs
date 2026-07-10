@@ -86,6 +86,9 @@ impl ImeState {
     /// `order_base + 1` (glyphs above the underlines). Passing the tree's order — rather
     /// than a hardcoded low value — keeps the preedit above the surrounding field
     /// background, which a nested field's background quad would otherwise overdraw.
+    ///
+    /// `clip` masks the preedit glyphs + underlines to a rect (the field bounds, #72) so a long composing
+    /// string does not overflow the border; `None` leaves it unclipped (the whole-viewport default).
     #[allow(clippy::too_many_arguments)] // a cohesive preedit-emit call, mirroring paint.rs's emitters
     pub fn emit_preedit(
         &self,
@@ -96,10 +99,16 @@ impl ImeState {
         atlas: &mut Atlas,
         scene: &mut Scene,
         order_base: u32,
+        clip: Option<Rect>,
     ) {
         if self.preedit.is_empty() {
             return;
         }
+        // Mask everything to the caller's clip (the field, #72), or a whole-viewport no-op when unclipped.
+        let mask = RoundedRect {
+            rect: clip.unwrap_or_else(|| Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4)),
+            radii: Default::default(),
+        };
         let shaped = text_system.shape(&self.preedit, style, None);
 
         // Glyphs: rasterize at the 0-origin, translate to the caret origin, and draw
@@ -110,6 +119,7 @@ impl ImeState {
             glyph.bounds.origin.x += origin.x;
             glyph.bounds.origin.y += origin.y;
             glyph.order = order_base + 1;
+            glyph.content_mask = mask;
             scene.glyphs.push(glyph);
         }
 
@@ -117,16 +127,12 @@ impl ImeState {
         // solid whole-preedit underline to emphasize the converting region (Q5).
         let thickness = (style.size.0 * 0.0625).max(1.0);
         let underline_y = origin.y + shaped.size.h - thickness;
-        let no_clip = RoundedRect {
-            rect: Rect::from_xywh(0.0, 0.0, 1.0e4, 1.0e4),
-            radii: Default::default(),
-        };
         scene.underlines.push(Underline {
             rect: Rect::from_xywh(origin.x, underline_y, shaped.size.w, thickness),
             color,
             style: UnderlineStyle::Solid,
             thickness,
-            content_mask: no_clip,
+            content_mask: mask,
             order: order_base,
         });
         if let Some((start, end)) = self.active {
@@ -141,7 +147,7 @@ impl ImeState {
                 color,
                 style: UnderlineStyle::Dotted,
                 thickness,
-                content_mask: no_clip,
+                content_mask: mask,
                 order: order_base,
             });
         }
