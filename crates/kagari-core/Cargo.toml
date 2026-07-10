@@ -28,6 +28,8 @@ wgpu = { workspace = true }
 pollster = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# OS clipboard for the editable text element (#298); a fresh handle is opened per copy/paste op.
+arboard = { workspace = true }
 
 [features]
 # Dev theme hot-reload (#44): wires the kagari-style watcher to the App via the winit EventLoopProxy.

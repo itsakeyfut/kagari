@@ -147,6 +147,38 @@ impl Text {
     }
 }
 
+/// Rasterizes `shaped` into the scene's glyph buffer at `bounds.origin` with `color`, stamping the current
+/// painter order and the active scroll clip. A no-op without an atlas (GPU-free Scene-structure tests emit
+/// no glyphs). Shared by the read-only [`Text`] leaf and the editable `TextEdit` leaf (#298), so a clip /
+/// order / offset fix lands in one place.
+pub(crate) fn paint_shaped_glyphs(
+    cx: &mut PaintCx,
+    shaped: &ShapedText,
+    color: Color,
+    bounds: Rect,
+) {
+    let Some(atlas) = cx.atlas.as_deref_mut() else {
+        return;
+    };
+    // Rasterize directly into the reused per-frame glyph buffer (no temp Vec), then fix up only the
+    // newly-appended sprites: offset by the laid-out origin, stamp the traversal painter's order (so text
+    // draws above its background), and mask to the scroll viewport if any (`rasterize_into` left them
+    // unclipped; unclipped text keeps the no-op mask).
+    let start = cx.scene.glyphs.len();
+    cx.text
+        .rasterize_into(shaped, color, atlas, &mut cx.scene.glyphs);
+    let clip = cx.clip();
+    let order = cx.next_order();
+    for sprite in &mut cx.scene.glyphs[start..] {
+        sprite.bounds.origin.x += bounds.origin.x;
+        sprite.bounds.origin.y += bounds.origin.y;
+        sprite.order = order;
+        if let Some(clip) = clip {
+            sprite.content_mask.rect = clip;
+        }
+    }
+}
+
 impl Element for Text {
     fn request_layout(&mut self, cx: &mut LayoutCx) -> NodeId {
         if let Some(id) = self.id {
@@ -215,10 +247,6 @@ impl Element for Text {
             .current()
             .map(|role| cx.theme.resolve_color(role))
             .unwrap_or(self.color);
-        // Without an atlas (GPU-free Scene-structure tests) text emits no glyphs.
-        let Some(atlas) = cx.atlas.as_deref_mut() else {
-            return;
-        };
         // The re-shaping path (wrap #260 / reactive content #274) re-shapes at the laid-out width, but
         // **memoized**: only when the content **or** the width key changed since the last paint (otherwise
         // the build/prev `shaped` is reused by borrow — no per-frame `ShapedText` clone). The width key is
@@ -240,25 +268,7 @@ impl Element for Text {
         let Some(shaped) = self.shaped.as_ref() else {
             return;
         };
-        // Rasterize directly into the scene's glyph buffer (reused across frames) — no per-frame
-        // temp Vec — then fix up only the newly-appended sprites.
-        let start = cx.scene.glyphs.len();
-        cx.text
-            .rasterize_into(shaped, color, atlas, &mut cx.scene.glyphs);
-        // Glyph sprites are emitted in text-local coordinates at order 0; offset by the laid-out
-        // origin and stamp the traversal painter's order so the text draws above its background.
-        // Under a scroll ancestor, mask each glyph to the visible viewport (`rasterize_into` left
-        // them unclipped); unclipped text keeps that no-op mask.
-        let clip = cx.clip();
-        let order = cx.next_order();
-        for sprite in &mut cx.scene.glyphs[start..] {
-            sprite.bounds.origin.x += bounds.origin.x;
-            sprite.bounds.origin.y += bounds.origin.y;
-            sprite.order = order;
-            if let Some(clip) = clip {
-                sprite.content_mask.rect = clip;
-            }
-        }
+        paint_shaped_glyphs(cx, shaped, color, bounds);
     }
 
     fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}

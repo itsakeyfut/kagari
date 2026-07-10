@@ -15,6 +15,7 @@ mod overlay;
 mod reactive_prop;
 mod scroll;
 mod text;
+mod text_edit;
 mod transform;
 mod virtualized;
 
@@ -25,6 +26,7 @@ pub use icon::{Icon, icon};
 pub use overlay::{AnchorHandle, Overlay, Placement, overlay};
 pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};
+pub use text_edit::{TextEdit, text_edit};
 pub use transform::{TransformOrigin, Transformed, transform};
 pub use virtualized::{VirtualizedList, virtualized_list};
 

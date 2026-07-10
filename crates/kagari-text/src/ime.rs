@@ -80,6 +80,13 @@ impl ImeState {
     /// Shape and rasterize the preedit at `origin` (logical px) and emit its glyphs
     /// plus a solid underline (whole preedit) and a dotted underline (active segment)
     /// into `scene`. The underlines draw behind the glyphs (lower painter order).
+    ///
+    /// `order_base` is the painter order the caller allocates from the element tree's
+    /// monotonic counter (#298): the underlines draw at `order_base` and the glyphs at
+    /// `order_base + 1` (glyphs above the underlines). Passing the tree's order — rather
+    /// than a hardcoded low value — keeps the preedit above the surrounding field
+    /// background, which a nested field's background quad would otherwise overdraw.
+    #[allow(clippy::too_many_arguments)] // a cohesive preedit-emit call, mirroring paint.rs's emitters
     pub fn emit_preedit(
         &self,
         text_system: &mut TextSystem,
@@ -88,6 +95,7 @@ impl ImeState {
         color: Color,
         atlas: &mut Atlas,
         scene: &mut Scene,
+        order_base: u32,
     ) {
         if self.preedit.is_empty() {
             return;
@@ -95,13 +103,13 @@ impl ImeState {
         let shaped = text_system.shape(&self.preedit, style, None);
 
         // Glyphs: rasterize at the 0-origin, translate to the caret origin, and draw
-        // above the underline (order 1 > the underline's order 0).
+        // above the underlines (order_base + 1 > the underlines' order_base).
         let mut glyphs = Vec::new();
         text_system.rasterize_into(&shaped, color, atlas, &mut glyphs);
         for mut glyph in glyphs {
             glyph.bounds.origin.x += origin.x;
             glyph.bounds.origin.y += origin.y;
-            glyph.order = 1;
+            glyph.order = order_base + 1;
             scene.glyphs.push(glyph);
         }
 
@@ -119,7 +127,7 @@ impl ImeState {
             style: UnderlineStyle::Solid,
             thickness,
             content_mask: no_clip,
-            order: 0,
+            order: order_base,
         });
         if let Some((start, end)) = self.active {
             let (start_x, end_x) = (x_at_byte(&shaped, start), x_at_byte(&shaped, end));
@@ -134,7 +142,7 @@ impl ImeState {
                 style: UnderlineStyle::Dotted,
                 thickness,
                 content_mask: no_clip,
-                order: 0,
+                order: order_base,
             });
         }
     }

@@ -12,6 +12,7 @@ pub mod anim;
 pub mod app;
 pub mod arena;
 pub mod bridge;
+pub mod clipboard;
 pub mod damage;
 /// Dev-build debug overlay (#69). Compiled out in release builds.
 #[cfg(debug_assertions)]
@@ -29,10 +30,12 @@ pub use a11y::Role;
 pub use anim::{Animatable, Animated, AnimationSpec, Easing};
 pub use app::{App, Decorations, WindowOptions};
 pub use bridge::UiProxy;
+pub use clipboard::{Clipboard, SystemClipboard};
 pub use damage::DamageState;
 pub use element::{
-    AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, TransformOrigin,
-    Transformed, div, icon, overlay, scroll, text, transform, virtualized_list,
+    AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, TextEdit,
+    TransformOrigin, Transformed, div, icon, overlay, scroll, text, text_edit, transform,
+    virtualized_list,
 };
 pub use error::AppError;
 pub use event::{
