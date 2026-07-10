@@ -116,6 +116,18 @@ fn should_show_placeholder(has_placeholder: bool, is_empty: bool, is_focused: bo
     has_placeholder && is_empty && !is_focused
 }
 
+/// The outcome of a key/edit event for the leaf (#312): whether the leaf **handled** it (→ consume, so it
+/// does not bubble to ancestors) and whether paint state **changed** (→ repaint via the edit epoch).
+enum KeyOutcome {
+    /// Handled, and the text/caret/selection changed → consume + repaint.
+    Changed,
+    /// Handled but nothing changed (Ctrl+C; Ctrl+X/V with nothing to cut/paste) → consume, no repaint.
+    ConsumedUnchanged,
+    /// Not handled by the leaf → bubble to ancestors (Enter single-line, ArrowUp/Down, unmatched keys), so a
+    /// wrapping widget (NumberInput #76, Combobox #79) can act on them.
+    Ignored,
+}
+
 impl TextEdit {
     /// Sets placeholder text shown (muted) when the buffer is empty and the leaf is unfocused (#72).
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
@@ -181,8 +193,9 @@ impl TextEdit {
         false
     }
 
-    /// Applies a key press to the buffer; returns whether anything (text or caret/selection) changed.
-    fn handle_key(&mut self, ke: &KeyEvent) -> bool {
+    /// Applies a key press to the buffer; returns the [`KeyOutcome`] — whether the leaf handled the key (so
+    /// `handle_event` consumes it) and whether paint state changed (so it repaints).
+    fn handle_key(&mut self, ke: &KeyEvent) -> KeyOutcome {
         // Exclude AltGr (reported as Ctrl+Alt on Windows/Linux) so it types text (e.g. German AltGr+Q = '@')
         // instead of misfiring shortcuts. macOS Cmd maps to `meta`, which never carries `alt`.
         let ctrl = (ke.modifiers.ctrl || ke.modifiers.meta) && !ke.modifiers.alt;
@@ -190,11 +203,11 @@ impl TextEdit {
         match ke.code {
             KeyCode::Backspace => {
                 self.buffer.delete_backward();
-                true
+                KeyOutcome::Changed
             }
             KeyCode::Delete => {
                 self.buffer.delete_forward();
-                true
+                KeyOutcome::Changed
             }
             KeyCode::ArrowLeft => {
                 let by = if ctrl {
@@ -203,7 +216,7 @@ impl TextEdit {
                     Movement::CharLeft
                 };
                 self.buffer.move_cursor(by, shift);
-                true
+                KeyOutcome::Changed
             }
             KeyCode::ArrowRight => {
                 let by = if ctrl {
@@ -212,53 +225,68 @@ impl TextEdit {
                     Movement::CharRight
                 };
                 self.buffer.move_cursor(by, shift);
-                true
+                KeyOutcome::Changed
             }
             KeyCode::Home => {
                 self.buffer.move_cursor(Movement::LineStart, shift);
-                true
+                KeyOutcome::Changed
             }
             KeyCode::End => {
                 self.buffer.move_cursor(Movement::LineEnd, shift);
-                true
+                KeyOutcome::Changed
             }
             KeyCode::KeyA if ctrl => {
                 self.buffer.select_all();
-                true
+                KeyOutcome::Changed
             }
             KeyCode::KeyZ if ctrl && shift => {
                 self.buffer.redo();
-                true
+                KeyOutcome::Changed
             }
             KeyCode::KeyZ if ctrl => {
                 self.buffer.undo();
-                true
+                KeyOutcome::Changed
             }
             KeyCode::KeyY if ctrl => {
                 self.buffer.redo();
-                true
+                KeyOutcome::Changed
             }
+            // Clipboard shortcuts are always consumed by a focused field, even when there is nothing to do.
             KeyCode::KeyC if ctrl => {
                 self.copy_to_clipboard();
-                false // copy leaves the buffer unchanged
+                KeyOutcome::ConsumedUnchanged // copy leaves the buffer unchanged
             }
-            KeyCode::KeyX if ctrl => self.cut_to_clipboard(),
-            KeyCode::KeyV if ctrl => self.paste_from_clipboard(),
-            // Single-line: Enter inserts no newline (submit is the widget's concern, #72).
-            KeyCode::Enter | KeyCode::NumpadEnter => false,
+            KeyCode::KeyX if ctrl => {
+                if self.cut_to_clipboard() {
+                    KeyOutcome::Changed
+                } else {
+                    KeyOutcome::ConsumedUnchanged
+                }
+            }
+            KeyCode::KeyV if ctrl => {
+                if self.paste_from_clipboard() {
+                    KeyOutcome::Changed
+                } else {
+                    KeyOutcome::ConsumedUnchanged
+                }
+            }
+            // Single-line: Enter is not handled — it bubbles so a wrapper can submit/commit (#312). Multi-line
+            // (#309) will instead insert a newline (Changed); the classification is per mode.
+            KeyCode::Enter | KeyCode::NumpadEnter => KeyOutcome::Ignored,
             _ => {
                 // A plain typed press (no Ctrl/Cmd) inserts its layout-resolved text (#303), minus control
-                // chars (Tab/CR/etc. are not inserted verbatim).
+                // chars (Tab/CR/etc. are not inserted verbatim). Anything the leaf does not turn into an edit
+                // (ArrowUp/Down, PageUp/Down, Esc, F-keys, unbound Ctrl combos) is Ignored → it bubbles.
                 if !ctrl {
                     if let Some(text) = &ke.text {
                         let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
                         if !filtered.is_empty() {
                             self.buffer.insert(&filtered);
-                            return true;
+                            return KeyOutcome::Changed;
                         }
                     }
                 }
-                false
+                KeyOutcome::Ignored
             }
         }
     }
@@ -481,27 +509,27 @@ impl Element for TextEdit {
     }
 
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
-        let changed = match ev {
-            Event::Keyboard(ke) if ke.pressed => {
-                let c = self.handle_key(ke);
-                cx.stop_propagation(); // a focused field consumes its keys (don't bubble to ancestors)
-                c
-            }
+        let outcome = match ev {
+            Event::Keyboard(ke) if ke.pressed => self.handle_key(ke),
             Event::Ime(ie) => {
                 self.buffer.apply_ime(ie.clone());
-                cx.stop_propagation();
-                true
+                KeyOutcome::Changed
             }
             Event::Mouse(me) => {
-                let c = self.handle_mouse(me);
-                if c {
-                    cx.stop_propagation();
+                if self.handle_mouse(me) {
+                    KeyOutcome::Changed
+                } else {
+                    KeyOutcome::Ignored
                 }
-                c
             }
-            _ => false,
+            _ => KeyOutcome::Ignored,
         };
-        if changed {
+        // Consume only what the leaf handled — unhandled keys (Enter single-line, ArrowUp/Down, …) bubble to
+        // ancestors so a wrapping widget (NumberInput #76, Combobox #79) can act on them (#312).
+        if matches!(outcome, KeyOutcome::Changed | KeyOutcome::ConsumedUnchanged) {
+            cx.stop_propagation();
+        }
+        if matches!(outcome, KeyOutcome::Changed) {
             // Bump the epoch (repaint), then reflect into `value` as the last step (post-borrow; reflect
             // no-ops unless the text actually changed — skips caret/selection/preedit).
             self.bump();
@@ -989,5 +1017,87 @@ mod tests {
             !should_show_placeholder(false, true, false),
             "no placeholder set → nothing to show"
         );
+    }
+
+    #[test]
+    fn text_edit_should_bubble_unhandled_keys_to_ancestor() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let owner = Owner::new();
+        owner.set();
+        let mut focus = FocusRegistry::new();
+        provide_context(focus.clone());
+
+        // An ancestor div records the keys that bubble up to it — i.e. the keys the editor did NOT consume.
+        let bubbled: Rc<RefCell<Vec<KeyCode>>> = Rc::new(RefCell::new(Vec::new()));
+        let rec = bubbled.clone();
+        let value = RwSignal::new("abc".to_string());
+        let mut root = crate::div()
+            .on_key_down(move |ke, _cx| rec.borrow_mut().push(ke.code))
+            .child(text_edit(value))
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut hit = HitTest::new();
+        let damage = Arc::new(DamageState::default());
+        let theme = Theme::light();
+        let mut scene = Scene::new();
+        render_tree(
+            &mut root,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            Some(&mut hit),
+            None,
+            Some(&mut focus),
+            None,
+            None,
+            &mut scene,
+            VIEWPORT,
+            &damage,
+            &theme,
+        )
+        .unwrap();
+
+        // Click inside the field to focus the editor.
+        let mut dispatch = DispatchState::default();
+        let click = MouseEvent::new(
+            MouseKind::Down(MouseButton::Left),
+            Point::new(2.0, 8.0),
+            Modifiers::default(),
+        );
+        dispatch_mouse(&mut root, &arena, &hit, &click, &mut dispatch);
+        let target = focus.focused_node();
+        assert!(target.is_some(), "the click focused the editor");
+
+        let press = |root: &mut AnyElement, code: KeyCode, mods: Modifiers, text: Option<&str>| {
+            let mut kev = KeyEvent::new(code, mods, true, false);
+            kev.text = text.map(|s| s.to_string().into());
+            dispatch_key(root, &arena, target, &kev);
+        };
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        // Unhandled keys bubble to the ancestor…
+        press(&mut root, KeyCode::Enter, Modifiers::default(), None);
+        press(&mut root, KeyCode::ArrowUp, Modifiers::default(), None);
+        press(&mut root, KeyCode::ArrowDown, Modifiers::default(), None);
+        // …handled keys do not: a typed insert, a caret move, and Ctrl+C all stay consumed by the field.
+        press(&mut root, KeyCode::KeyA, Modifiers::default(), Some("a"));
+        press(&mut root, KeyCode::ArrowLeft, Modifiers::default(), None);
+        press(&mut root, KeyCode::KeyC, ctrl, None);
+
+        assert_eq!(
+            *bubbled.borrow(),
+            vec![KeyCode::Enter, KeyCode::ArrowUp, KeyCode::ArrowDown],
+            "only unhandled keys bubble to the ancestor"
+        );
+
+        drop(owner);
     }
 }
