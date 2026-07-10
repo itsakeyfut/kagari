@@ -298,6 +298,13 @@ struct WindowState {
     ticker: crate::scheduler::Ticker,
     last_frame: Option<Instant>,
     ime_enabled: bool,
+    // The IME candidate-window transport (#299): the focused editable leaf publishes its caret rect
+    // (window coords) here at paint; `sync_ime` reads it after the frame to point `set_ime_cursor_area`
+    // and toggle `set_ime_allowed`. A per-frame-record sink (RK-019): cleared before each paint.
+    ime_caret: crate::ime::ImeCaretArea,
+    // Whether `set_ime_allowed(true)` is currently requested (#299). Tracked so the toggle fires only on a
+    // text-field focus enter/leave, not every frame.
+    ime_allowed_requested: bool,
     // Set once a panic is caught in this window's frame/event work (#65): a degraded window skips all
     // further frames + events (its last-good frame stays on screen; it can still be closed), rather
     // than continuing to mutate state left inconsistent by the panic.
@@ -676,7 +683,8 @@ impl App {
             surface_config(&surface, &gpu.adapter, window.inner_size())?
         };
         surface.configure(&device, &config);
-        window.set_ime_allowed(true);
+        // IME starts disallowed; `sync_ime` enables it on a text-field focus enter (#299), driven by the
+        // focused editor's published caret area, and disables it on leave/unmount.
 
         let renderer = kagari_render::Renderer::new(
             Arc::clone(&device),
@@ -692,6 +700,7 @@ impl App {
         let damage = Arc::new(DamageState::default());
         let scheduler = Scheduler::new();
         let ticker = crate::scheduler::Ticker::new();
+        let ime_caret = crate::ime::ImeCaretArea::new();
         let (root, focus, overlay_layers) = child_owner.with(|| {
             bind_window_theme_damage(theme, Arc::clone(&damage));
             // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
@@ -719,6 +728,9 @@ impl App {
             // The animation ticker (#253): provide a clone so `Animated::new` (widget / scroll build)
             // captures it and registers itself when it starts; `redraw` drives it each frame.
             provide_context(ticker.clone());
+            // The IME caret transport (#299): provide a clone so an editable `text_edit` leaf captures it
+            // and publishes its caret area at paint; `redraw`/`sync_ime` read it to drive the OS IME.
+            provide_context(ime_caret.clone());
             let root = (pending.root)();
             (root, focus, overlay_layers)
         });
@@ -779,6 +791,8 @@ impl App {
                 ticker,
                 last_frame: None,
                 ime_enabled: false,
+                ime_caret,
+                ime_allowed_requested: false,
                 hit_test: HitTest::new(),
                 focus,
                 cursor_reg: CursorRegistry::new(),
@@ -953,11 +967,33 @@ impl WindowState {
         }
     }
 
-    /// Report the IME candidate-window area to the OS. A default until #25 drives it from the caret.
+    /// Drive the OS IME from the focused editor's published caret area (#299): a published rect means a
+    /// text field is focused, so enable IME (once, on the enter edge) and point the candidate window at the
+    /// caret; its absence means none is focused, so disable IME (once, on the leave edge). Called after each
+    /// frame's paint, so a blurred or unmounted editor tears IME down on its own.
+    fn sync_ime(&mut self) {
+        if self.ime_caret.get().is_some() {
+            if !self.ime_allowed_requested {
+                self.window.set_ime_allowed(true);
+                self.ime_allowed_requested = true;
+            }
+            self.report_ime_caret_area();
+        } else if self.ime_allowed_requested {
+            self.window.set_ime_allowed(false);
+            self.ime_allowed_requested = false;
+        }
+    }
+
+    /// Point the OS IME candidate window at the focused editor's caret area (#299). The editor publishes the
+    /// caret rect in window-logical coords, which `set_ime_cursor_area` expects directly (no scale factor).
     fn report_ime_caret_area(&self) {
         use winit::dpi::LogicalPosition;
-        self.window
-            .set_ime_cursor_area(LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 16.0));
+        if let Some(rect) = self.ime_caret.get() {
+            self.window.set_ime_cursor_area(
+                LogicalPosition::new(rect.origin.x, rect.origin.y),
+                LogicalSize::new(rect.size.w.max(1.0), rect.size.h),
+            );
+        }
     }
 
     /// Handle a pointer move: update the tracked position + gesture cursor, dispatch a `Move` (hover
@@ -1372,6 +1408,11 @@ impl WindowState {
         // last frame's stack during input, so it is cleared here at the start of the next paint (#219).
         self.overlay_layers.clear();
 
+        // Clear the IME caret cell before painting; the focused editor republishes it during the paint walk
+        // (mirrors `hit_test`/`overlay_layers`). After the frame, `sync_ime` reads it: a published rect means
+        // a text field is focused (enable + track), its absence means none is (disable) — RK-019 (#299).
+        self.ime_caret.clear();
+
         // Advance active animations (#253) by the elapsed `dt` **before** building/painting, so each
         // `Animated`'s signal write resolves into its paint slot this frame (ADR 0001 synchronous
         // effects). `dt` is clamped so a long idle gap (or a paused window) cannot fling a spring; the
@@ -1427,6 +1468,10 @@ impl WindowState {
             self.a11y
                 .build_update(&self.arena, self.focus.focused_node(), a11y_scale)
         });
+
+        // Drive the OS IME from the caret area the focused editor just published (#299): enable/track while a
+        // text field is focused, disable on leave/unmount.
+        self.sync_ime();
 
         // Paint the cursor-tracked drag-image on top of the main tree (#178), into the same scene.
         // Built under the per-drag owner so any reactive props register there and dispose when the
