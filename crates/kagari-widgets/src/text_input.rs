@@ -11,10 +11,10 @@
 use kagari_base::{Px, SharedString};
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IntoElement, Role, div, text, text_edit};
-use kagari_style::{ColorRole, Styled};
+use kagari_core::{AnyElement, IntoElement, Role, text, text_edit};
+use kagari_style::ColorRole;
 
-use crate::control::{ControlSize, apply_size, label_px};
+use crate::control::{ControlSize, field_frame, label_px};
 
 /// A single-line text input (#72). Build with [`text_input`]; chain `.placeholder(..)` / `.size(..)` /
 /// `.disabled(..)`. Controlled via `RwSignal<String>` (D2) — keyboard / mouse / IME drive edits that
@@ -57,16 +57,6 @@ impl TextInput {
     }
 }
 
-/// A sane default width floor (logical px) for `size` so a standalone empty field is usable; it still
-/// fills a wider slot (the editor flex-grows) and only floors the narrow case.
-fn field_min_w(size: ControlSize) -> f32 {
-    match size {
-        ControlSize::Sm => 120.0,
-        ControlSize::Md => 160.0,
-        ControlSize::Lg => 200.0,
-    }
-}
-
 impl IntoElement for TextInput {
     fn into_element(self) -> AnyElement {
         let TextInput {
@@ -89,11 +79,7 @@ impl IntoElement for TextInput {
                     v.into()
                 }
             });
-            return apply_size(div(), size)
-                .min_w(field_min_w(size))
-                .rounded_md()
-                .bg(ColorRole::Surface)
-                .border_w_2()
+            return field_frame(size)
                 .border_color(Some(ColorRole::Border))
                 .role(Role::TextInput)
                 .child(text(content).color_role(ColorRole::TextMuted).size(font))
@@ -109,11 +95,7 @@ impl IntoElement for TextInput {
         // sole focus target), it only reads `is_focus_visible` to color the ring (keyboard modality only).
         let handle = editor.focus_handle();
 
-        apply_size(div(), size)
-            .min_w(field_min_w(size))
-            .rounded_md()
-            .bg(ColorRole::Surface)
-            .border_w_2()
+        field_frame(size)
             .border_color(rx(move || {
                 Some(if handle.is_focus_visible() {
                     ColorRole::FocusRing
