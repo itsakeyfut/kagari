@@ -20,6 +20,7 @@ pub mod debug;
 pub mod element;
 pub mod error;
 pub mod event;
+pub mod ime;
 pub mod overlay;
 pub mod paint;
 pub mod persist;
@@ -46,6 +47,7 @@ pub use event::{
     dispatch_drag_start, dispatch_drop, dispatch_gesture, dispatch_ime, dispatch_key,
     dispatch_mouse, use_focus_handle,
 };
+pub use ime::ImeCaretArea;
 pub use kagari_base::{Transform, WindowId};
 pub use kagari_render::IconId;
 pub use overlay::{OverlayEntry, OverlayLayer, OverlayLayers, OverlayRegistry};

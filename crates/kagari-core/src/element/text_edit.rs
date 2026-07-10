@@ -29,6 +29,7 @@ use crate::event::{
     CursorIcon, FocusHandle, FocusId, HitRegion, InteractFlags, KeyCode, KeyEvent, MouseButton,
     MouseEvent, MouseKind, use_focus_handle,
 };
+use crate::ime::ImeCaretArea;
 use crate::reactive::prelude::*;
 use crate::reactive::{RwSignal, create_effect, rx, use_context};
 
@@ -54,6 +55,9 @@ pub struct TextEdit {
     focus_id: FocusId,
     /// The OS clipboard (from context), for Ctrl+C/V/X; `None` when unprovided (copy/paste no-op).
     clipboard: Option<Arc<dyn Clipboard>>,
+    /// The IME candidate-window transport (from context, #299): the caret rect (window coords) is
+    /// published here at paint while focused; `None` when unprovided (headless / no shell).
+    ime_caret: Option<ImeCaretArea>,
     style: TextStyle,
     /// Bumped on every mutation so a bound `ReactiveProp` flags paint-damage (ARK-003).
     edit_epoch: RwSignal<u64>,
@@ -81,6 +85,7 @@ pub fn text_edit(value: RwSignal<String>) -> TextEdit {
         handle,
         focus_id,
         clipboard: use_context::<Arc<dyn Clipboard>>(),
+        ime_caret: use_context::<ImeCaretArea>(),
         style: default_style(),
         edit_epoch,
         epoch_prop: ReactiveProp::new(rx(move || edit_epoch.get())),
@@ -317,6 +322,24 @@ impl Element for TextEdit {
         let Some(shaped) = self.shaped.as_ref() else {
             return;
         };
+        // The caret rect (text-local), resolved once when focused and reused for the IME caret publish (#299)
+        // and the caret quad below (#298).
+        let caret = self
+            .handle
+            .is_focused_untracked()
+            .then(|| self.buffer.caret_rect(shaped));
+        // Publish the caret area (window coords) so the shell points the OS IME candidate window at it and
+        // enables IME while a text field is focused (#299). Only the focused editor writes; an unfocused one
+        // leaves the per-frame cell untouched, so the shell reads `None` and disables IME. Published whether
+        // or not composing, so the candidate window follows the preedit caret too.
+        if let (Some(cr), Some(area)) = (caret, &self.ime_caret) {
+            area.set(Rect::from_xywh(
+                bounds.origin.x + cr.origin.x,
+                bounds.origin.y + cr.origin.y,
+                cr.size.w.max(1.0),
+                cr.size.h,
+            ));
+        }
         // Resolve colors before the atlas/scene borrows.
         let text_color = cx.theme.resolve_color(ColorRole::Text);
         let selection_color = scale_alpha(cx.theme.resolve_color(ColorRole::Accent), 0.35);
@@ -332,17 +355,18 @@ impl Element for TextEdit {
         }
         // 4. Glyphs.
         paint_shaped_glyphs(cx, shaped, text_color, bounds);
-        // 5. Caret (only when focused and not composing) — above the glyphs. Read focus *untracked*
-        //    (the focus-watch effect from `request_layout` drives the repaint); a 2px bar reads clearly.
-        if self.handle.is_focused_untracked() && !self.buffer.ime().is_composing() {
-            let cr = self.buffer.caret_rect(shaped);
-            let rect = Rect::from_xywh(
-                bounds.origin.x + cr.origin.x,
-                bounds.origin.y + cr.origin.y,
-                cr.size.w.max(2.0),
-                cr.size.h,
-            );
-            push_fill_quad(cx, rect, text_color);
+        // 5. Caret (only when focused and not composing) — above the glyphs. `caret` is already gated on
+        //    focus (untracked; the focus-watch effect drives the repaint); a 2px bar reads clearly.
+        if let Some(cr) = caret {
+            if !self.buffer.ime().is_composing() {
+                let rect = Rect::from_xywh(
+                    bounds.origin.x + cr.origin.x,
+                    bounds.origin.y + cr.origin.y,
+                    cr.size.w.max(2.0),
+                    cr.size.h,
+                );
+                push_fill_quad(cx, rect, text_color);
+            }
         }
         // 6. IME preedit at the caret origin, while composing. Allocate the painter order from the tree's
         //    monotonic counter (underlines at `order_base`, glyphs at `order_base + 1`) so the preedit
@@ -494,15 +518,18 @@ mod tests {
         focus: FocusRegistry,
         damage: Arc<DamageState>,
         theme: Theme,
+        ime_caret: ImeCaretArea,
         root_id: NodeId,
     }
 
-    /// Builds an editor (under an owner with a `FocusRegistry` + `MockClipboard` in context) and renders one
-    /// frame. Returns the harness with the editor's node id.
+    /// Builds an editor (under an owner with a `FocusRegistry` + `MockClipboard` + `ImeCaretArea` in context)
+    /// and renders one frame. Returns the harness with the editor's node id.
     fn harness(value: RwSignal<String>) -> Harness {
         let focus = FocusRegistry::new();
         provide_context(focus.clone());
         provide_context::<Arc<dyn Clipboard>>(Arc::new(MockClipboard(Mutex::new(String::new()))));
+        let ime_caret = ImeCaretArea::new();
+        provide_context(ime_caret.clone());
         let mut h = Harness {
             root: text_edit(value).into_element(),
             arena: Arena::new(),
@@ -513,6 +540,7 @@ mod tests {
             focus,
             damage: Arc::new(DamageState::default()),
             theme: Theme::light(),
+            ime_caret,
             root_id: NodeId::from_raw(0),
         };
         h.root_id = frame(&mut h);
@@ -521,6 +549,9 @@ mod tests {
 
     /// Renders one frame; returns the root node id + leaves the scene available via a fresh `Scene`.
     fn frame(h: &mut Harness) -> NodeId {
+        // Clear the IME caret cell before paint, mirroring the shell (#299): the focused editor republishes
+        // during paint, so a frame with no focused editor reads back `None`.
+        h.ime_caret.clear();
         let mut scene = Scene::new();
         render_tree(
             &mut h.root,
@@ -797,6 +828,70 @@ mod tests {
             value.get_untracked(),
             "本",
             "the external write was refused mid-composition; the commit did not build on \"zzz\""
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_unfocused_should_not_publish_ime_caret() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let h = harness(value);
+
+        // The initial frame rendered while unfocused → nothing published (the shell reads `None` = disable IME).
+        assert_eq!(
+            h.ime_caret.get(),
+            None,
+            "an unfocused editor publishes no IME caret area"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_focused_should_publish_ime_caret_area() {
+        let owner = Owner::new();
+        owner.set();
+        // Non-empty so the root editor has width for the click to land (empty → 0-width leaf, click misses).
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        assert_eq!(h.ime_caret.get(), None, "unfocused → no caret area");
+
+        // A click focuses it; the next paint publishes the caret rect (window coords) for the OS candidate window.
+        click(&mut h, 1.0);
+        frame(&mut h);
+        let area = h
+            .ime_caret
+            .get()
+            .expect("a focused editor publishes its caret area");
+        assert!(
+            area.size.h > 0.0,
+            "the published caret area has the caret's height"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_ime_caret_should_track_caret() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+
+        click(&mut h, 1.0); // focus; caret near the start
+        frame(&mut h);
+        let x0 = h.ime_caret.get().expect("focused → published").origin.x;
+        // Moving the caret to the end advances it → the published area's x tracks it (the OS candidate window
+        // follows caret movement).
+        press(&mut h, KeyCode::End, Modifiers::default(), None);
+        frame(&mut h);
+        let x1 = h.ime_caret.get().expect("focused → published").origin.x;
+        assert!(
+            x1 > x0,
+            "the published caret x tracks the caret moving to the end ({x0} → {x1})"
         );
 
         drop(owner);
