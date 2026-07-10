@@ -701,6 +701,11 @@ impl App {
             // widget's `use_focus_handle()` mints into this same registry (shared inner) and joins its
             // tab order / `focused_node` resolution. Disposed with the child owner on close (RK-006/008).
             provide_context(focus.clone());
+            // OS clipboard (#298): provide the system backend so an editable `text_edit` leaf can
+            // `use_context` it for Ctrl+C/V/X. A unit backend (opened per-op); no per-window state.
+            provide_context::<std::sync::Arc<dyn crate::clipboard::Clipboard>>(
+                std::sync::Arc::new(crate::clipboard::SystemClipboard),
+            );
             // Interactive overlay layer stack (#219): provide a clone into context so an open `Overlay`
             // registers here at paint; the shell reads it for dismiss routing + focus-trap. Disposed with
             // the child owner on close.

@@ -49,6 +49,13 @@ impl FocusHandle {
         self.current.get() == Some(self.id)
     }
 
+    /// Whether this handle currently holds focus, read **without** subscribing (#298). Use this in a
+    /// `paint` (not a reactive context) after separately subscribing to focus for repaint — reading the
+    /// tracked [`is_focused`](Self::is_focused) outside a tracking context warns and would miss updates.
+    pub fn is_focused_untracked(&self) -> bool {
+        self.current.get_untracked() == Some(self.id)
+    }
+
     /// Whether this handle holds focus **and** the focus indicator should be shown — i.e. the most
     /// recent input was a keyboard, not a pointer (the `:focus-visible` heuristic). A **tracked** read
     /// (of both the focus and focus-visible signals), so it drives fine-grained repaint. Use this for

@@ -523,6 +523,14 @@ impl TextBuffer {
         let x1 = x_at_byte(shaped, sel.end);
         vec![Rect::from_xywh(x0, 0.0, (x1 - x0).max(0.0), height)]
     }
+
+    /// The byte offset nearest a pointer `x` (text-origin-relative logical px), for click-to-caret
+    /// (#298). Returns a grapheme-cluster boundary (safe to feed [`set_selection`](Self::set_selection)).
+    /// Single-line MVP: resolves on line 0 (`_y` is reserved for multi-line, post-MVP — RK-024).
+    /// `byte_at_x` clamps internally, so an `x` past the line end resolves to the last boundary.
+    pub fn byte_at_point(&self, shaped: &ShapedText, x: f32, _y: f32) -> usize {
+        byte_at_x(shaped, 0, x)
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +709,34 @@ mod tests {
             buffer.selection_rects(&shaped).is_empty(),
             "no selection yields no rects"
         );
+    }
+
+    #[test]
+    fn byte_at_point_should_map_x_to_byte() {
+        let mut system = TextSystem::new(FontDb::new());
+        let style = TextStyle {
+            family: "Noto Sans".into(),
+            size: Px(16.0),
+            weight: fontdb::Weight::NORMAL,
+            line_height: None,
+        };
+        let shaped = system.shape("abc", &style, None);
+        let buffer = TextBuffer::with_text("abc");
+
+        // x=0 → the first byte; an x well past the line end → the last boundary (clamped internally).
+        assert_eq!(
+            buffer.byte_at_point(&shaped, 0.0, 0.0),
+            0,
+            "x=0 maps to byte 0"
+        );
+        assert_eq!(
+            buffer.byte_at_point(&shaped, 1.0e4, 0.0),
+            3,
+            "an x past the end clamps to the last byte"
+        );
+        // A mid-string x maps to a grapheme boundary (0..=3), safe for set_selection.
+        let mid = buffer.byte_at_point(&shaped, x_at_byte(&shaped, 2), 0.0);
+        assert!(mid <= 3, "a mid x resolves to a valid byte boundary");
     }
 
     #[test]
