@@ -15,7 +15,7 @@
 
 use std::any::TypeId;
 
-use kagari_base::{NodeId, Point};
+use kagari_base::{NodeId, Point, SharedString};
 
 use kagari_text::ImeEvent;
 
@@ -89,28 +89,34 @@ impl MouseEvent {
 }
 
 /// A resolved keyboard event delivered to elements (#49): the physical `code`, the `modifiers` held,
-/// whether it is a press (`pressed`) or release, and whether it is an auto-`repeat`. `#[non_exhaustive]`:
-/// delivered to handlers (not user-constructed), so fields can be added without a breaking change.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// whether it is a press (`pressed`) or release, whether it is an auto-`repeat`, and the layout-resolved
+/// typed `text` of the press (#303). `#[non_exhaustive]`: delivered to handlers (not user-constructed), so
+/// fields can be added without a breaking change. Not `Copy` — `text` is a `SharedString`.
+#[derive(Clone, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub struct KeyEvent {
     pub code: KeyCode,
     pub modifiers: Modifiers,
     pub pressed: bool,
     pub repeat: bool,
+    /// The layout-resolved typed text of this press (shift/symbols/dead-keys applied), or `None` for a
+    /// non-text key (arrows, F-keys, bare modifiers) or a release (#303). The direct/ASCII counterpart to
+    /// IME commit (#296); an editor inserts it on a plain press (no Ctrl/Cmd).
+    pub text: Option<SharedString>,
 }
 
 impl KeyEvent {
     /// Builds a key event from its physical `code`, held `modifiers`, press state (`pressed`), and
-    /// auto-`repeat` flag. Handlers receive events pre-built by the app; this is the supported way
-    /// to *synthesize* one (tests, programmatic input injection) despite the `#[non_exhaustive]`
-    /// struct.
+    /// auto-`repeat` flag, with no typed `text` (the app path sets `text` from winit; #303). Handlers
+    /// receive events pre-built by the app; this is the supported way to *synthesize* one (tests,
+    /// programmatic input injection) despite the `#[non_exhaustive]` struct.
     pub fn new(code: KeyCode, modifiers: Modifiers, pressed: bool, repeat: bool) -> Self {
         Self {
             code,
             modifiers,
             pressed,
             repeat,
+            text: None,
         }
     }
 }
@@ -407,7 +413,7 @@ pub fn dispatch_key(root: &mut AnyElement, arena: &Arena, focused: Option<NodeId
             root,
             arena,
             Delivery::Bubble { path: &path },
-            &Event::Keyboard(*ev),
+            &Event::Keyboard(ev.clone()),
         );
     }
 }
@@ -867,6 +873,7 @@ mod tests {
             modifiers: Modifiers::default(),
             pressed: true,
             repeat: false,
+            text: None,
         };
         dispatch_key(&mut root, &arena, reg.focused_node(), &key);
 
@@ -877,6 +884,82 @@ mod tests {
         );
 
         drop(owner);
+    }
+
+    #[test]
+    fn key_text_should_reach_the_focused_handler() {
+        // A key's layout-resolved typed text (#303) rides the KeyEvent to the focused node's on_key_down;
+        // a non-text key carries `None`. Recorded as `String` to avoid naming SharedString here.
+        let owner = Owner::new();
+        owner.set();
+
+        let seen: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let rec = Rc::clone(&seen);
+
+        let mut reg = FocusRegistry::new();
+        let focus = reg.handle();
+        let root = div().track_focus(&focus).on_key_down(move |ke, _| {
+            rec.borrow_mut()
+                .push(ke.text.as_ref().map(|s| s.to_string()))
+        });
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let mut root: AnyElement = root.into_element();
+        root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: Some(&mut reg),
+            cursor: None,
+        });
+
+        focus.focus();
+        // A printable press carries its typed text; a non-text key (ArrowLeft) carries None.
+        dispatch_key(
+            &mut root,
+            &arena,
+            reg.focused_node(),
+            &KeyEvent {
+                code: KeyCode::KeyA,
+                modifiers: Modifiers::default(),
+                pressed: true,
+                repeat: false,
+                text: Some("a".into()),
+            },
+        );
+        dispatch_key(
+            &mut root,
+            &arena,
+            reg.focused_node(),
+            &KeyEvent {
+                code: KeyCode::ArrowLeft,
+                modifiers: Modifiers::default(),
+                pressed: true,
+                repeat: false,
+                text: None,
+            },
+        );
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![Some("a".to_string()), None],
+            "the handler receives the typed text, and None for a non-text key"
+        );
+
+        drop(owner);
+    }
+
+    #[test]
+    fn key_new_should_default_text_to_none() {
+        // `KeyEvent::new` keeps its 4-arg signature; the app sets `text` from winit separately (#303).
+        let k = KeyEvent::new(KeyCode::KeyA, Modifiers::default(), true, false);
+        assert!(k.text.is_none(), "KeyEvent::new leaves text unset");
     }
 
     #[test]
@@ -893,6 +976,7 @@ mod tests {
             modifiers: Modifiers::default(),
             pressed: true,
             repeat: false,
+            text: None,
         };
         dispatch_key(&mut root, &arena, None, &key);
 
@@ -1014,6 +1098,7 @@ mod tests {
             modifiers: Modifiers::default(),
             pressed: false,
             repeat: false,
+            text: None,
         };
         dispatch_key(&mut root, &arena, reg.focused_node(), &key_up);
 

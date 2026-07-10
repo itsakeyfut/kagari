@@ -1161,6 +1161,10 @@ impl WindowState {
             modifiers: self.modifiers,
             pressed: event.state.is_pressed(),
             repeat: event.repeat,
+            // The layout-resolved typed text winit computed for this press (#303) — the direct/ASCII path
+            // to the focused editor (IME-composed text comes via `on_ime`). Via `String`: SharedString has
+            // no `From<&str>`. Delivered verbatim; the editor decides what to insert.
+            text: event.text.as_ref().map(|s| s.to_string().into()),
         };
         match route_key(&self.keymap, &kev) {
             KeyRoute::Consume(action) => self.handle_action(action),
@@ -1954,6 +1958,7 @@ mod tests {
             modifiers: mods,
             pressed: true,
             repeat: false,
+            text: None,
         };
         let chord = key_chord(&ev);
         assert_eq!(chord.code, KeyCode::KeyS);
@@ -1994,6 +1999,7 @@ mod tests {
             modifiers: Modifiers::default(),
             pressed,
             repeat: false,
+            text: None,
         }
     }
 
