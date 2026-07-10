@@ -123,7 +123,24 @@ impl Element for VirtualizedList {
         cx.set_clip(saved);
     }
 
-    fn handle_event(&mut self, _ev: &Event, _cx: &mut EventCx) {}
+    fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
+        // A container: route the event down to the realized row on the dispatch path (like `Scroll`/`Div`),
+        // so a hit on a virtualized row reaches its handlers. Only realized rows are on the path
+        // (O(visible)); the row's own `Div::handle_event` fires / filters its listeners. Rows scrolled out
+        // of the window are released, so they are structurally off the path.
+        let Some(id) = self.id else {
+            return;
+        };
+        let Some(next) = cx.next_child_on_path(id) else {
+            return;
+        };
+        for (_, node_id, element) in self.list.realized_children() {
+            if node_id == next {
+                element.handle_event(ev, cx);
+                return;
+            }
+        }
+    }
 
     fn reconcile(&mut self, cx: &mut LayoutCx) {
         // A container: realize the inner list's staged range change (scrolled-in/out rows) live, then
@@ -146,12 +163,17 @@ mod tests {
     use super::*;
     use crate::arena::Arena;
     use crate::element::DamageSink;
+    use crate::event::{
+        DispatchState, HitTest, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse,
+    };
     use kagari_base::Color;
     use kagari_layout::LayoutTree;
     use kagari_render::{Background, Scene};
     use kagari_style::Theme;
     use kagari_text::{FontDb, TextSystem};
     use reactive_graph::owner::Owner;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     struct NoopDamage;
@@ -474,6 +496,150 @@ mod tests {
             "the top row is clipped to its visible 10px, not the full 20"
         );
 
+        drop(owner);
+    }
+
+    /// Builds a 1000-row list (20px rows, 100px viewport) whose rows are built by `build_row`, lays it out
+    /// and paints it (recording hit regions at the current offset positions).
+    fn vl_with<V: IntoElement>(
+        handle: &ScrollHandle,
+        env: &mut Env,
+        hit: &mut HitTest,
+        build_row: impl Fn(usize) -> V + 'static,
+    ) -> (AnyElement, NodeId) {
+        let mut root: AnyElement =
+            virtualized_list(20.0, 1000, Size { w: 100.0, h: 100.0 }, handle, build_row)
+                .into_element();
+        let id = root.request_layout(&mut env.cx());
+        env.layout.compute(id, Size { w: 100.0, h: 100.0 }).unwrap();
+        repaint(&mut root, env, hit, id);
+        (root, id)
+    }
+
+    /// A `vl_with` whose rows record the last-clicked index into `clicked`.
+    fn clickable_vl(
+        handle: &ScrollHandle,
+        env: &mut Env,
+        hit: &mut HitTest,
+    ) -> (AnyElement, NodeId, Rc<Cell<Option<usize>>>) {
+        let clicked = Rc::new(Cell::new(None));
+        let c = clicked.clone();
+        let (root, id) = vl_with(handle, env, hit, move |i| {
+            let c = c.clone();
+            div()
+                .size(Size { w: 100.0, h: 20.0 })
+                .on_click(move |_, _| c.set(Some(i)))
+        });
+        (root, id, clicked)
+    }
+
+    /// Clears the hit-test and repaints, so hit regions reflect the rows' current painted offset positions.
+    fn repaint(root: &mut AnyElement, env: &mut Env, hit: &mut HitTest, id: NodeId) {
+        hit.clear();
+        let mut scene = Scene::new();
+        root.paint(
+            env.layout.layout(id),
+            &mut PaintCx::new(
+                &mut scene,
+                &env.layout,
+                &mut env.text,
+                None,
+                Some(hit),
+                &env.theme,
+            ),
+        );
+    }
+
+    /// Dispatches a full click (down + up = a synthesized click) at a window point.
+    fn click(root: &mut AnyElement, arena: &Arena, hit: &HitTest, x: f32, y: f32) {
+        let mut dispatch = DispatchState::default();
+        for kind in [
+            MouseKind::Down(MouseButton::Left),
+            MouseKind::Up(MouseButton::Left),
+        ] {
+            let ev = MouseEvent::new(kind, Point::new(x, y), Modifiers::default());
+            dispatch_mouse(root, arena, hit, &ev, &mut dispatch);
+        }
+    }
+
+    #[test]
+    fn virtualized_row_click_should_reach_its_handler() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        let (mut root, _id, clicked) = clickable_vl(&handle, &mut env, &mut hit);
+
+        // At offset 0 the window point (50,50) is over index 2 (its row paints at y ∈ [40,60)).
+        click(&mut root, &env.arena, &hit, 50.0, 50.0);
+        assert_eq!(
+            clicked.get(),
+            Some(2),
+            "a click on a realized row reaches that row's handler"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_click_should_track_scroll_offset() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        let (mut root, id, clicked) = clickable_vl(&handle, &mut env, &mut hit);
+
+        click(&mut root, &env.arena, &hit, 50.0, 50.0);
+        assert_eq!(clicked.get(), Some(2), "offset 0: (50,50) hits index 2");
+
+        // Scroll down 200px (10 rows): realize the shifted window (8..17), re-paint (hit regions follow the
+        // new offset), then click the same window point — it now lands on index 12, not the released index 2.
+        handle.jump_to(Point::new(0.0, 200.0));
+        root.reconcile(&mut env.cx());
+        env.layout.compute(id, Size { w: 100.0, h: 100.0 }).unwrap();
+        repaint(&mut root, &mut env, &mut hit, id);
+
+        click(&mut root, &env.arena, &hit, 50.0, 50.0);
+        assert_eq!(
+            clicked.get(),
+            Some(12),
+            "hit regions follow the painted offset: (50,50) now hits index 12, and the scrolled-out index 2 \
+             is no longer on the event path"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_row_hover_should_reach_its_handler() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        let entered = Rc::new(Cell::new(None));
+        let e = entered.clone();
+        let (mut root, _id) = vl_with(&handle, &mut env, &mut hit, move |i| {
+            let e = e.clone();
+            div()
+                .size(Size { w: 100.0, h: 20.0 })
+                .on_mouse_enter(move |_, _| e.set(Some(i)))
+        });
+
+        // A pointer Move over index 2 (row at y ∈ [40,60)) fires its enter handler — the same generic descend
+        // routes hover (a Move enter/leave delivery) to the realized row, not just clicks.
+        let mut dispatch = DispatchState::default();
+        let ev = MouseEvent::new(
+            MouseKind::Move,
+            Point::new(50.0, 50.0),
+            Modifiers::default(),
+        );
+        dispatch_mouse(&mut root, &env.arena, &hit, &ev, &mut dispatch);
+        assert_eq!(
+            entered.get(),
+            Some(2),
+            "a hover over a realized row reaches that row's mouse-enter handler"
+        );
         drop(owner);
     }
 }
