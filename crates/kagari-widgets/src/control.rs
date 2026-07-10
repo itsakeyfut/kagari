@@ -48,6 +48,27 @@ pub(crate) fn label_px(size: ControlSize) -> Px {
     }
 }
 
+/// A sane default min width (logical px) for `size` so a standalone empty text field is usable; it still
+/// fills a wider slot (the editor flex-grows) and only floors the narrow case.
+pub(crate) fn field_min_w(size: ControlSize) -> f32 {
+    match size {
+        ControlSize::Sm => 120.0,
+        ControlSize::Md => 160.0,
+        ControlSize::Lg => 200.0,
+    }
+}
+
+/// The shared bordered / rounded / padded field frame for text-entry widgets (TextInput #72, NumberInput
+/// #76): size-driven padding + a min width, a `Surface` bg, and a 2px border. The caller sets the border
+/// color (a reactive `FocusRing` when enabled, static `Border` when disabled), the role, and the children.
+pub(crate) fn field_frame(size: ControlSize) -> Div {
+    apply_size(div(), size)
+        .min_w(field_min_w(size))
+        .rounded_md()
+        .bg(ColorRole::Surface)
+        .border_w_2()
+}
+
 /// The checkbox's square box side (logical px) for `size` — sized near the label cap height so the box
 /// and its label align.
 pub(crate) fn checkbox_box_px(size: ControlSize) -> Px {
