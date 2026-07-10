@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use kagari_base::{Color, NodeId, Point, Px, Rect};
+use kagari_base::{Color, NodeId, Point, Px, Rect, SharedString};
 use kagari_layout::LayoutStyle;
 use kagari_style::ColorRole;
 use kagari_text::{Movement, ShapedText, TextBuffer, TextStyle, fontdb};
@@ -32,6 +32,10 @@ use crate::event::{
 use crate::ime::ImeCaretArea;
 use crate::reactive::prelude::*;
 use crate::reactive::{RwSignal, create_effect, rx, use_context};
+
+/// Keeps the focused caret at least this many px from the field's right edge when horizontally scrolling a
+/// long single line (#72), so the caret is not painted flush against (or clipped by) the border.
+const CARET_SCROLL_MARGIN: f32 = 3.0;
 
 /// The default editor text style (single-line), matching the `text` leaf's default.
 fn default_style() -> TextStyle {
@@ -59,6 +63,10 @@ pub struct TextEdit {
     /// published here at paint while focused; `None` when unprovided (headless / no shell).
     ime_caret: Option<ImeCaretArea>,
     style: TextStyle,
+    /// Placeholder text shown (muted) when the buffer is empty and unfocused (#72); `None` = no placeholder.
+    placeholder: Option<SharedString>,
+    /// The shaped placeholder, built once in `request_layout` and reused each paint it is shown.
+    placeholder_shaped: Option<ShapedText>,
     /// Bumped on every mutation so a bound `ReactiveProp` flags paint-damage (ARK-003).
     edit_epoch: RwSignal<u64>,
     epoch_prop: ReactiveProp<u64>,
@@ -69,6 +77,9 @@ pub struct TextEdit {
     shaped_content: Option<String>,
     /// The last laid-out bounds, cached in paint so a mouse handler can map a window pointer to text-local x.
     last_bounds: Rect,
+    /// The horizontal scroll offset (px) applied in paint so the focused caret stays within the field (#72);
+    /// cached so a mouse handler maps a click x back to the correct text byte.
+    scroll_x: f32,
     id: Option<NodeId>,
 }
 
@@ -87,17 +98,45 @@ pub fn text_edit(value: RwSignal<String>) -> TextEdit {
         clipboard: use_context::<Arc<dyn Clipboard>>(),
         ime_caret: use_context::<ImeCaretArea>(),
         style: default_style(),
+        placeholder: None,
+        placeholder_shaped: None,
         edit_epoch,
         epoch_prop: ReactiveProp::new(rx(move || edit_epoch.get())),
         last_written: init,
         shaped: None,
         shaped_content: None,
         last_bounds: Rect::default(),
+        scroll_x: 0.0,
         id: None,
     }
 }
 
+/// Whether the placeholder should paint: only with a placeholder set, an empty buffer, and no focus (#72).
+fn should_show_placeholder(has_placeholder: bool, is_empty: bool, is_focused: bool) -> bool {
+    has_placeholder && is_empty && !is_focused
+}
+
 impl TextEdit {
+    /// Sets placeholder text shown (muted) when the buffer is empty and the leaf is unfocused (#72).
+    pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
+    /// Sets the text font size (logical px). Used by a wrapper (TextInput #72) to scale the input with its
+    /// `ControlSize`; the placeholder and committed text share it.
+    pub fn font_size(mut self, size: Px) -> Self {
+        self.style.size = size;
+        self
+    }
+
+    /// The leaf's focus handle. A wrapper (TextInput #72) reads it to drive a focus ring reflecting the
+    /// editor's focus — the leaf remains the sole focus target (the wrapper does not register the handle),
+    /// so no extra tab-order entry is minted.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.handle.clone()
+    }
+
     /// Bumps the edit epoch (strictly increasing), so the bound `ReactiveProp` effect marks the node
     /// paint-dirty and the frame repaints (ARK-003).
     fn bump(&self) {
@@ -230,7 +269,9 @@ impl TextEdit {
         if let MouseKind::Down(MouseButton::Left) = me.kind {
             self.handle.focus();
             if let Some(shaped) = self.shaped.as_ref() {
-                let x = me.pos.x - self.last_bounds.origin.x;
+                // Map the window x to text-local x, adding back the horizontal scroll offset (#72) that paint
+                // applied, so a click lands on the correct byte when a long line is scrolled.
+                let x = me.pos.x - self.last_bounds.origin.x + self.scroll_x;
                 let byte = self.buffer.byte_at_point(shaped, x, 0.0);
                 if me.modifiers.shift {
                     let anchor = self.buffer.cursor();
@@ -298,6 +339,10 @@ impl Element for TextEdit {
         let size = shaped.size;
         self.shaped_content = Some(self.buffer.text().to_string());
         self.shaped = Some(shaped);
+        // Shape the placeholder once (if any) for reuse each paint it is shown (#72).
+        if let Some(ph) = &self.placeholder {
+            self.placeholder_shaped = Some(cx.text.shape(ph, &self.style, None));
+        }
         cx.layout.set_measure(id, Box::new(move |_avail| size));
         id
     }
@@ -328,13 +373,19 @@ impl Element for TextEdit {
             .handle
             .is_focused_untracked()
             .then(|| self.buffer.caret_rect(shaped));
-        // Publish the caret area (window coords) so the shell points the OS IME candidate window at it and
-        // enables IME while a text field is focused (#299). Only the focused editor writes; an unfocused one
-        // leaves the per-frame cell untouched, so the shell reads `None` and disables IME. Published whether
-        // or not composing, so the candidate window follows the preedit caret too.
+        // Horizontal scroll (#72): shift the text left so the focused caret stays within the field; empty /
+        // unfocused → 0 (left-aligned). `ox` is the effective text origin x. Cached in `self.scroll_x` (below)
+        // so `handle_mouse` maps a click x back to a text byte.
+        // `avail` is clamped to ≥ 0 so a degenerate field narrower than the margin still yields scroll_x = 0
+        // at Home (not a spurious offset).
+        let avail = (bounds.size.w - CARET_SCROLL_MARGIN).max(0.0);
+        let scroll_x = caret.map_or(0.0, |cr| (cr.origin.x - avail).max(0.0));
+        let ox = bounds.origin.x - scroll_x;
+        // Publish the caret area (window coords, scroll-adjusted) so the OS IME candidate window follows the
+        // on-screen caret + IME enables while a text field is focused (#299). Only the focused editor writes.
         if let (Some(cr), Some(area)) = (caret, &self.ime_caret) {
             area.set(Rect::from_xywh(
-                bounds.origin.x + cr.origin.x,
+                ox + cr.origin.x,
                 bounds.origin.y + cr.origin.y,
                 cr.size.w.max(1.0),
                 cr.size.h,
@@ -343,24 +394,40 @@ impl Element for TextEdit {
         // Resolve colors before the atlas/scene borrows.
         let text_color = cx.theme.resolve_color(ColorRole::Text);
         let selection_color = scale_alpha(cx.theme.resolve_color(ColorRole::Accent), 0.35);
+        // Clip all content (glyphs / caret / selection) to the field so a long line does not overflow the
+        // border (#72); restored before the hit region below.
+        let prev_clip = cx.push_clip(bounds);
         // 3. Selection quads (below the glyphs).
         for r in self.buffer.selection_rects(shaped) {
             let rect = Rect::from_xywh(
-                bounds.origin.x + r.origin.x,
+                ox + r.origin.x,
                 bounds.origin.y + r.origin.y,
                 r.size.w,
                 r.size.h,
             );
             push_fill_quad(cx, rect, selection_color);
         }
-        // 4. Glyphs.
-        paint_shaped_glyphs(cx, shaped, text_color, bounds);
+        // 4. Glyphs (shifted by the scroll offset; the pushed clip masks the overflow).
+        let text_bounds = Rect::from_xywh(ox, bounds.origin.y, bounds.size.w, bounds.size.h);
+        paint_shaped_glyphs(cx, shaped, text_color, text_bounds);
+        // 4b. Placeholder (muted) — only when empty and unfocused (#72). An empty buffer paints no real glyphs
+        //     above, so there is no overlap. `caret.is_some()` == focused (it is gated on focus above).
+        if should_show_placeholder(
+            self.placeholder.is_some(),
+            self.buffer.text().is_empty(),
+            caret.is_some(),
+        ) {
+            if let Some(ph_shaped) = self.placeholder_shaped.as_ref() {
+                let muted = cx.theme.resolve_color(ColorRole::TextMuted);
+                paint_shaped_glyphs(cx, ph_shaped, muted, text_bounds);
+            }
+        }
         // 5. Caret (only when focused and not composing) — above the glyphs. `caret` is already gated on
         //    focus (untracked; the focus-watch effect drives the repaint); a 2px bar reads clearly.
         if let Some(cr) = caret {
             if !self.buffer.ime().is_composing() {
                 let rect = Rect::from_xywh(
-                    bounds.origin.x + cr.origin.x,
+                    ox + cr.origin.x,
                     bounds.origin.y + cr.origin.y,
                     cr.size.w.max(2.0),
                     cr.size.h,
@@ -368,14 +435,17 @@ impl Element for TextEdit {
                 push_fill_quad(cx, rect, text_color);
             }
         }
-        // 6. IME preedit at the caret origin, while composing. Allocate the painter order from the tree's
-        //    monotonic counter (underlines at `order_base`, glyphs at `order_base + 1`) so the preedit
-        //    composes above the field background — a hardcoded low order would be overdrawn in a nested field.
+        // 6. IME preedit at the (scroll-adjusted) caret origin, while composing. Allocate the painter order
+        //    from the tree's monotonic counter (underlines at `order_base`, glyphs at `order_base + 1`) so the
+        //    preedit composes above the field background — a hardcoded low order would be overdrawn nested.
         if self.buffer.ime().is_composing() {
             let cr = self.buffer.caret_rect(shaped);
-            let origin = Point::new(bounds.origin.x + cr.origin.x, bounds.origin.y + cr.origin.y);
+            let origin = Point::new(ox + cr.origin.x, bounds.origin.y + cr.origin.y);
             let order_base = cx.next_order();
             let _glyph_slot = cx.next_order(); // reserve `order_base + 1` for the preedit glyphs
+            // The active field clip (Some(bounds) here — we are inside `push_clip`) so the preedit is masked
+            // to the field like the committed glyphs (#72), captured before the atlas borrow.
+            let clip = cx.clip();
             if let Some(atlas) = cx.atlas.as_deref_mut() {
                 self.buffer.ime().emit_preedit(
                     cx.text,
@@ -385,9 +455,12 @@ impl Element for TextEdit {
                     atlas,
                     cx.scene,
                     order_base,
+                    clip,
                 );
             }
         }
+        cx.set_clip(prev_clip);
+        self.scroll_x = scroll_x;
         // 7. Record a hit region so clicks land + the tab order sees it as focusable.
         if let Some(id) = self.id {
             let clip = cx.clip_rect(bounds);
@@ -895,5 +968,26 @@ mod tests {
         );
 
         drop(owner);
+    }
+
+    #[test]
+    fn should_show_placeholder_only_when_empty_and_unfocused_with_placeholder() {
+        // has_placeholder, is_empty, is_focused
+        assert!(
+            should_show_placeholder(true, true, false),
+            "placeholder set + empty + unfocused → show"
+        );
+        assert!(
+            !should_show_placeholder(true, true, true),
+            "focused → hide (the caret leads)"
+        );
+        assert!(
+            !should_show_placeholder(true, false, false),
+            "non-empty → hide (the text leads)"
+        );
+        assert!(
+            !should_show_placeholder(false, true, false),
+            "no placeholder set → nothing to show"
+        );
     }
 }

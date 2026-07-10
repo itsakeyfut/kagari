@@ -36,6 +36,7 @@ fn preedit_underline_should_match_golden() {
             renderer.atlas_mut(),
             &mut scene,
             0,
+            None,
         );
         // Verified independently of lavapipe: glyphs plus a solid + a dotted underline.
         assert_eq!(scene.glyphs.len(), 3, "日 本 語 → three glyphs");
