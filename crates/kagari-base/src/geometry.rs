@@ -36,6 +36,18 @@ pub struct Rect {
     pub size: Size,
 }
 
+/// A layout orientation — the axis a split or stack runs along. A closed pair (it will never gain
+/// variants), so it is deliberately NOT `#[non_exhaustive]`. Serde-gated like the other base value types,
+/// so serializable models (e.g. a dock layout) can persist it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Axis {
+    /// Runs left-to-right; children are laid out horizontally.
+    Horizontal,
+    /// Runs top-to-bottom; children are laid out vertically.
+    Vertical,
+}
+
 /// Per-side lengths (padding, border, margin).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
