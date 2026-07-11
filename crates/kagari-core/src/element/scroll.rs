@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
-use kagari_layout::scroll::{ScrollState, fling_target, thumb};
+use kagari_layout::scroll::{ScrollState, fling_target, thumb, thumb_drag_to_offset};
 use kagari_layout::{Display, LayoutStyle, Overflow};
 use kagari_render::{Background, Border, Quad, RoundedRect};
 
 use super::{AnyElement, DamageSink, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx};
 use crate::anim::{Animated, AnimationSpec};
 use crate::arena::Node;
+use crate::event::{HitRegion, InteractFlags, MouseButton, MouseKind};
 use crate::reactive::{Prop, create_effect, rx};
 
 /// Overlay-scrollbar thumb thickness (logical px).
@@ -35,6 +36,9 @@ const SCROLL_SPRING: AnimationSpec = AnimationSpec::Spring {
 #[derive(Clone)]
 pub struct ScrollHandle {
     offset: Animated<Point>,
+    /// The bound `Scroll`'s last-measured content extent, written each paint (when this handle drives an
+    /// interactive scroll) and read by an outer widget to clamp wheel scrolling. Clones share the cell.
+    content: Arc<Mutex<Size>>,
 }
 
 impl ScrollHandle {
@@ -42,12 +46,32 @@ impl ScrollHandle {
     pub fn new() -> Self {
         Self {
             offset: Animated::new(Point::new(0.0, 0.0), SCROLL_SPRING),
+            content: Arc::new(Mutex::new(Size::new(0.0, 0.0))),
+        }
+    }
+
+    /// The bound scroll's last-measured content extent (`(0, 0)` before the first paint). Lets an outer
+    /// widget clamp wheel scrolling to `content − viewport` without re-measuring.
+    pub fn content(&self) -> Size {
+        self.content.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    /// Stores the measured content extent (called by the bound `Scroll` at paint).
+    pub(crate) fn store_content(&self, content: Size) {
+        if let Ok(mut c) = self.content.lock() {
+            *c = content;
         }
     }
 
     /// The current scroll offset — a tracked read inside a reactive closure.
     pub fn offset(&self) -> Point {
         self.offset.get()
+    }
+
+    /// The current scroll offset as an **untracked** read — for imperative event-time snapshots (a
+    /// drag-start capture) that must not create a reactive subscription.
+    pub fn offset_untracked(&self) -> Point {
+        self.offset.get_untracked()
     }
 
     /// Animates to an absolute offset (the container clamps it to the content at paint). Smooth by
@@ -99,10 +123,30 @@ impl From<&ScrollHandle> for Prop<Point> {
     }
 }
 
+/// An in-progress scrollbar-thumb drag: which axis, the pointer position where the grab began, and the
+/// scroll offset at that moment (both along the dragged axis). `None` when not dragging — the handler
+/// early-returns on a bare hover, since `on_mouse_move` also fires when merely hovering the thumb.
+struct ThumbDrag {
+    vertical: bool,
+    start_mouse: f32,
+    start_offset: f32,
+}
+
+/// Thumb geometry retained from the last paint, so the event handler can hit-test a mouse-down against
+/// the visible thumb and map a drag with the same `content`/`viewport` it was painted from.
+#[derive(Clone, Copy)]
+struct ThumbMetrics {
+    thumb_v: Option<Rect>,
+    thumb_h: Option<Rect>,
+    content: Size,
+    viewport: Size,
+}
+
 /// A scroll container: a fixed-size viewport that clips its children and translates them by a
 /// reactive offset (paint-only). Children stack in **block** flow so their natural size overflows the
 /// viewport (a flex container would shrink them to fit). Bind the offset with a static [`Point`] or a
-/// reactive [`ScrollHandle`]; overlay scrollbars appear when content overflows.
+/// reactive [`ScrollHandle`]; overlay scrollbars appear when content overflows, and become **draggable**
+/// when bound with [`offset_handle`](Self::offset_handle).
 pub struct Scroll {
     children: Vec<AnyElement>,
     layout: LayoutStyle,
@@ -113,6 +157,15 @@ pub struct Scroll {
     id: Option<NodeId>,
     child_ids: Vec<NodeId>,
     scrollbar: bool,
+    /// The writable handle bound by [`offset_handle`](Self::offset_handle) — enables interactive thumb
+    /// drag. `None` = static/read-only offset (non-interactive thumbs, the pre-existing behavior).
+    drag_handle: Option<ScrollHandle>,
+    /// The in-progress thumb drag, if any.
+    drag: Option<ThumbDrag>,
+    /// Thumb geometry from the last paint (event-time hit-test + drag mapping); only set when interactive.
+    metrics: Option<ThumbMetrics>,
+    /// Per-axis enable `(horizontal, vertical)`: a disabled axis pins its offset to 0 and shows no thumb.
+    axes: (bool, bool),
 }
 
 /// Creates an empty scroll container (block flow, overflow-scroll). Set a viewport with
@@ -134,6 +187,10 @@ pub fn scroll() -> Scroll {
         id: None,
         child_ids: Vec::new(),
         scrollbar: true,
+        drag_handle: None,
+        drag: None,
+        metrics: None,
+        axes: (true, true),
     }
 }
 
@@ -172,6 +229,23 @@ impl Scroll {
     /// Hides the overlay scrollbars (shown by default when content overflows).
     pub fn hide_scrollbar(mut self) -> Self {
         self.scrollbar = false;
+        self
+    }
+
+    /// Binds a writable [`ScrollHandle`] as the offset **and** enables interactive scrollbar thumbs: a
+    /// mouse-down on a thumb captures the pointer and a drag writes the handle (the grab point tracks the
+    /// cursor). Sets the reactive read prop from the same handle, so this replaces `.offset(&handle)` when
+    /// draggable thumbs are wanted. A static [`offset`](Self::offset) leaves the thumbs non-interactive.
+    pub fn offset_handle(mut self, handle: &ScrollHandle) -> Self {
+        self.drag_handle = Some(handle.clone());
+        self.offset = Some(handle.into());
+        self
+    }
+
+    /// Per-axis scroll enable `(horizontal, vertical)` (both on by default). A disabled axis pins its
+    /// offset to 0 (enforced at paint, so any writer is clamped) and paints/hit-tests no thumb.
+    pub fn axes(mut self, horizontal: bool, vertical: bool) -> Self {
+        self.axes = (horizontal, vertical);
         self
     }
 
@@ -215,21 +289,56 @@ impl Scroll {
     }
 
     /// Emits the overlay scrollbar thumbs (drawn above content, clipped to the viewport). One thumb
-    /// per overflowing axis, sized by the content/viewport ratio via [`kagari_layout::scroll::thumb`].
-    fn paint_scrollbars(&self, bounds: Rect, content: Size, offset: Point, cx: &mut PaintCx) {
+    /// per **enabled, overflowing** axis, sized by the content/viewport ratio via
+    /// [`kagari_layout::scroll::thumb`]. When a handle is bound ([`offset_handle`](Self::offset_handle)),
+    /// each painted thumb also records an interactive hit region and the geometry is retained in
+    /// `self.metrics` for the drag handler — so the interactive area exactly matches the visible thumb
+    /// (no dead zone when content fits: no thumb ⇒ no hit region).
+    fn paint_scrollbars(&mut self, bounds: Rect, content: Size, offset: Point, cx: &mut PaintCx) {
         // If an active clip fully culls the viewport (e.g. a nested scroll scrolled out of its
         // parent), emit no thumbs — mirroring `Div`'s empty-mask skip, so no degenerate zero-mask
         // quad is pushed.
         let mask_rect = cx.clip_rect(bounds);
         if cx.clip().is_some() && mask_rect.is_empty() {
+            self.metrics = None;
             return;
         }
-        let color = Background::Solid(Color::new(0.6, 0.6, 0.6, 0.6));
+        // A mid-gray thumb (sRGB → linear-premultiplied) at high opacity, so it reads on both light and
+        // dark surfaces (a fainter thumb washes out on a light theme where Surface ≈ white).
+        let color = Background::Solid(Color::from_srgb([0.5, 0.5, 0.5, 0.85]));
         let mask = RoundedRect {
             rect: mask_rect,
             radii: Corners::default(),
         };
-        let push_thumb = |rect: Rect, cx: &mut PaintCx| {
+        // Vertical thumb (right edge) — only when the vertical axis is enabled and overflows.
+        let thumb_v = if self.axes.1 {
+            thumb(bounds.size.h, content.h, offset.y, bounds.size.h).map(|(pos, len)| {
+                Rect::from_xywh(
+                    bounds.origin.x + bounds.size.w - SCROLLBAR_THICKNESS,
+                    bounds.origin.y + pos,
+                    SCROLLBAR_THICKNESS,
+                    len,
+                )
+            })
+        } else {
+            None
+        };
+        // Horizontal thumb (bottom edge).
+        let thumb_h = if self.axes.0 {
+            thumb(bounds.size.w, content.w, offset.x, bounds.size.w).map(|(pos, len)| {
+                Rect::from_xywh(
+                    bounds.origin.x + pos,
+                    bounds.origin.y + bounds.size.h - SCROLLBAR_THICKNESS,
+                    len,
+                    SCROLLBAR_THICKNESS,
+                )
+            })
+        } else {
+            None
+        };
+        let interactive = self.drag_handle.is_some();
+        // Vertical first, then horizontal (stable order for painter/z and tests).
+        for rect in [thumb_v, thumb_h].into_iter().flatten() {
             let order = cx.next_order();
             cx.scene.quads.push(Quad {
                 bounds: rect,
@@ -242,26 +351,89 @@ impl Scroll {
                 content_mask: mask,
                 order,
             });
-        };
-        // Vertical thumb on the right edge.
-        if let Some((pos, len)) = thumb(bounds.size.h, content.h, offset.y, bounds.size.h) {
-            let rect = Rect::from_xywh(
-                bounds.origin.x + bounds.size.w - SCROLLBAR_THICKNESS,
-                bounds.origin.y + pos,
-                SCROLLBAR_THICKNESS,
-                len,
-            );
-            push_thumb(rect, cx);
+            // The thumbs paint last, so their hit `order` is the highest — an edge press grabs the
+            // thumb over any content beneath it (RK-016).
+            if interactive {
+                if let Some(id) = self.id {
+                    cx.record_hit(HitRegion {
+                        node: id,
+                        bounds: rect,
+                        clip: mask_rect,
+                        order,
+                        flags: InteractFlags {
+                            mouse: true,
+                            ..InteractFlags::default()
+                        },
+                    });
+                }
+            }
         }
-        // Horizontal thumb on the bottom edge.
-        if let Some((pos, len)) = thumb(bounds.size.w, content.w, offset.x, bounds.size.w) {
-            let rect = Rect::from_xywh(
-                bounds.origin.x + pos,
-                bounds.origin.y + bounds.size.h - SCROLLBAR_THICKNESS,
-                len,
-                SCROLLBAR_THICKNESS,
-            );
-            push_thumb(rect, cx);
+        self.metrics = interactive.then_some(ThumbMetrics {
+            thumb_v,
+            thumb_h,
+            content,
+            viewport: bounds.size,
+        });
+    }
+
+    /// Handles a mouse event on the scroll node itself (the thumb hit region), when a drag handle is
+    /// bound. Down on a thumb captures the pointer + records the grab; a captured Move maps the drag to
+    /// an offset (grab point tracks the cursor); Up releases. A Move with no active drag (a bare hover,
+    /// which also fires `on_mouse_move`) is a no-op — the `drag` Option is the guard.
+    fn handle_thumb(&mut self, me: &crate::event::MouseEvent, cx: &mut EventCx) {
+        let Some(handle) = self.drag_handle.clone() else {
+            return;
+        };
+        match me.kind {
+            MouseKind::Down(MouseButton::Left) => {
+                let Some(m) = self.metrics else {
+                    return;
+                };
+                if m.thumb_v.is_some_and(|r| r.contains(me.pos)) {
+                    cx.capture_pointer();
+                    self.drag = Some(ThumbDrag {
+                        vertical: true,
+                        start_mouse: me.pos.y,
+                        start_offset: handle.offset_untracked().y,
+                    });
+                } else if m.thumb_h.is_some_and(|r| r.contains(me.pos)) {
+                    cx.capture_pointer();
+                    self.drag = Some(ThumbDrag {
+                        vertical: false,
+                        start_mouse: me.pos.x,
+                        start_offset: handle.offset_untracked().x,
+                    });
+                }
+            }
+            MouseKind::Move => {
+                let (Some(d), Some(m)) = (self.drag.as_ref(), self.metrics) else {
+                    return;
+                };
+                let cur = handle.offset_untracked();
+                if d.vertical {
+                    let y = thumb_drag_to_offset(
+                        d.start_offset,
+                        me.pos.y - d.start_mouse,
+                        m.viewport.h,
+                        m.content.h,
+                        m.viewport.h,
+                    );
+                    handle.jump_to(Point::new(cur.x, y));
+                } else {
+                    let x = thumb_drag_to_offset(
+                        d.start_offset,
+                        me.pos.x - d.start_mouse,
+                        m.viewport.w,
+                        m.content.w,
+                        m.viewport.w,
+                    );
+                    handle.jump_to(Point::new(x, cur.y));
+                }
+            }
+            MouseKind::Up(MouseButton::Left) if self.drag.take().is_some() => {
+                cx.release_pointer();
+            }
+            _ => {}
         }
     }
 }
@@ -307,11 +479,21 @@ impl Element for Scroll {
             content.w = content.w.max(local.origin.x + local.size.w);
             content.h = content.h.max(local.origin.y + local.size.h);
         }
-        let offset = ScrollState {
+        // Publish the measured content to the bound handle so an outer widget can clamp wheel scrolling.
+        if let Some(handle) = &self.drag_handle {
+            handle.store_content(content);
+        }
+        let clamped = ScrollState {
             offset: self.current_offset(),
             content,
         }
         .clamp(viewport);
+        // Per-axis lock: a disabled axis pins to 0 here, at the single point every offset write (wheel,
+        // drag, programmatic) funnels through for paint — so the invariant holds regardless of the writer.
+        let offset = Point {
+            x: if self.axes.0 { clamped.x } else { 0.0 },
+            y: if self.axes.1 { clamped.y } else { 0.0 },
+        };
 
         // Paint children translated by -offset, clipped to the viewport (nested scrolls intersect).
         // Offsetting the absolute origin keeps the RK-007 cascade: parent origin + child local - offset.
@@ -343,14 +525,26 @@ impl Element for Scroll {
     }
 
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
-        // The scroll container has no handlers of its own (the offset is driven by a ScrollHandle);
-        // just descend toward the target so children's handlers run, like `Div`.
+        // Descend toward the target so children's handlers run, like `Div`.
         let Some(id) = self.id else {
             return;
         };
         if let Some(next) = cx.next_child_on_path(id) {
             if let Some(i) = self.child_ids.iter().position(|&c| c == next) {
                 self.children[i].handle_event(ev, cx);
+            }
+        }
+        if cx.is_stopped() {
+            return;
+        }
+        // Self-fire: when a handle is bound, the painted thumb records a hit region on this node, so a
+        // mouse-down/drag on it delivers here (or the captured node during a drag). Drives the offset.
+        if self.drag_handle.is_some() {
+            if let Event::Mouse(me) = ev {
+                if cx.should_fire(id) {
+                    cx.set_current(id);
+                    self.handle_thumb(me, cx);
+                }
             }
         }
     }
@@ -1016,6 +1210,294 @@ mod tests {
             "convergence deregisters — the app returns to on-demand (no idle frames)"
         );
 
+        drop(owner);
+    }
+
+    // --- Interactive thumbs (#83): drag, hover, release, hit-recording, per-axis lock ---
+
+    use crate::event::{
+        DispatchState, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse,
+    };
+
+    /// Builds `root`, computes layout + paints with a real `HitTest`, returning the arena, hit-test,
+    /// scene, and root id so a test can dispatch mouse events against the recorded thumb hit region.
+    fn paint_interactive(root: &mut AnyElement, viewport: Size) -> (Arena, HitTest, Scene, NodeId) {
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage: Arc<dyn DamageSink> = Arc::new(NoopDamage);
+        let theme = Theme::default();
+        let id = root.request_layout(&mut LayoutCx {
+            arena: &mut arena,
+            layout: &mut layout,
+            text: &mut text,
+            damage,
+            theme: &theme,
+            focus: None,
+            cursor: None,
+        });
+        layout.compute(id, viewport).unwrap();
+        let mut scene = Scene::new();
+        let mut hit = HitTest::new();
+        let bounds = layout.layout(id);
+        root.paint(
+            bounds,
+            &mut PaintCx::new(&mut scene, &layout, &mut text, None, Some(&mut hit), &theme),
+        );
+        (arena, hit, scene, id)
+    }
+
+    /// A vertical scroll: one 100×200 child in a 100×100 viewport (overflows the height) bound to
+    /// `handle` for interactive thumbs. The vertical thumb is len 50 at x∈[94,100], y∈[0,50] (offset 0).
+    fn interactive_v(handle: &ScrollHandle) -> AnyElement {
+        scroll()
+            .size(Size::new(100.0, 100.0))
+            .offset_handle(handle)
+            .child(div().size(Size::new(100.0, 200.0)).background(green()))
+            .into_element()
+    }
+
+    fn send(
+        root: &mut AnyElement,
+        arena: &Arena,
+        hit: &HitTest,
+        st: &mut DispatchState,
+        k: MouseKind,
+        x: f32,
+        y: f32,
+    ) {
+        let ev = MouseEvent::new(k, Point::new(x, y), Modifiers::default());
+        dispatch_mouse(root, arena, hit, &ev, st);
+    }
+
+    #[test]
+    fn scroll_thumb_should_record_hit_when_overflowing() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut root = interactive_v(&handle);
+        let (_a, hit, _s, id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        // The vertical thumb (x∈[94,100], y∈[0,50]) is pickable and tagged to the scroll node.
+        assert_eq!(
+            hit.pick(Point::new(97.0, 25.0)),
+            Some(id),
+            "the overflowing thumb records an interactive hit region on the scroll node"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_thumb_should_record_no_hit_when_content_fits() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        // Content 80 fits the 100 viewport → no thumb → no hit region → edge clicks reach content.
+        let mut root = scroll()
+            .size(Size::new(100.0, 100.0))
+            .offset_handle(&handle)
+            .child(div().size(Size::new(80.0, 80.0)).background(green()))
+            .into_element();
+        let (_a, hit, _s, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        assert!(
+            hit.pick(Point::new(97.0, 25.0)).is_none(),
+            "content that fits paints no thumb and records no hit region (no dead zone)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_thumb_drag_should_move_offset() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut root = interactive_v(&handle);
+        let (arena, hit, _s, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        // Grab the thumb (97,25) and drag to the track bottom (97,75): delta 50 over free-track 50 →
+        // offset reaches max (content 200 − viewport 100 = 100).
+        let mut st = DispatchState::default();
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Down(MouseButton::Left),
+            97.0,
+            25.0,
+        );
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            75.0,
+        );
+        assert_eq!(
+            handle.offset().y,
+            100.0,
+            "dragging the thumb to the track bottom scrolls to the max offset (grab tracks the cursor)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_thumb_horizontal_drag_should_move_offset_x() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        // A horizontally-overflowing scroll (300-wide child in a 100 viewport): the horizontal thumb sits
+        // on the bottom edge (y∈[94,100], x∈[0,33.3]). This exercises the x/y-symmetric horizontal drag
+        // branch (start_offset from .x, `jump_to(Point::new(x, cur.y))`) — an axis-swap would fail here.
+        let mut root = scroll()
+            .size(Size::new(100.0, 100.0))
+            .offset_handle(&handle)
+            .child(div().size(Size::new(300.0, 100.0)).background(green()))
+            .into_element();
+        let (arena, hit, _s, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        // Grab the thumb (15,97) and drag right to (60,97): delta 45 over free-track 66.67 → offset x
+        // 45 · 200/66.67 = 135; y stays 0.
+        let mut st = DispatchState::default();
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Down(MouseButton::Left),
+            15.0,
+            97.0,
+        );
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            60.0,
+            97.0,
+        );
+        assert!(
+            (handle.offset().x - 135.0).abs() < 0.01,
+            "the horizontal thumb drag scrolls x (got {})",
+            handle.offset().x
+        );
+        assert_eq!(
+            handle.offset().y,
+            0.0,
+            "the horizontal drag leaves y untouched"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_hover_without_grab_should_not_scroll() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut root = interactive_v(&handle);
+        let (arena, hit, _s, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        // A bare Move over the thumb (no prior Down) also fires on_mouse_move — it must not scrub.
+        let mut st = DispatchState::default();
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            40.0,
+        );
+        assert_eq!(
+            handle.offset().y,
+            0.0,
+            "hovering the thumb without a grab does not scroll"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_thumb_up_should_release_and_reset() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut root = interactive_v(&handle);
+        let (arena, hit, _s, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        let mut st = DispatchState::default();
+        // Down + Move to y=50 → offset 50; Up releases; a further Move must NOT scrub (drag reset).
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Down(MouseButton::Left),
+            97.0,
+            25.0,
+        );
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            50.0,
+        );
+        assert_eq!(handle.offset().y, 50.0, "the drag scrolled to 50");
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Up(MouseButton::Left),
+            97.0,
+            50.0,
+        );
+        send(
+            &mut root,
+            &arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            75.0,
+        );
+        assert_eq!(
+            handle.offset().y,
+            50.0,
+            "after release, a hover-move does not continue scrubbing"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn scroll_axes_should_pin_disabled_axis() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        handle.jump_to(Point::new(50.0, 50.0));
+        // Content 200×200 overflows both axes, but horizontal is disabled → x pinned to 0, no h thumb.
+        let mut root = scroll()
+            .size(Size::new(100.0, 100.0))
+            .offset_handle(&handle)
+            .axes(false, true)
+            .child(div().size(Size::new(200.0, 200.0)).background(green()))
+            .into_element();
+        let (_a, _h, scene, _id) = paint_interactive(&mut root, Size::new(100.0, 100.0));
+        // The child paints translated by -(0, 50): x pinned to 0 (not -50), y scrolled by 50.
+        assert_eq!(
+            scene.quads[0].bounds.origin.x, 0.0,
+            "the disabled horizontal axis pins the x offset to 0"
+        );
+        assert_eq!(
+            scene.quads[0].bounds.origin.y, -50.0,
+            "the enabled vertical axis still scrolls"
+        );
+        // Only the vertical thumb is painted (child + 1 thumb = 2 quads), no horizontal thumb.
+        assert_eq!(
+            scene.quads.len(),
+            2,
+            "a disabled axis paints no thumb (child + vertical thumb only)"
+        );
         drop(owner);
     }
 }
