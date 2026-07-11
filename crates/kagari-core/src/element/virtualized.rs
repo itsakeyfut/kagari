@@ -3,18 +3,30 @@
 //! reads a [`ScrollHandle`] offset, positions each realized row at `index * item_height - offset`, and
 //! clips to a fixed viewport (a standalone virtual viewport — not nested in a #60 `Scroll`).
 
-use kagari_base::{NodeId, Point, Rect, Size};
-use kagari_layout::scroll::visible_range;
+use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
+use kagari_layout::scroll::{thumb, thumb_drag_to_offset, visible_range};
 use kagari_layout::{LayoutStyle, Overflow};
+use kagari_render::{Border, Quad, RoundedRect};
 
+use super::scroll::{SCROLLBAR_THICKNESS, scrollbar_thumb_bg};
 use super::{
     AnyElement, DynList, Element, Event, EventCx, IntoElement, LayoutCx, PaintCx, ScrollHandle,
     div, dyn_list,
 };
+use crate::event::{HitRegion, InteractFlags, MouseButton, MouseEvent, MouseKind};
 
 /// Extra rows realized on each side of the visible window, so a scroll of a fraction of a row does
 /// not flash un-built content at the edges.
 const BUFFER: usize = 2;
+
+/// An in-progress overlay-scrollbar-thumb drag on the (vertical-only) virtualized list: the pointer y
+/// where the grab began and the scroll offset at that moment. Mirrors `Scroll`'s `ThumbDrag`, but the
+/// list scrolls vertically only, so there is one axis. `None` on a bare hover — the guard against a
+/// hover scrubbing the offset (a `Move` also delivers to the captured node once a drag is active).
+struct ThumbDragV {
+    start_mouse: f32,
+    start_offset: f32,
+}
 
 /// A fixed-height virtualized list: only the rows intersecting the viewport (± a buffer) are built,
 /// and an offset change incrementally realizes/releases rows by index key (in-range rows keep their
@@ -26,9 +38,17 @@ const BUFFER: usize = 2;
 pub struct VirtualizedList {
     list: DynList<usize, usize>,
     item_height: f32,
+    /// Total row count — the content height is `count * item_height` (the list is virtualized, so the
+    /// extent can't be measured from laid-out children the way `Scroll` does). Drives the overlay thumb.
+    count: usize,
     offset: ScrollHandle,
     viewport: Size,
     id: Option<NodeId>,
+    /// The vertical overlay-scrollbar thumb rect from the last paint (absolute coords), retained so a
+    /// mouse-down can hit-test against exactly the visible thumb. `None` when content fits (no thumb).
+    thumb: Option<Rect>,
+    /// The in-progress thumb drag, if any.
+    drag: Option<ThumbDragV>,
 }
 
 /// Creates a fixed-height virtualized list of `count` rows, each `item_height` tall, clipped to
@@ -66,9 +86,12 @@ where
     VirtualizedList {
         list,
         item_height,
+        count,
         offset: offset.clone(),
         viewport,
         id: None,
+        thumb: None,
+        drag: None,
     }
 }
 
@@ -77,6 +100,98 @@ impl VirtualizedList {
     /// scheduler polls this; tests poll it before driving [`Element::reconcile`].
     pub fn is_dirty(&self) -> bool {
         self.list.is_dirty()
+    }
+
+    /// Paints the vertical overlay-scrollbar thumb (right edge), sized by the viewport/content ratio and
+    /// positioned by the offset — above the rows (highest painter order), recording an interactive hit
+    /// region so a mouse-down grabs it. `None` (no thumb, no hit region) when content fits. The thumb rect
+    /// is retained in `self.thumb` for the event-time hit-test. Mirrors `Scroll::paint_scrollbars`, but the
+    /// list is vertical-only. `content_h` is `count * item_height`; `offset_y` is clamped inside [`thumb`].
+    fn paint_scrollbar(&mut self, bounds: Rect, content_h: f32, offset_y: f32, cx: &mut PaintCx) {
+        // If an active clip fully culls the viewport, emit no thumb (mirrors `Scroll`'s empty-mask skip).
+        let mask_rect = cx.clip_rect(bounds);
+        if cx.clip().is_some() && mask_rect.is_empty() {
+            self.thumb = None;
+            return;
+        }
+        let thumb_rect =
+            thumb(bounds.size.h, content_h, offset_y, bounds.size.h).map(|(pos, len)| {
+                Rect::from_xywh(
+                    bounds.origin.x + bounds.size.w - SCROLLBAR_THICKNESS,
+                    bounds.origin.y + pos,
+                    SCROLLBAR_THICKNESS,
+                    len,
+                )
+            });
+        if let Some(rect) = thumb_rect {
+            let order = cx.next_order();
+            cx.scene.quads.push(Quad {
+                bounds: rect,
+                corner_radii: Corners::default(),
+                bg: scrollbar_thumb_bg(),
+                border: Border {
+                    widths: Edges::default(),
+                    color: Color::TRANSPARENT,
+                },
+                content_mask: RoundedRect {
+                    rect: mask_rect,
+                    radii: Corners::default(),
+                },
+                order,
+            });
+            // The thumb paints last, so its hit `order` is the highest — an edge press grabs the thumb
+            // over the row beneath it (RK-016).
+            if let Some(id) = self.id {
+                cx.record_hit(HitRegion {
+                    node: id,
+                    bounds: rect,
+                    clip: mask_rect,
+                    order,
+                    flags: InteractFlags {
+                        mouse: true,
+                        ..InteractFlags::default()
+                    },
+                });
+            }
+        }
+        self.thumb = thumb_rect;
+    }
+
+    /// Handles a mouse event on the list node itself (the overlay-thumb hit region). Down inside the
+    /// retained thumb rect captures the pointer + records the grab; a captured Move maps the drag to an
+    /// offset (grab point tracks the cursor) and writes it via `jump_to`; Up releases. A Move with no
+    /// active drag (a bare hover) is a no-op — `drag` is the guard. Mirrors `Scroll::handle_thumb`.
+    fn handle_thumb(&mut self, me: &MouseEvent, cx: &mut EventCx) {
+        match me.kind {
+            MouseKind::Down(MouseButton::Left) => {
+                if self.thumb.is_some_and(|r| r.contains(me.pos)) {
+                    cx.capture_pointer();
+                    self.drag = Some(ThumbDragV {
+                        start_mouse: me.pos.y,
+                        start_offset: self.offset.offset_untracked().y,
+                    });
+                }
+            }
+            MouseKind::Move => {
+                let Some(d) = self.drag.as_ref() else {
+                    return;
+                };
+                let content_h = self.count as f32 * self.item_height;
+                let cur = self.offset.offset_untracked();
+                let y = thumb_drag_to_offset(
+                    d.start_offset,
+                    me.pos.y - d.start_mouse,
+                    self.viewport.h,
+                    content_h,
+                    self.viewport.h,
+                );
+                self.offset.jump_to(Point::new(cur.x, y));
+            }
+            MouseKind::Up(MouseButton::Left) if self.drag.take().is_some() => {
+                cx.release_pointer();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -101,7 +216,9 @@ impl Element for VirtualizedList {
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
-        let offset = self.offset.offset();
+        // An untracked read: paint must not establish a reactive dependency (the repaint seam is the inner
+        // `DynList`'s staging effect, which subscribes to the offset and flags structure-dirty on a scroll).
+        let offset = self.offset.offset_untracked();
         let item_height = self.item_height;
         // Clip to the viewport, then paint each realized row at `index * item_height - offset`
         // (offset-based, not flex). A row fully outside the viewport is clipped away by Div's mask.
@@ -121,23 +238,45 @@ impl Element for VirtualizedList {
             element.paint(row_bounds, cx);
         }
         cx.set_clip(saved);
+
+        // The true content height is `count * item_height` (only O(visible) rows exist, so it can't be
+        // measured from laid-out children the way `Scroll` does). Publish it on the handle so a host or
+        // observer can read the extent via `ScrollHandle::content()` (parity with `Scroll`, which a
+        // composing scroll surface can rely on); the list widget itself clamps its wheel from its own
+        // `count * item_height`. Then paint the overlay thumb above the rows.
+        let content_h = self.count as f32 * item_height;
+        self.offset
+            .store_content(Size::new(bounds.size.w, content_h));
+        self.paint_scrollbar(bounds, content_h, offset.y, cx);
     }
 
     fn handle_event(&mut self, ev: &Event, cx: &mut EventCx) {
         // A container: route the event down to the realized row on the dispatch path (like `Scroll`/`Div`),
         // so a hit on a virtualized row reaches its handlers. Only realized rows are on the path
         // (O(visible)); the row's own `Div::handle_event` fires / filters its listeners. Rows scrolled out
-        // of the window are released, so they are structurally off the path.
+        // of the window are released, so they are structurally off the path. Falls through (no early return)
+        // so the overlay-thumb self-fire below still runs when the thumb itself is the target.
         let Some(id) = self.id else {
             return;
         };
-        let Some(next) = cx.next_child_on_path(id) else {
+        if let Some(next) = cx.next_child_on_path(id) {
+            for (_, node_id, element) in self.list.realized_children() {
+                if node_id == next {
+                    element.handle_event(ev, cx);
+                    break;
+                }
+            }
+        }
+        if cx.is_stopped() {
             return;
-        };
-        for (_, node_id, element) in self.list.realized_children() {
-            if node_id == next {
-                element.handle_event(ev, cx);
-                return;
+        }
+        // Self-fire: the painted overlay thumb records a hit region on THIS node (highest order), so a
+        // mouse-down/drag on it delivers here (or to this captured node during a drag). Drives the offset.
+        // Mirrors `Scroll::handle_event`; the offset handle is always bound, so the thumb is always drivable.
+        if let Event::Mouse(me) = ev {
+            if cx.should_fire(id) {
+                cx.set_current(id);
+                self.handle_thumb(me, cx);
             }
         }
     }
@@ -371,8 +510,13 @@ mod tests {
             ),
         );
         assert!(
-            scene.quads.is_empty(),
-            "the over-scrolled tail is clipped above the viewport"
+            !scene.quads.iter().any(|q| q.bg == green()),
+            "the over-scrolled tail rows are clipped above the viewport"
+        );
+        // The overlay thumb self-clamps to the track bottom, so it still paints (the scene isn't blank).
+        assert!(
+            scene.quads.iter().any(|q| q.bg == thumb_bg()),
+            "the overlay thumb paints at the track bottom even when over-scrolled"
         );
 
         drop(owner);
@@ -639,6 +783,226 @@ mod tests {
             entered.get(),
             Some(2),
             "a hover over a realized row reaches that row's mouse-enter handler"
+        );
+        drop(owner);
+    }
+
+    // --- Overlay scrollbar (#321): a draggable vertical thumb on the virtualized list ---
+
+    /// The overlay-scrollbar thumb fill — the same shared helper the element paints with (in scope via
+    /// `use super::*`), so this in-crate test can't silently drift from the production color.
+    fn thumb_bg() -> Background {
+        scrollbar_thumb_bg()
+    }
+
+    /// Builds a `count`-row list (20px rows) in a 100×100 viewport bound to `handle`, lays it out and
+    /// paints it with a hit-test — returning the root, id, and scene so a test can inspect the thumb quad
+    /// and dispatch mouse events against its recorded hit region.
+    fn painted_vl(
+        handle: &ScrollHandle,
+        env: &mut Env,
+        hit: &mut HitTest,
+        count: usize,
+    ) -> (AnyElement, NodeId, Scene) {
+        let mut root: AnyElement =
+            virtualized_list(20.0, count, Size { w: 100.0, h: 100.0 }, handle, |_i| {
+                div().size(Size { w: 100.0, h: 20.0 }).background(green())
+            })
+            .into_element();
+        let id = root.request_layout(&mut env.cx());
+        env.layout.compute(id, Size { w: 100.0, h: 100.0 }).unwrap();
+        hit.clear();
+        let mut scene = Scene::new();
+        root.paint(
+            env.layout.layout(id),
+            &mut PaintCx::new(
+                &mut scene,
+                &env.layout,
+                &mut env.text,
+                None,
+                Some(hit),
+                &env.theme,
+            ),
+        );
+        (root, id, scene)
+    }
+
+    /// Dispatches a single mouse event at a window point.
+    fn send(
+        root: &mut AnyElement,
+        arena: &Arena,
+        hit: &HitTest,
+        st: &mut DispatchState,
+        k: MouseKind,
+        x: f32,
+        y: f32,
+    ) {
+        let ev = MouseEvent::new(k, Point::new(x, y), Modifiers::default());
+        dispatch_mouse(root, arena, hit, &ev, st);
+    }
+
+    #[test]
+    fn virtualized_should_paint_overlay_scrollbar_thumb() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        // 20 rows of 20px (content 400) in a 100 viewport overflows → a vertical thumb, len 100·100/400 = 25.
+        let (_root, _id, scene) = painted_vl(&handle, &mut env, &mut hit, 20);
+        let thumb = scene
+            .quads
+            .iter()
+            .find(|q| q.bg == thumb_bg())
+            .expect("overflowing content paints an overlay scrollbar thumb");
+        assert_eq!(
+            thumb.bounds.size.w, SCROLLBAR_THICKNESS,
+            "the thumb is thin"
+        );
+        assert_eq!(
+            thumb.bounds.size.h, 25.0,
+            "the thumb length reflects the viewport/content ratio (100/400 of 100)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_should_paint_no_thumb_when_content_fits() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        // 3 rows of 20px (content 60) fit the 100 viewport → no overflow → no thumb (no dead zone).
+        let (_root, _id, scene) = painted_vl(&handle, &mut env, &mut hit, 3);
+        assert!(
+            !scene.quads.iter().any(|q| q.bg == thumb_bg()),
+            "content that fits paints no scrollbar thumb"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_thumb_drag_should_scroll() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        // 20 rows / content 400 / viewport 100 → thumb len 25 at x∈[94,100], y∈[0,25]; free track 75, max 300.
+        let (mut root, _id, _scene) = painted_vl(&handle, &mut env, &mut hit, 20);
+        // Grab the thumb at (97,10) and drag down 37.5px: offset = 37.5 · 300/75 = 150 (grab tracks cursor).
+        let mut st = DispatchState::default();
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Down(MouseButton::Left),
+            97.0,
+            10.0,
+        );
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            47.5,
+        );
+        assert!(
+            (handle.offset().y - 150.0).abs() < 0.01,
+            "dragging the thumb scrolls by the inverse-mapped amount (got {})",
+            handle.offset().y
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_thumb_up_should_release_and_reset() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        // 20 rows / content 400 / viewport 100 → thumb at x∈[94,100], y∈[0,25]; free track 75, max 300.
+        let (mut root, _id, _scene) = painted_vl(&handle, &mut env, &mut hit, 20);
+        let mut st = DispatchState::default();
+        // Down + Move to y=25 → drag delta 15 → offset 15·300/75 = 60; Up releases; a later Move must NOT
+        // scrub (the `self.drag.take()` on Up reset the grab). Mirrors Scroll's release-and-reset test.
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Down(MouseButton::Left),
+            97.0,
+            10.0,
+        );
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            25.0,
+        );
+        assert!(
+            (handle.offset().y - 60.0).abs() < 0.01,
+            "the drag scrolled to 60 (got {})",
+            handle.offset().y
+        );
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Up(MouseButton::Left),
+            97.0,
+            25.0,
+        );
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            60.0,
+        );
+        assert!(
+            (handle.offset().y - 60.0).abs() < 0.01,
+            "after release, a hover-move does not continue scrubbing (got {})",
+            handle.offset().y
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_hover_thumb_should_not_scroll() {
+        let owner = Owner::new();
+        owner.set();
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let mut hit = HitTest::new();
+        let (mut root, _id, _scene) = painted_vl(&handle, &mut env, &mut hit, 20);
+        // A bare Move over the thumb (no prior Down) also fires on_mouse_move — it must not scrub.
+        let mut st = DispatchState::default();
+        send(
+            &mut root,
+            &env.arena,
+            &hit,
+            &mut st,
+            MouseKind::Move,
+            97.0,
+            12.0,
+        );
+        assert_eq!(
+            handle.offset().y,
+            0.0,
+            "hovering the thumb without a grab does not scroll"
         );
         drop(owner);
     }

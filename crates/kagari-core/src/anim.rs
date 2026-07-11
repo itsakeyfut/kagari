@@ -19,8 +19,17 @@ use crate::reactive::prelude::*;
 use crate::reactive::{RwSignal, use_context};
 use crate::scheduler::{ActiveSources, Tickable, Ticker};
 
-/// Convergence threshold on both the value-to-target distance and the velocity magnitude.
-const EPS: f32 = 0.001;
+/// Spring rest thresholds, RELATIVE to the target's magnitude — the position distance and the velocity
+/// magnitude are each compared against `REST_*_REL · max(1, |target|)`. A single *absolute* epsilon can't
+/// serve both unit-scale values (`Color`, 0..1) and px-scale values (a scroll offset in the hundreds or
+/// thousands): at large magnitudes f32 quantization pins the position a few ULPs short of the target and
+/// leaves a small limit-cycle velocity, so a fixed absolute threshold is never met — the spring never
+/// rests and pins the app to continuous redraw (RK-037-adjacent). Relative thresholds settle across
+/// scales. The value snaps to the exact target on convergence, and convergence lands at the (sub-pixel)
+/// quantization plateau, so the snap is imperceptible. `REST_SPEED_REL` is looser than `REST_DELTA_REL`
+/// because the persistent limit-cycle velocity is larger (relative to scale) than the position residual.
+const REST_DELTA_REL: f32 = 1e-5;
+const REST_SPEED_REL: f32 = 1e-3;
 /// Maximum spring integration sub-step (seconds) — keeps semi-implicit Euler stable for stiff springs.
 const MAX_STEP: f32 = 1.0 / 240.0;
 /// Clamp on a single frame's dt (seconds) so a huge hitch cannot explode the spring.
@@ -353,8 +362,10 @@ impl<T: Animatable + Send + Sync + 'static> Animated<T> {
                     // convergence threshold; treat it as converged so the value snaps to the target
                     // and the active source is released rather than pinning continuous redraw forever.
                     let non_finite = !nx.magnitude().is_finite() || !nv.magnitude().is_finite();
+                    let scale = inner.target.magnitude().max(1.0);
                     let done = non_finite
-                        || (nx.sub(inner.target).magnitude() < EPS && nv.magnitude() < EPS);
+                        || (nx.sub(inner.target).magnitude() < REST_DELTA_REL * scale
+                            && nv.magnitude() < REST_SPEED_REL * scale);
                     inner.velocity = if done {
                         inner.target.sub(inner.target)
                     } else {
@@ -459,6 +470,44 @@ mod tests {
         }
         assert_eq!(anim.get(), 100.0, "converges (and snaps) to the target");
         assert!(!anim.tick(frame()), "tick stays false once converged");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn animated_should_converge_at_large_magnitude() {
+        // Regression (#321): a px-scale spring (a scroll offset in the thousands) must still rest. A single
+        // *absolute* rest epsilon is unreachable at large magnitudes — f32 quantization floors the position
+        // a few ULPs short and leaves a limit-cycle velocity above the epsilon — so the spring would never
+        // rest and would pin the app to continuous redraw. Scale-relative thresholds fix it: a spring to
+        // 10000 converges (tick returns false), snaps to the exact target, and releases the active source.
+        let owner = Owner::new();
+        owner.set();
+
+        let sources = ActiveSources::new();
+        provide_context(sources.clone());
+        let anim = Animated::new(0.0_f32, spring());
+        anim.set_target(10_000.0);
+        assert_eq!(sources.count(), 1, "set_target registers an active source");
+
+        let mut ticks = 0;
+        while anim.tick(frame()) {
+            ticks += 1;
+            assert!(
+                ticks < 10_000,
+                "a large-magnitude spring must converge in bounded time"
+            );
+        }
+        assert_eq!(
+            anim.get(),
+            10_000.0,
+            "converges and snaps to the exact large target"
+        );
+        assert_eq!(
+            sources.count(),
+            0,
+            "convergence releases the active source (no idle redraw)"
+        );
 
         drop(owner);
     }
