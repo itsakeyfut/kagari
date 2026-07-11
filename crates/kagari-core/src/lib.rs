@@ -17,6 +17,7 @@ pub mod damage;
 /// Dev-build debug overlay (#69). Compiled out in release builds.
 #[cfg(debug_assertions)]
 pub mod debug;
+pub mod dock;
 pub mod element;
 pub mod error;
 pub mod event;
@@ -33,6 +34,7 @@ pub use app::{App, Decorations, WindowOptions};
 pub use bridge::UiProxy;
 pub use clipboard::{Clipboard, SystemClipboard};
 pub use damage::DamageState;
+pub use dock::{DockChild, DockNode, DockTarget, DockTree, DropZone, PanelId, drop_zone};
 pub use element::{
     AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, TextEdit,
     TransformOrigin, Transformed, div, icon, overlay, scroll, text, text_edit, transform,

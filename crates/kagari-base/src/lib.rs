@@ -10,7 +10,7 @@ pub mod transform;
 pub mod unit;
 
 pub use color::{Color, ColorSpace, TaggedColor, Transfer};
-pub use geometry::{Corners, Edges, Point, Rect, Size};
+pub use geometry::{Axis, Corners, Edges, Point, Rect, Size};
 pub use id::{NodeId, WindowId};
 pub use string::SharedString;
 pub use transform::Transform;

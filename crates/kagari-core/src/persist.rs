@@ -8,12 +8,14 @@
 //! set by the consumer via this service (there is no built-in theme switcher / rebinding UI yet).
 //! Dock/panel layout persistence and multi-profile support are post-MVP.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use kagari_base::{Point, SharedString, Size};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -52,8 +54,11 @@ impl KeymapOverrides {
 }
 
 /// The full persisted framework state. Every field is `#[serde(default)]` so an older / partial RON
-/// file still loads (forward-compatible), filling missing fields with defaults.
+/// file still loads (forward-compatible), filling missing fields with defaults. `#[non_exhaustive]` so
+/// future fields (added as the framework grows) never break an external struct-literal — consumers
+/// mutate via [`PersistenceService::with`], never by constructing this directly.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PersistedState {
     /// Per-window geometry, indexed by window open order.
     #[serde(default)]
@@ -65,6 +70,13 @@ pub struct PersistedState {
     /// User keymap overrides layered onto the default keymap.
     #[serde(default)]
     pub keymap_overrides: KeymapOverrides,
+    /// App-owned custom state, keyed by an app-chosen name; each value is a RON-serialized blob. The
+    /// framework never interprets these — the app reads/writes typed values through
+    /// [`PersistenceService::set`]/[`get`](PersistenceService::get) (e.g. a dock layout, recent files).
+    /// A `BTreeMap` (not `HashMap`) so the on-disk key order is stable across saves — no diff churn. A
+    /// corrupt/foreign blob under one key never breaks the others: each is parsed on demand.
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
 }
 
 /// Shared inner state behind the cloneable [`PersistenceService`] handle.
@@ -177,6 +189,40 @@ impl PersistenceService {
         *lc = Some(Instant::now());
     }
 
+    /// Stores `value` (serialized to RON) under `key` in the app-owned [`extra`](PersistedState::extra)
+    /// map, marking the state dirty. Overwrites any prior value at `key`. The framework never interprets
+    /// the blob — this is the generic hook app state (a dock layout, recent files, tool presets) persists
+    /// through, so core stays mechanism-not-policy. Errors surface [`AppError::Persist`] if `value` cannot
+    /// serialize.
+    pub fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), AppError> {
+        let blob = ron::ser::to_string(value).map_err(|e| AppError::Persist(e.to_string()))?;
+        self.with(|s| {
+            s.extra.insert(key.to_string(), blob);
+        });
+        Ok(())
+    }
+
+    /// Reads and deserializes the value stored at `key` by [`set`](Self::set). `Ok(None)` if the key is
+    /// absent; `Err(AppError::Persist)` if a blob is present but does not parse as `T` — so a caller can
+    /// warn / fall back to a default instead of *silently* losing state (distinct from absent). Recovers a
+    /// poisoned lock rather than defaulting.
+    pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, AppError> {
+        let blob = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extra
+            .get(key)
+            .cloned();
+        match blob {
+            None => Ok(None),
+            Some(b) => ron::from_str::<T>(&b)
+                .map(Some)
+                .map_err(|e| AppError::Persist(e.to_string())),
+        }
+    }
+
     /// Whether there are unsaved changes.
     pub fn is_dirty(&self) -> bool {
         self.inner.dirty.load(Ordering::SeqCst)
@@ -247,6 +293,7 @@ mod tests {
                 chord: KeyChord::new(KeyCode::KeyS, ctrl()),
                 action: Action::Named("save".into()),
             }]),
+            extra: BTreeMap::new(),
         };
         let text = ron::ser::to_string_pretty(&state, ron::ser::PrettyConfig::default())
             .expect("serialize");
@@ -322,6 +369,86 @@ mod tests {
         let reloaded = PersistenceService::load_from(path.clone());
         assert_eq!(reloaded.snapshot().theme, Some("dark".into()));
         assert_eq!(reloaded.snapshot().windows.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_set_get_should_roundtrip_a_custom_key() {
+        // The generic named-key API: store a serde value under an app-chosen key, read it back typed,
+        // and survive a save→reload (the blob lives in `extra`).
+        let dir = unique_temp_dir("named-key");
+        let path = dir.join("state.ron");
+        let svc = PersistenceService::load_from(path.clone());
+        svc.set("recent", &vec![1_u32, 2, 3]).expect("set");
+        assert!(svc.is_dirty(), "set marks the service dirty");
+        assert_eq!(
+            svc.get::<Vec<u32>>("recent").expect("get"),
+            Some(vec![1, 2, 3]),
+            "the custom key round-trips in memory"
+        );
+        svc.save().expect("save");
+
+        let reloaded = PersistenceService::load_from(path.clone());
+        assert_eq!(
+            reloaded.get::<Vec<u32>>("recent").expect("get"),
+            Some(vec![1, 2, 3]),
+            "the custom key round-trips through the RON file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_get_absent_key_should_be_none() {
+        let svc = PersistenceService::in_memory();
+        assert_eq!(
+            svc.get::<u32>("missing")
+                .expect("get of an absent key is Ok"),
+            None,
+            "an absent key is Ok(None), not an error"
+        );
+    }
+
+    #[test]
+    fn persistence_get_corrupt_blob_should_error() {
+        // A present-but-unparseable blob is an Err (distinct from absent), so the caller can warn / fall
+        // back rather than silently discarding the user's state.
+        let svc = PersistenceService::in_memory();
+        svc.with(|s| {
+            s.extra
+                .insert("bad".to_string(), "not <<< valid ron".to_string());
+        });
+        assert!(
+            svc.get::<u32>("bad").is_err(),
+            "a corrupt blob is an error, not a silent None"
+        );
+        assert!(
+            svc.get::<u32>("other").expect("absent is Ok").is_none(),
+            "an absent key stays Ok(None) even when another key is corrupt"
+        );
+    }
+
+    #[test]
+    fn persistence_should_load_older_ron_without_extra() {
+        // Forward-compat: a state.ron written before `extra` existed (no `extra` field) still loads, with
+        // `extra` defaulting to empty (#[serde(default)]).
+        let dir = unique_temp_dir("older-ron");
+        let path = dir.join("state.ron");
+        std::fs::write(&path, b"(theme: Some(\"light\"))").expect("write older ron");
+        let svc = PersistenceService::load_from(path.clone());
+        assert_eq!(
+            svc.snapshot().theme,
+            Some("light".into()),
+            "older fields load"
+        );
+        assert!(
+            svc.snapshot().extra.is_empty(),
+            "the missing `extra` field defaults to empty"
+        );
+        assert_eq!(
+            svc.get::<u32>("anything").expect("get"),
+            None,
+            "get on an empty extra is Ok(None)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
