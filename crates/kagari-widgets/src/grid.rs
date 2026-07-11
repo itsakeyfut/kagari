@@ -1,0 +1,577 @@
+//! The [`GridView`] widget (#225, MVP): a uniform-tile grid (asset browser / media pool / thumbnail gallery)
+//! that wraps a **fixed** set of same-size items into rows and **virtualizes** the body, with single-select on
+//! click and 2D arrow-key navigation.
+//!
+//! It is the third virtualized selectable widget after [`Table`](crate::Table) (#224) and [`Tree`](crate::Tree)
+//! (#223), and the simplest: because the item count is fixed (no expand), it builds the core
+//! [`virtualized_list`](kagari_core::virtualized_list) element **directly** with a fixed row count (like Table)
+//! — no `dyn_list`, no `Send + Sync` items_fn, no two-plane arena. The column count is derived from the viewport
+//! width (`cols = ⌊(vp.w + gap) / (item.w + gap)⌋`), items are laid out `cols` per flex row (with a native
+//! [`Div::gap`](kagari_core::element::Div::gap) between cells), and the vertical gap is folded into the row
+//! height. The widget owns the body [`ScrollHandle`] (wheel + keyboard scroll-to-selected).
+//!
+//! MVP scope: render + single-select + 2D keyboard nav + focus. Uniform item size is an invariant (the
+//! virtualized body requires it). **Follow-ups**: multi-select (Ctrl/Shift), resize-reactive column count
+//! (the viewport width is fixed at build), `Role::Grid`/`GridCell` a11y.
+
+use std::rc::Rc;
+
+use kagari_base::{Point, Px, Size};
+use kagari_core::element::Div;
+use kagari_core::reactive::prelude::*;
+use kagari_core::reactive::{RwSignal, rx};
+use kagari_core::{
+    AnyElement, IntoElement, KeyCode, MouseKind, ScrollHandle, div, use_focus_handle,
+    virtualized_list as core_virtualized_list,
+};
+use kagari_style::{ColorRole, Styled};
+
+/// The GridView's item selection (#225). Single-select today (an item index or nothing); a future multi-select
+/// extends this type non-breakingly, so callers bind `RwSignal<GridSelection>` rather than a bare
+/// `Option<usize>`. Grid-owned (not shared with the [`Table`](crate::Table)'s `Selection`): a grid's future
+/// multi-select is a 2D rectangle, which diverges from the table's 1D range, so the types evolve independently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct GridSelection(Option<usize>);
+
+impl GridSelection {
+    /// Nothing selected.
+    pub fn none() -> Self {
+        GridSelection(None)
+    }
+
+    /// Selects the single item at index `i` (into the `count` passed to [`grid_view`]).
+    pub fn single(i: usize) -> Self {
+        GridSelection(Some(i))
+    }
+
+    /// The selected item index, if any.
+    pub fn selected(&self) -> Option<usize> {
+        self.0
+    }
+
+    /// Whether item `i` is selected (the internal predicate a multi-select variant generalizes).
+    fn is_selected(&self, i: usize) -> bool {
+        self.0 == Some(i)
+    }
+}
+
+/// A virtualized uniform-tile grid (#225). Build with [`grid_view`]; set the viewport with
+/// [`.size(..)`](Self::size), the inter-tile spacing with [`.gap(..)`](Self::gap), and wire selection with
+/// [`.selection(..)`](Self::selection). Only the rows in view (± a buffer) are ever built. Returns
+/// `impl IntoElement`; `Styled` is **not** on its surface.
+pub struct GridView {
+    count: usize,
+    item_size: Size,
+    item_fn: Rc<dyn Fn(usize) -> AnyElement>,
+    gap: f32,
+    viewport: Size,
+    selection: Option<RwSignal<GridSelection>>,
+}
+
+/// Creates a grid over `count` items, each `item_size` (logical px), building item `index` with
+/// `item(index)`. Set the scroll viewport with [`.size(..)`](GridView::size) — it defaults to a small
+/// placeholder, so a real caller sizes it to its slot. The viewport **width** determines the column count.
+pub fn grid_view(
+    count: usize,
+    item_size: Size,
+    item: impl Fn(usize) -> AnyElement + 'static,
+) -> GridView {
+    GridView {
+        count,
+        item_size,
+        item_fn: Rc::new(item),
+        gap: 0.0,
+        viewport: Size { w: 240.0, h: 320.0 },
+        selection: None,
+    }
+}
+
+impl GridView {
+    /// Sets the inter-tile gap (logical px), applied horizontally between cells and vertically between rows.
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Sets the scroll viewport (the clipped window the grid scrolls within). Mirrors
+    /// [`VirtualizedList::size`](crate::VirtualizedList::size); the width drives the column count and the height
+    /// the scroll extent.
+    pub fn size(mut self, viewport: Size) -> Self {
+        self.viewport = viewport;
+        self
+    }
+
+    /// Binds the controlled selection. A clicked cell sets it to `GridSelection::single(index)` and the selected
+    /// cell is tinted; wiring selection also enables focus + 2D arrow-key navigation. When unset, items render
+    /// but are not selectable.
+    pub fn selection(mut self, selection: RwSignal<GridSelection>) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+}
+
+/// Builds one grid row `row`: a flex row (with a native `gap`) of the cells `[row*cols .. min(count, ..)]`.
+/// A partial last row builds only its real items. Each cell is `item_size`, tinted `Accent` when selected, and
+/// carries the caller's item content; the `.bg` / `.on_click` are wired only when a selection signal is present.
+fn build_grid_row(
+    row: usize,
+    cols: usize,
+    count: usize,
+    item_size: Size,
+    gap: f32,
+    item_fn: &Rc<dyn Fn(usize) -> AnyElement>,
+    selection: Option<RwSignal<GridSelection>>,
+) -> Div {
+    let start = row * cols;
+    let end = (start + cols).min(count);
+    let mut r = div().flex().gap(Px(gap));
+    for i in start..end {
+        let mut cell = div().size(item_size);
+        match selection {
+            Some(sel) => {
+                cell = cell
+                    .bg(rx(move || {
+                        if sel.get().is_selected(i) {
+                            ColorRole::Accent
+                        } else {
+                            ColorRole::Surface
+                        }
+                    }))
+                    .on_click(move |_, _| sel.set(GridSelection::single(i)));
+            }
+            None => cell = cell.bg(ColorRole::Surface),
+        }
+        r = r.child(cell.child((item_fn)(i)));
+    }
+    r
+}
+
+/// Keeps the row at `pos` within the viewport by nudging the scroll offset (mirrors the Tree's helper).
+fn scroll_into_view(handle: &ScrollHandle, pos: usize, row_h: f32, body_height: f32) {
+    let y = pos as f32 * row_h;
+    let cur = handle.offset().y;
+    let next = if y < cur {
+        y
+    } else if y + row_h > cur + body_height {
+        y + row_h - body_height
+    } else {
+        cur
+    };
+    handle.jump_to(Point::new(0.0, next));
+}
+
+/// Handles a key press: 2D grid navigation over the item indices. Right/Left move ±1 within a row (no wrap
+/// past the row edges); Down/Up move ±`cols` (staying put when there is no cell directly below/above). All
+/// moves are guarded (no `usize` underflow). The first nav press with no selection selects item 0. Scrolls to
+/// keep the selected item's row visible.
+fn keyboard(
+    code: KeyCode,
+    count: usize,
+    cols: usize,
+    selection: RwSignal<GridSelection>,
+    handle: &ScrollHandle,
+    row_h: f32,
+    body_height: f32,
+) {
+    if count == 0 {
+        return;
+    }
+    let next = match selection.get_untracked().selected() {
+        Some(i) => match code {
+            KeyCode::ArrowRight => {
+                if i % cols != cols - 1 && i + 1 < count {
+                    i + 1
+                } else {
+                    i
+                }
+            }
+            KeyCode::ArrowLeft => {
+                if i % cols != 0 {
+                    i - 1
+                } else {
+                    i
+                }
+            }
+            KeyCode::ArrowDown => {
+                if i + cols < count {
+                    i + cols
+                } else {
+                    i
+                }
+            }
+            KeyCode::ArrowUp => {
+                if i >= cols {
+                    i - cols
+                } else {
+                    i
+                }
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => i,
+            _ => return,
+        },
+        None => match code {
+            KeyCode::ArrowRight
+            | KeyCode::ArrowLeft
+            | KeyCode::ArrowDown
+            | KeyCode::ArrowUp
+            | KeyCode::Enter
+            | KeyCode::NumpadEnter => 0,
+            _ => return,
+        },
+    };
+    selection.set(GridSelection::single(next));
+    scroll_into_view(handle, next / cols, row_h, body_height);
+}
+
+impl IntoElement for GridView {
+    fn into_element(self) -> AnyElement {
+        let GridView {
+            count,
+            item_size,
+            item_fn,
+            gap,
+            viewport,
+            selection,
+        } = self;
+
+        // Column count from the viewport width. Guard the denominator: a zero-width item (or w+gap == 0) would
+        // divide by zero → `inf as usize` saturates to `usize::MAX`, collapsing every item into one mega-row and
+        // defeating virtualization; fall back to a single column instead.
+        let cols = if item_size.w + gap <= 0.0 {
+            1
+        } else {
+            ((viewport.w + gap) / (item_size.w + gap)).floor().max(1.0) as usize
+        };
+        let row_count = count.div_ceil(cols); // count==0 → 0 rows; count%cols==0 → no phantom trailing row
+        let row_h = item_size.h + gap; // vertical gap folded into the row slot
+
+        // Virtualized body: build the CORE element so the widget owns the scroll handle (wheel + keyboard
+        // scroll-to-selected); re-add the wheel handler (the core element has no `handle_event` of its own).
+        let handle = ScrollHandle::new();
+        let max_y = (row_count as f32 * row_h - viewport.h).max(0.0);
+        let core = core_virtualized_list(row_h, row_count, viewport, &handle, move |row| {
+            build_grid_row(row, cols, count, item_size, gap, &item_fn, selection)
+        });
+        let wheel = handle.clone();
+        let body = div()
+            .size(viewport)
+            .on_wheel(move |ev, _| {
+                if let MouseKind::Wheel { dy, .. } = ev.kind {
+                    let next = (wheel.offset().y - dy * row_h).clamp(0.0, max_y);
+                    wheel.jump_to(Point::new(0.0, next));
+                }
+            })
+            .child(core);
+
+        // Focus + 2D keyboard navigation only when a selection signal is wired (selection is the nav cursor).
+        match selection {
+            Some(sel) => {
+                let focus = use_focus_handle();
+                let ring = focus.clone();
+                let kb_handle = handle.clone();
+                let body_h = viewport.h;
+                div()
+                    .rounded_md()
+                    .border_w_1()
+                    .border_color(rx(move || {
+                        ring.is_focus_visible().then_some(ColorRole::FocusRing)
+                    }))
+                    .track_focus(&focus)
+                    .on_key_down(move |kev, _| {
+                        if kev.repeat {
+                            return;
+                        }
+                        keyboard(kev.code, count, cols, sel, &kb_handle, row_h, body_h);
+                    })
+                    .child(body)
+                    .into_element()
+            }
+            None => div().child(body).into_element(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+
+    use kagari_base::{NodeId, Size as BSize};
+    use kagari_core::arena::Arena;
+    use kagari_core::damage::DamageState;
+    use kagari_core::event::FocusRegistry;
+    use kagari_core::paint::render_tree;
+    use kagari_core::reactive::{Owner, provide_context};
+    use kagari_core::{
+        DispatchState, HitTest, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
+        dispatch_key, dispatch_mouse, text,
+    };
+    use kagari_layout::LayoutTree;
+    use kagari_render::Scene;
+    use kagari_style::Theme;
+    use kagari_text::{FontDb, TextSystem};
+
+    const VIEWPORT: BSize = BSize { w: 400.0, h: 400.0 };
+    const ITEM: BSize = BSize { w: 100.0, h: 40.0 };
+    const ROW_H: f32 = 40.0; // ITEM.h + gap(0)
+    const COLS: usize = 3; // ⌊320 / 100⌋
+
+    /// A grid of `n` items (100×40), 3 columns (viewport 320 wide), all rows visible (viewport 400 tall so the
+    /// body does not window), optionally wired to `sel`.
+    fn sample_grid(n: usize, sel: Option<RwSignal<GridSelection>>) -> AnyElement {
+        let mut g = grid_view(n, ITEM, |i| text(format!("#{i}")).into_element())
+            .size(BSize { w: 320.0, h: 400.0 });
+        if let Some(s) = sel {
+            g = g.selection(s);
+        }
+        g.into_element()
+    }
+
+    struct Harness {
+        root: AnyElement,
+        arena: Arena,
+        layout: LayoutTree,
+        text: TextSystem,
+        hit: HitTest,
+        focus: FocusRegistry,
+        damage: StdArc<DamageState>,
+        theme: Theme,
+        root_id: NodeId,
+    }
+
+    fn harness(build: impl FnOnce() -> AnyElement) -> Harness {
+        let focus = FocusRegistry::new();
+        provide_context(focus.clone());
+        let mut h = Harness {
+            root: build(),
+            arena: Arena::new(),
+            layout: LayoutTree::new(),
+            text: TextSystem::new(FontDb::new()),
+            hit: HitTest::new(),
+            focus,
+            damage: StdArc::new(DamageState::default()),
+            theme: Theme::light(),
+            root_id: NodeId::from_raw(0),
+        };
+        h.root_id = frame(&mut h).0;
+        h
+    }
+
+    fn frame(h: &mut Harness) -> (NodeId, Scene) {
+        let mut scene = Scene::new();
+        let id = render_tree(
+            &mut h.root,
+            &mut h.arena,
+            &mut h.layout,
+            &mut h.text,
+            None,
+            Some(&mut h.hit),
+            None,
+            Some(&mut h.focus),
+            None,
+            None,
+            &mut scene,
+            VIEWPORT,
+            &h.damage,
+            &h.theme,
+        )
+        .unwrap();
+        (id, scene)
+    }
+
+    /// The core virtualized body node: root → child[0] body div → child[0] core (same path with/without
+    /// selection, since the focus container's only child is the body div).
+    fn core_node(h: &Harness) -> NodeId {
+        let body = h.arena.get(h.root_id).unwrap().children[0];
+        h.arena.get(body).unwrap().children[0]
+    }
+
+    /// The realized grid-row slot nodes (children of the core node).
+    fn body_rows(h: &Harness) -> Vec<NodeId> {
+        h.arena.get(core_node(h)).unwrap().children.clone()
+    }
+
+    /// The cell nodes of realized row `win_i` (slot → child[0] flex row → its children = the cells).
+    fn row_cells(h: &Harness, win_i: usize) -> Vec<NodeId> {
+        let flex = h.arena.get(body_rows(h)[win_i]).unwrap().children[0];
+        h.arena.get(flex).unwrap().children.clone()
+    }
+
+    /// Clicks item index `i` (row `i/COLS`, col `i%COLS`) at offset 0.
+    fn click_item(h: &mut Harness, i: usize) {
+        let c = h.layout.absolute_layout(core_node(h));
+        let x = c.origin.x + (i % COLS) as f32 * ITEM.w + ITEM.w / 2.0;
+        let y = c.origin.y + (i / COLS) as f32 * ROW_H + ROW_H / 2.0;
+        let p = Point::new(x, y);
+        let mut dispatch = DispatchState::default();
+        for kind in [
+            MouseKind::Down(MouseButton::Left),
+            MouseKind::Up(MouseButton::Left),
+        ] {
+            let ev = MouseEvent::new(kind, p, Modifiers::default());
+            dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
+        }
+    }
+
+    fn press(h: &mut Harness, code: KeyCode) {
+        let kev = KeyEvent::new(code, Modifiers::default(), true, false);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+    }
+
+    #[test]
+    fn grid_view_should_render_rows_from_count_and_cols() {
+        let owner = Owner::new();
+        owner.set();
+        // 10 items, 3 cols → 4 rows (div_ceil). Viewport is tall enough to realize all rows.
+        let h = harness(|| sample_grid(10, None));
+        assert_eq!(body_rows(&h).len(), 4, "10 items / 3 cols → 4 rows");
+        assert_eq!(row_cells(&h, 0).len(), 3, "a full row builds 3 cells");
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_should_window_large_count() {
+        let owner = Owner::new();
+        owner.set();
+        // 300 items / 3 cols = 100 rows, but a 400px viewport (~10 rows) realizes only a window — GridView
+        // passes the derived row_count to the core, which builds only the visible rows (± a buffer).
+        let h = harness(|| {
+            grid_view(300, ITEM, |i| text(format!("#{i}")).into_element())
+                .size(BSize { w: 320.0, h: 400.0 })
+                .into_element()
+        });
+        assert!(
+            body_rows(&h).len() < 100,
+            "only the visible row window is realized, not all 100 rows"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_partial_last_row_should_build_only_real_items() {
+        let owner = Owner::new();
+        owner.set();
+        // 10 items, 3 cols → last row (row 3) holds only item 9.
+        let h = harness(|| sample_grid(10, None));
+        assert_eq!(
+            row_cells(&h, 3).len(),
+            1,
+            "the partial last row builds only its 1 real item, no phantom cells"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_click_should_select() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::none());
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        click_item(&mut h, 4); // row 1, col 1
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(4),
+            "clicking a cell selects its item index"
+        );
+        click_item(&mut h, 0);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(0),
+            "clicking another cell moves the selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_selected_should_highlight() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(2));
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        let accent = h.theme.resolve_color(ColorRole::Accent);
+        let (_, scene) = frame(&mut h);
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|q| q.bg == kagari_render::Background::Solid(accent)),
+            "the selected cell paints an Accent background"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_arrow_right_down_should_navigate_2d() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::none());
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        press(&mut h, KeyCode::ArrowRight); // no cursor → item 0
+        assert_eq!(selection.get_untracked().selected(), Some(0));
+        press(&mut h, KeyCode::ArrowRight); // 0 → 1 (within row)
+        assert_eq!(selection.get_untracked().selected(), Some(1));
+        press(&mut h, KeyCode::ArrowDown); // 1 → 4 (+cols)
+        assert_eq!(selection.get_untracked().selected(), Some(4));
+        press(&mut h, KeyCode::ArrowUp); // 4 → 1 (-cols)
+        assert_eq!(selection.get_untracked().selected(), Some(1));
+        press(&mut h, KeyCode::ArrowLeft); // 1 → 0 (within row)
+        assert_eq!(selection.get_untracked().selected(), Some(0));
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_arrow_up_left_should_not_underflow() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(0)); // top-left corner
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        press(&mut h, KeyCode::ArrowUp); // no row above → stay (no usize underflow / panic)
+        assert_eq!(selection.get_untracked().selected(), Some(0));
+        press(&mut h, KeyCode::ArrowLeft); // col 0, no wrap → stay
+        assert_eq!(selection.get_untracked().selected(), Some(0));
+        // Right at the row edge does not wrap to the next row.
+        let sel2 = RwSignal::new(GridSelection::single(2)); // row 0, col 2 (last col)
+        let mut h2 = harness(|| sample_grid(10, Some(sel2)));
+        press(&mut h2, KeyCode::ArrowRight);
+        assert_eq!(
+            sel2.get_untracked().selected(),
+            Some(2),
+            "Right at the last column stays put (no line-wrap)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_zero_count_should_render_nothing() {
+        let owner = Owner::new();
+        owner.set();
+        let mut h = harness(|| sample_grid(0, None));
+        assert_eq!(body_rows(&h).len(), 0, "a zero-item grid realizes no rows");
+        frame(&mut h); // a second frame must not panic on the empty range
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_zero_item_width_should_not_collapse_cols() {
+        let owner = Owner::new();
+        owner.set();
+        // A zero-width item must fall back to cols=1 (not usize::MAX → one mega-row of every item).
+        let h = harness(|| {
+            grid_view(6, BSize { w: 0.0, h: 40.0 }, |i| {
+                text(format!("#{i}")).into_element()
+            })
+            .size(BSize { w: 320.0, h: 400.0 })
+            .into_element()
+        });
+        assert_eq!(
+            row_cells(&h, 0).len(),
+            1,
+            "cols=1 fallback: the first row has 1 cell, not all 6 (no usize::MAX collapse)"
+        );
+        drop(owner);
+    }
+}
