@@ -16,8 +16,16 @@ use crate::arena::Node;
 use crate::event::{HitRegion, InteractFlags, MouseButton, MouseKind};
 use crate::reactive::{Prop, create_effect, rx};
 
-/// Overlay-scrollbar thumb thickness (logical px).
-const SCROLLBAR_THICKNESS: f32 = 6.0;
+/// Overlay-scrollbar thumb thickness (logical px). `pub(crate)` so the `VirtualizedList` element paints
+/// a thumb of the same thickness (its own vertical-only overlay), keeping the two bars visually identical.
+pub(crate) const SCROLLBAR_THICKNESS: f32 = 6.0;
+
+/// The overlay-scrollbar thumb fill: a mid-gray (sRGB → linear-premultiplied) at high opacity so it reads
+/// on both light and dark surfaces. `pub(crate)` and shared so `Scroll` and `VirtualizedList` never drift
+/// apart visually. Not `const` — `Color::from_srgb` decodes at runtime.
+pub(crate) fn scrollbar_thumb_bg() -> Background {
+    Background::Solid(Color::from_srgb([0.5, 0.5, 0.5, 0.85]))
+}
 
 /// The scroll spring (#176): near-critically-damped (2·√120 ≈ 21.9) so `scroll_to` and flings settle
 /// smoothly without a visible bounce. Tunable — the inertial-scroll physics tuning is post-MVP.
@@ -72,6 +80,14 @@ impl ScrollHandle {
     /// drag-start capture) that must not create a reactive subscription.
     pub fn offset_untracked(&self) -> Point {
         self.offset.get_untracked()
+    }
+
+    /// The offset the animation is currently heading toward — for accumulating a relative scroll (e.g. a
+    /// wheel notch) on the destination rather than the momentary value, so repeated notches mid-flight
+    /// don't drop deltas. A smooth-scroll caller clamps `target() + delta` and passes it to
+    /// [`scroll_to`](Self::scroll_to). Equals the current offset when at rest.
+    pub fn target(&self) -> Point {
+        self.offset.target()
     }
 
     /// Animates to an absolute offset (the container clamps it to the content at paint). Smooth by
@@ -303,9 +319,8 @@ impl Scroll {
             self.metrics = None;
             return;
         }
-        // A mid-gray thumb (sRGB → linear-premultiplied) at high opacity, so it reads on both light and
-        // dark surfaces (a fainter thumb washes out on a light theme where Surface ≈ white).
-        let color = Background::Solid(Color::from_srgb([0.5, 0.5, 0.5, 0.85]));
+        // A mid-gray thumb at high opacity (shared with `VirtualizedList` so the bars match).
+        let color = scrollbar_thumb_bg();
         let mask = RoundedRect {
             rect: mask_rect,
             radii: Corners::default(),
