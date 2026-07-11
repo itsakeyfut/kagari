@@ -24,6 +24,7 @@ pub mod table;
 pub mod tabs;
 pub mod text_input;
 pub mod tooltip;
+pub mod tree;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
@@ -46,3 +47,4 @@ pub use table::{Selection, Table, table};
 pub use tabs::{Tabs, tabs};
 pub use text_input::{TextInput, text_input};
 pub use tooltip::{Tooltip, tooltip};
+pub use tree::{Tree, TreeNode, TreeSelection, tree};
