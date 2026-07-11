@@ -61,6 +61,31 @@ pub fn thumb(viewport: f32, content: f32, offset: f32, track: f32) -> Option<(f3
     Some((pos, len))
 }
 
+/// The offset a scrollbar-thumb drag lands at: the inverse of [`thumb`]'s `pos` map, using the SAME
+/// `MIN_THUMB`-clamped thumb length so the grabbed point tracks the cursor 1:1 even for tall content
+/// (where the naive `delta · content / track` factor drifts). `delta` is the pointer's move along the
+/// axis since the grab; the result is clamped to `[0, content - viewport]`. Returns `start_offset`
+/// unchanged for a non-overflowing or degenerate axis (`content ≤ viewport`, `track ≤ 0`, or a thumb
+/// that fills the track) — so a divide by a zero free-track never produces `NaN`/`Inf`.
+pub fn thumb_drag_to_offset(
+    start_offset: f32,
+    delta: f32,
+    viewport: f32,
+    content: f32,
+    track: f32,
+) -> f32 {
+    if content <= viewport || track <= 0.0 {
+        return start_offset;
+    }
+    let len = (track * viewport / content).clamp(MIN_THUMB.min(track), track);
+    let free = track - len;
+    if free <= 0.0 {
+        return start_offset;
+    }
+    let max_off = content - viewport;
+    (start_offset + delta * max_off / free).clamp(0.0, max_off)
+}
+
 /// The projected rest offset of an inertial fling (#176): `offset + velocity · FLING_TAU`, clamped per
 /// axis to `[0, max_offset]` so the fling never rests past the content. The scroll spring eases into
 /// this target seeded with `velocity`, so the motion carries forward before settling. `velocity` is in
@@ -146,6 +171,45 @@ mod tests {
             thumb(100.0, 100.0, 0.0, 100.0).is_none(),
             "content equal to the viewport shows no thumb"
         );
+    }
+
+    #[test]
+    fn thumb_drag_to_offset_should_invert_thumb_pos() {
+        // 100 vp / 400 content / 100 track → thumb len 25, free 75, max_off 300 (factor 4).
+        // Dragging the thumb the full free track (75) from offset 0 lands exactly at max_off (300).
+        assert_eq!(thumb_drag_to_offset(0.0, 75.0, 100.0, 400.0, 100.0), 300.0);
+        // A half-free-track drag (37.5) from 0 → 150, the exact inverse of thumb()'s pos=37.5 at offset 150.
+        assert_eq!(thumb_drag_to_offset(0.0, 37.5, 100.0, 400.0, 100.0), 150.0);
+        // Clamped to [0, max_off]: dragging past the top pins at 0, past the bottom pins at max_off.
+        assert_eq!(
+            thumb_drag_to_offset(150.0, -1000.0, 100.0, 400.0, 100.0),
+            0.0
+        );
+        assert_eq!(
+            thumb_drag_to_offset(150.0, 1000.0, 100.0, 400.0, 100.0),
+            300.0
+        );
+    }
+
+    #[test]
+    fn thumb_drag_to_offset_should_use_min_thumb_length_for_tall_content() {
+        // Tall content clamps the thumb to MIN_THUMB (16): the naive delta·content/track factor would
+        // under-move and leave an end-of-track dead zone. vp 100 / content 10000 / track 100 → len 16,
+        // free 84, max_off 9900 → dragging the full free track (84) reaches max_off exactly.
+        assert_eq!(
+            thumb_drag_to_offset(0.0, 84.0, 100.0, 10000.0, 100.0),
+            9900.0
+        );
+    }
+
+    #[test]
+    fn thumb_drag_to_offset_should_noop_on_degenerate() {
+        // Content fits → no thumb → the start offset is returned unchanged.
+        assert_eq!(thumb_drag_to_offset(5.0, 50.0, 100.0, 80.0, 100.0), 5.0);
+        // A zero track must not divide-by-zero into NaN/Inf — returns the (finite) start offset.
+        let r = thumb_drag_to_offset(5.0, 50.0, 100.0, 400.0, 0.0);
+        assert_eq!(r, 5.0);
+        assert!(r.is_finite());
     }
 
     #[test]
