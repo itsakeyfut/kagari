@@ -95,6 +95,48 @@ pub struct Div {
     /// The reactive toggle/selection state (#257): a static or reactive `bool` resolved at paint into
     /// the recorded a11y state, so a control's a11y state mirrors its signal (checkbox/switch/radio).
     a11y_checked: ReactiveProp<bool>,
+    /// Reactive/static flex-grow weight (#84): the share of a flex container's free main-axis space this
+    /// child claims, relative to its siblings. A reactive weight's bind effect flags **layout**-dirty
+    /// (like [`size`](Self::size)), so a signal-driven change relays out. `None` = taffy default (0).
+    flex_grow: Option<Prop<f32>>,
+    /// Resolved flex-grow: written by the bound effect (or once, static), read by `effective_layout`.
+    resolved_flex_grow: Arc<Mutex<Option<f32>>>,
+    /// The bounds handle bound by [`track_bounds`](Self::track_bounds) (#84): this node publishes its
+    /// laid-out [`Rect`] into the handle each paint, so a sibling widget's event handler can read the
+    /// container's size/origin (a splitter divider drag, a slider seek). `None` = not tracked.
+    bounds_handle: Option<BoundsHandle>,
+}
+
+/// A clone-shared handle to a [`Div`]'s last laid-out bounds (#84), published by
+/// [`track_bounds`](Div::track_bounds) each paint. A sibling widget's event handler reads
+/// [`get`](Self::get) (untracked) to learn the container's size/origin — e.g. a splitter divider mapping a
+/// pixel drag to a ratio, or a slider mapping a click to a value. It holds a [`Rect`] (origin + size), so
+/// both incremental (length-only) and absolute (origin-relative) mappings are served.
+///
+/// It is a plain measurement cell, **not** a signal: it is written inside `Div::paint`, and running
+/// reactive effects mid-paint would break the between-frames write discipline (RK-005/009). Read it at
+/// event time; never bind it into a reactive layout/paint prop.
+#[derive(Clone, Default)]
+pub struct BoundsHandle(Arc<Mutex<Rect>>);
+
+impl BoundsHandle {
+    /// A new handle; reads a zero [`Rect`] until the bound div first paints.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The div's last laid-out bounds (origin + size), or a zero rect before its first paint. An untracked
+    /// read for an event handler — creates no reactive subscription.
+    pub fn get(&self) -> Rect {
+        self.0.lock().map(|r| *r).unwrap_or_default()
+    }
+
+    /// Stores the laid-out bounds (called by the bound `Div` at paint).
+    pub(crate) fn store(&self, bounds: Rect) {
+        if let Ok(mut r) = self.0.lock() {
+            *r = bounds;
+        }
+    }
 }
 
 /// Creates an empty [`Div`].
@@ -116,6 +158,9 @@ pub fn div() -> Div {
         key_handlers: Vec::new(),
         action_handlers: Vec::new(),
         gesture_handlers: Vec::new(),
+        flex_grow: None,
+        resolved_flex_grow: Arc::new(Mutex::new(None)),
+        bounds_handle: None,
         drag_source: None,
         drop_target: None,
         drag_over_handlers: Vec::new(),
@@ -233,6 +278,41 @@ impl Div {
     /// **not** affect `min-height`. #260.
     pub fn min_w(mut self, min_w: f32) -> Self {
         self.layout.min_width = Some(min_w);
+        self
+    }
+
+    /// Sets the minimum height (logical px). The height counterpart of [`min_w`](Self::min_w):
+    /// `min-height: 0` lets a flex child shrink below its content height (a vertical splitter pane). #84.
+    pub fn min_h(mut self, min_h: f32) -> Self {
+        self.layout.min_height = Some(min_h);
+        self
+    }
+
+    /// Sets the flex-grow weight — a static value or a reactive [`Prop`] (#84). In a flex container this
+    /// child claims `grow / Σ grow` of the free main-axis space. **Damage kind: layout-dirty** (like
+    /// [`size`](Self::size)): a reactive change relays out. For panes whose size is purely proportional to
+    /// the weight (e.g. a splitter), pair it with [`flex_basis(0.0)`](Self::flex_basis) +
+    /// `min_w(0.0)`/`min_h(0.0)` so grow divides the *whole* main axis, not only the content-free remainder.
+    pub fn flex_grow(mut self, grow: impl Into<Prop<f32>>) -> Self {
+        self.flex_grow = Some(grow.into());
+        self
+    }
+
+    /// Sets the flex-basis (the main-axis base size before grow/shrink, logical px). `flex_basis(0.0)`
+    /// makes a flex child's size come entirely from its grow weight (proportional panes) rather than from
+    /// its content. Static. #84.
+    pub fn flex_basis(mut self, basis: f32) -> Self {
+        self.layout.flex_basis = Some(Px(basis));
+        self
+    }
+
+    /// Binds this element to a [`BoundsHandle`] (#84): the node publishes its laid-out [`Rect`] into the
+    /// handle at paint, so a sibling widget's event handler can read the container's size/origin (a
+    /// splitter divider mapping a pixel drag to a ratio, a slider mapping a click to a value). The
+    /// published value refreshes every paint; read it **untracked** from a handler — never bind it into a
+    /// reactive layout/paint prop (it is a paint-written cell, not a signal).
+    pub fn track_bounds(mut self, handle: &BoundsHandle) -> Self {
+        self.bounds_handle = Some(handle.clone());
         self
     }
 
@@ -481,6 +561,42 @@ impl Div {
         self.resolved_size.lock().ok().and_then(|slot| *slot)
     }
 
+    /// Resolves the flex-grow prop into `resolved_flex_grow` (#84) — the layout-dirty analogue of
+    /// [`bind_size`](Self::bind_size). A static prop writes the cell once; a reactive prop registers a
+    /// synchronous effect that re-resolves and, only on a changed value, writes the cell + flags
+    /// layout-damage for `id`. Registered once at build (RK-009).
+    fn bind_flex_grow(&mut self, damage: &Arc<dyn DamageSink>, id: NodeId) {
+        match self.flex_grow.take() {
+            Some(Prop::Static(grow)) => self.store_flex_grow(grow),
+            Some(Prop::Reactive(read)) => {
+                let cell = Arc::clone(&self.resolved_flex_grow);
+                let damage = Arc::clone(damage);
+                create_effect(move || {
+                    let grow = read();
+                    if let Ok(mut slot) = cell.lock() {
+                        // Change-detect by bits so an unchanged reactive re-run doesn't re-mark taffy
+                        // dirty (avoids a clippy float-cmp on the dedup, and NaN compares unequal safely).
+                        if slot.map(f32::to_bits) != Some(grow.to_bits()) {
+                            *slot = Some(grow);
+                            damage.mark_layout_dirty(id);
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
+    fn store_flex_grow(&self, grow: f32) {
+        if let Ok(mut slot) = self.resolved_flex_grow.lock() {
+            *slot = Some(grow);
+        }
+    }
+
+    fn current_flex_grow(&self) -> Option<f32> {
+        self.resolved_flex_grow.lock().ok().and_then(|slot| *slot)
+    }
+
     /// The raw [`LayoutStyle`] overlaid with the resolved layout tokens (gap + padding + per-axis size:
     /// `w`/`h`/`min_w`/`min_h`/`max_w`/`max_h`, #280) from the theme. `margin` tokens are still not mapped
     /// to taffy — a follow-up.
@@ -490,6 +606,11 @@ impl Div {
         // changed reactive size flows into the `LayoutStyle` the dedup `set_style` compares.
         if let Some(size) = self.current_size() {
             ls.size = Some(size);
+        }
+        // The reactive/static flex-grow (#84), resolved into a shared cell; overlay it so a changed
+        // reactive weight flows into the `LayoutStyle` the dedup `set_style` compares.
+        if let Some(grow) = self.current_flex_grow() {
+            ls.flex_grow = grow;
         }
         let lt = &self.style.layout;
         if let Some(step) = lt.gap {
@@ -565,6 +686,7 @@ impl Element for Div {
                 self.border_role.bind(&cx.damage, id);
                 self.a11y_checked.bind(&cx.damage, id);
                 self.bind_size(&cx.damage, id);
+                self.bind_flex_grow(&cx.damage, id);
                 // Record this focus target's FocusId → NodeId so keyboard dispatch / focus-within
                 // can resolve the focused node (#49). No-op when no registry is attached (the app
                 // path until live keyboard wiring lands).
@@ -614,6 +736,13 @@ impl Element for Div {
     }
 
     fn paint(&mut self, bounds: Rect, cx: &mut PaintCx) {
+        // Publish the laid-out bounds to a bound handle (#84) FIRST — unconditionally, before any
+        // bg/border/quad emission — so a background-less tracked container (e.g. a splitter root) still
+        // reports its size to a sibling's drag/seek handler.
+        if let Some(handle) = &self.bounds_handle {
+            handle.store(bounds);
+        }
+
         // Corner radius from the `rounded` token (all corners equal); 0 when unset. Shared by the
         // shadow and the background quad so they round identically.
         let radius = self
@@ -1857,5 +1986,107 @@ mod tests {
         );
         assert!(scene.quads[0].border.widths.top > 0.0);
         drop(owner);
+    }
+
+    #[test]
+    fn div_flex_grow_should_size_by_weight() {
+        // A 200-wide flex row with two grow children (weights 1 and 3, basis 0, min 0) divides the width
+        // 50 / 150 (1:3) — grow distributes the *whole* main axis because basis is 0.
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let scene = render(
+            div()
+                .flex()
+                .size(Size { w: 200.0, h: 100.0 })
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .flex_basis(0.0)
+                        .min_w(0.0)
+                        .background(green),
+                )
+                .child(
+                    div()
+                        .flex_grow(3.0)
+                        .flex_basis(0.0)
+                        .min_w(0.0)
+                        .background(green),
+                )
+                .into_element(),
+            &Theme::default(),
+        );
+        assert_eq!(scene.quads[0].bounds.size.w, 50.0, "weight 1 of 4 → 50px");
+        assert_eq!(scene.quads[1].bounds.size.w, 150.0, "weight 3 of 4 → 150px");
+        assert_eq!(
+            scene.quads[1].bounds.origin.x, 50.0,
+            "the second pane starts after the first"
+        );
+    }
+
+    #[test]
+    fn div_flex_grow_reactive_should_relayout_on_signal() {
+        // A signal-driven flex-grow relays out: weight 1→3 re-divides the row from 50/150 to 100/100.
+        let owner = Owner::new();
+        owner.set();
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let (grow, set_grow) = signal(1.0_f32);
+        let mut root = div()
+            .flex()
+            .size(Size { w: 200.0, h: 100.0 })
+            .child(
+                div()
+                    .flex_grow(rx(move || grow.get()))
+                    .flex_basis(0.0)
+                    .min_w(0.0)
+                    .background(green),
+            )
+            .child(
+                div()
+                    .flex_grow(3.0)
+                    .flex_basis(0.0)
+                    .min_w(0.0)
+                    .background(green),
+            )
+            .into_element();
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let theme = Theme::default();
+
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme);
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 50.0,
+            "frame 1: weight 1 of 4 → 50px"
+        );
+
+        set_grow.set(3.0);
+        let scene = render_retained(&mut root, &mut arena, &mut layout, &mut text, &theme);
+        assert_eq!(
+            scene.quads[0].bounds.size.w, 100.0,
+            "after the write: weight 3 of 6 → 100px (relayout)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn div_track_bounds_should_publish_laid_out_size() {
+        // A background-LESS tracked div still publishes its laid-out bounds — the store is at the top of
+        // `paint`, not inside the (skipped) quad-emission branch.
+        let bounds = BoundsHandle::new();
+        assert_eq!(
+            bounds.get().size,
+            Size { w: 0.0, h: 0.0 },
+            "zero before the first paint"
+        );
+        let root = div()
+            .size(Size { w: 120.0, h: 40.0 })
+            .track_bounds(&bounds)
+            .into_element();
+        let _ = render(root, &Theme::default());
+        assert_eq!(
+            bounds.get().size,
+            Size { w: 120.0, h: 40.0 },
+            "publishes the laid-out size after paint, even with no background quad"
+        );
     }
 }
