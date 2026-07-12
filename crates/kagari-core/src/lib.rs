@@ -36,8 +36,8 @@ pub use clipboard::{Clipboard, SystemClipboard};
 pub use damage::DamageState;
 pub use dock::{DockChild, DockNode, DockTarget, DockTree, DropZone, PanelId, drop_zone};
 pub use element::{
-    AnchorHandle, AnyElement, Element, Icon, IntoElement, Placement, ScrollHandle, TextEdit,
-    TransformOrigin, Transformed, div, icon, overlay, scroll, text, text_edit, transform,
+    AnchorHandle, AnyElement, BoundsHandle, Element, Icon, IntoElement, Placement, ScrollHandle,
+    TextEdit, TransformOrigin, Transformed, div, icon, overlay, scroll, text, text_edit, transform,
     virtualized_list,
 };
 pub use error::AppError;
