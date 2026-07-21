@@ -39,6 +39,21 @@ fn deregister_focus_cursor(cx: &mut LayoutCx, root: NodeId) {
     }
 }
 
+/// The layout style for a `DynList`/`DynIf` node: content-sized by default, or filling its flex parent
+/// (`flex_grow: 1`, `min_size: 0`) when `grow` is set (see [`DynList::grow`]/[`DynIf::grow`]).
+fn dyn_style(grow: bool) -> LayoutStyle {
+    if grow {
+        LayoutStyle {
+            flex_grow: 1.0,
+            min_width: Some(0.0),
+            min_height: Some(0.0),
+            ..LayoutStyle::default()
+        }
+    } else {
+        LayoutStyle::default()
+    }
+}
+
 /// A keyed, reactive list. Builds a child per item; on a collection-signal change only the
 /// changed children are rebuilt (keyed reconciliation), unchanged children keep their nodes.
 pub struct DynList<Item, K> {
@@ -51,6 +66,9 @@ pub struct DynList<Item, K> {
     pending: Arc<Mutex<Option<Vec<Item>>>>,
     /// This list's reactive scope; child owners are created under it.
     owner: Option<Owner>,
+    /// Whether this list's node grows to fill its flex parent ([`grow`](DynList::grow)); otherwise its node
+    /// is content-sized (`flex_grow: 0`).
+    grow: bool,
     id: Option<NodeId>,
 }
 
@@ -78,6 +96,7 @@ where
         children: Vec::new(),
         pending: Arc::new(Mutex::new(None)),
         owner: None,
+        grow: false,
         id: None,
     }
 }
@@ -87,6 +106,15 @@ where
     Item: Send + 'static,
     K: PartialEq + 'static,
 {
+    /// Makes this list's node **fill its flex parent** (`flex_grow: 1`, `min_size: 0`) instead of being
+    /// content-sized. Needed when a reactively-rebuilt subtree must occupy its container — e.g. a
+    /// [`Dock`](crate::element) workspace whose splitters/regions fill the window, or a tab-panel/scroll
+    /// body that should stretch. Without it the node collapses to its children's content size.
+    pub fn grow(mut self) -> Self {
+        self.grow = true;
+        self
+    }
+
     /// Whether a collection change is staged and not yet applied — derived from `pending` (the single
     /// source of truth), so it cannot drift from the staged payload (#278). Tests poll it.
     pub fn is_dirty(&self) -> bool {
@@ -184,12 +212,19 @@ where
 {
     fn request_layout(&mut self, cx: &mut LayoutCx) -> NodeId {
         if let Some(id) = self.id {
+            // Re-request layout for the existing children each frame so a reactive LAYOUT prop inside the
+            // subtree (e.g. a splitter's `flex_grow` ratio, #239) re-applies its taffy style on later
+            // frames — `Div::request_layout` recurses every call for the same reason. Without this only
+            // paint props (bg/color) re-resolve inside a dyn scope; a reactive size/grow would stay stale.
+            for (_, _, _, el) in &mut self.children {
+                el.request_layout(cx);
+            }
             return id;
         }
         let id = cx.arena.insert(Node::default());
         self.id = Some(id);
         cx.layout.insert(id, None);
-        cx.layout.set_style(id, &LayoutStyle::default());
+        cx.layout.set_style(id, &dyn_style(self.grow));
         // Scope child owners under the ambient owner so an ancestor's removal disposes this whole
         // dyn node. Callers build under an owner (App root #36 / tests); the detached-owner
         // fallback is only the no-ambient-owner degenerate case.
@@ -272,6 +307,8 @@ pub struct DynIf {
     /// [`is_dirty`](Self::is_dirty) (#278).
     pending: Arc<Mutex<Option<bool>>>,
     owner: Option<Owner>,
+    /// Whether this node grows to fill its flex parent ([`grow`](DynIf::grow)); else it is content-sized.
+    grow: bool,
     id: Option<NodeId>,
 }
 
@@ -289,11 +326,19 @@ where
         child: None,
         pending: Arc::new(Mutex::new(None)),
         owner: None,
+        grow: false,
         id: None,
     }
 }
 
 impl DynIf {
+    /// Makes this node **fill its flex parent** (`flex_grow: 1`, `min_size: 0`) instead of being
+    /// content-sized — the conditional counterpart of [`DynList::grow`].
+    pub fn grow(mut self) -> Self {
+        self.grow = true;
+        self
+    }
+
     /// Whether a condition change is staged and not yet applied — derived from `pending` (#278).
     pub fn is_dirty(&self) -> bool {
         self.pending.lock().map(|p| p.is_some()).unwrap_or(false)
@@ -361,12 +406,17 @@ impl DynIf {
 impl Element for DynIf {
     fn request_layout(&mut self, cx: &mut LayoutCx) -> NodeId {
         if let Some(id) = self.id {
+            // Re-request layout for the mounted child each frame so a reactive LAYOUT prop inside it
+            // re-applies its taffy style (the DynList rationale; #239).
+            if let Some((_, _, el)) = &mut self.child {
+                el.request_layout(cx);
+            }
             return id;
         }
         let id = cx.arena.insert(Node::default());
         self.id = Some(id);
         cx.layout.insert(id, None);
-        cx.layout.set_style(id, &LayoutStyle::default());
+        cx.layout.set_style(id, &dyn_style(self.grow));
         // Scope child owners under the ambient owner so an ancestor's removal disposes this whole
         // dyn node. Callers build under an owner (App root #36 / tests); the detached-owner
         // fallback is only the no-ambient-owner degenerate case.
@@ -576,6 +626,29 @@ mod tests {
         let mut list = dyn_list(move || items.get(), |k: &u32| *k, |_k: &u32| div());
         let id = list.request_layout(&mut env.cx());
         (list, env, id, set_items)
+    }
+
+    #[test]
+    fn dyn_style_grow_should_fill_parent() {
+        // `.grow()` makes the reactive node stretch (flex_grow:1, min 0) so a rebuilt subtree can fill its
+        // flex parent (#239 dock workspace); the default is content-sized.
+        let filled = dyn_style(true);
+        assert_eq!(filled.flex_grow, 1.0, "grow sets flex_grow to 1");
+        assert_eq!(
+            filled.min_width,
+            Some(0.0),
+            "grow allows shrinking below content width"
+        );
+        assert_eq!(
+            filled.min_height,
+            Some(0.0),
+            "grow allows shrinking below content height"
+        );
+        assert_eq!(
+            dyn_style(false).flex_grow,
+            0.0,
+            "the default node is content-sized"
+        );
     }
 
     #[test]

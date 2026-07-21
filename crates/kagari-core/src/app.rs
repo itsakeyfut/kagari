@@ -1304,7 +1304,9 @@ impl WindowState {
                 dispatch_drag_leave(&mut self.root, &self.arena, old);
             }
             let new_accepted = match query {
-                Some(t) => dispatch_drag_over(&mut self.root, &self.arena, t, payload_type),
+                Some(t) => {
+                    dispatch_drag_over(&mut self.root, &self.arena, t, payload_type, self.pointer)
+                }
                 None => false,
             };
             if let DragState::Active(d) = &mut self.drag {
@@ -1325,7 +1327,7 @@ impl WindowState {
             if let Some(target) = d.over {
                 if d.accepted {
                     if commit {
-                        dispatch_drop(&mut self.root, &self.arena, target, d.payload);
+                        dispatch_drop(&mut self.root, &self.arena, target, d.payload, self.pointer);
                     }
                     dispatch_drag_leave(&mut self.root, &self.arena, target);
                 }
@@ -1352,7 +1354,7 @@ impl WindowState {
             // Unlike begin/move/end_drag, no explicit `mark_all_dirty`: the drop handler's signal
             // writes flag damage via their synchronous effects; a handler that changes nothing
             // visible (e.g. only logs) needs no repaint.
-            dispatch_drop(&mut self.root, &self.arena, target, payload);
+            dispatch_drop(&mut self.root, &self.arena, target, payload, self.pointer);
         }
     }
 
@@ -1488,6 +1490,7 @@ impl WindowState {
                         &mut self.scene,
                         self.pointer,
                         viewport,
+                        true, // keep the ghost inside the window (#239)
                         &self.damage,
                         &theme,
                     ) {
