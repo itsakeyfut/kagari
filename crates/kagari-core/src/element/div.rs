@@ -105,6 +105,10 @@ pub struct Div {
     /// laid-out [`Rect`] into the handle each paint, so a sibling widget's event handler can read the
     /// container's size/origin (a splitter divider drag, a slider seek). `None` = not tracked.
     bounds_handle: Option<BoundsHandle>,
+    /// Whether to clip children to this node's bounds ([`clip`](Self::clip), #239). `false` = children may
+    /// overflow (the default); `true` = overflowing content is masked to the box (a dock region confines a
+    /// panel's content). Unlike [`Scroll`](super::Scroll) this adds no scrolling/translation — just the mask.
+    clip: bool,
 }
 
 /// A clone-shared handle to a [`Div`]'s last laid-out bounds (#84), published by
@@ -161,6 +165,7 @@ pub fn div() -> Div {
         flex_grow: None,
         resolved_flex_grow: Arc::new(Mutex::new(None)),
         bounds_handle: None,
+        clip: false,
         drag_source: None,
         drop_target: None,
         drag_over_handlers: Vec::new(),
@@ -303,6 +308,16 @@ impl Div {
     /// its content. Static. #84.
     pub fn flex_basis(mut self, basis: f32) -> Self {
         self.layout.flex_basis = Some(Px(basis));
+        self
+    }
+
+    /// Clips children to this node's bounds (#239): overflowing content is masked to the box instead of
+    /// bleeding past it (a dock region confines a small panel's text). Adds no scrolling — unlike
+    /// [`scroll`](super::scroll) it only masks; content outside the box is culled, not made reachable.
+    /// The mask is an axis-aligned rect (a `rounded` container does not round-clip its children, matching
+    /// the `Scroll` precedent).
+    pub fn clip(mut self) -> Self {
+        self.clip = true;
         self
     }
 
@@ -893,6 +908,10 @@ impl Element for Div {
             cx.record_a11y(id, a11y, bounds);
         }
 
+        // Clip children to this node's bounds when requested (#239): push the mask (intersecting any
+        // scroll/clip ancestor), paint, then restore. `None` when unclipped (children overflow as before).
+        let saved_clip = self.clip.then(|| cx.push_clip(bounds));
+
         // Paint each child at its absolute bounds. `LayoutTree::layout` returns parent-relative
         // coordinates (taffy), so offset by this node's origin to get the child's absolute rect.
         for (child, &child_id) in self.children.iter_mut().zip(&self.child_ids) {
@@ -905,6 +924,10 @@ impl Element for Div {
                 size: local.size,
             };
             child.paint(child_bounds, cx);
+        }
+
+        if let Some(saved) = saved_clip {
+            cx.set_clip(saved);
         }
     }
 
@@ -1338,6 +1361,82 @@ mod tests {
         // radius Lg → 8px, applied to all four corners.
         assert_eq!(scene.quads[0].corner_radii.tl, 8.0);
         assert_eq!(scene.quads[0].corner_radii.br, 8.0);
+    }
+
+    #[test]
+    fn div_clip_should_mask_overflowing_child() {
+        let theme = Theme::from_ron(TEST_THEME_RON).unwrap();
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        // A 50×50 parent with a 100×100 child: clipped → the child's quad mask is confined to the box.
+        let clipped = render(
+            div()
+                .size(Size { w: 50.0, h: 50.0 })
+                .clip()
+                .child(div().min_w(100.0).min_h(100.0).background(green))
+                .into_element(),
+            &theme,
+        );
+        let mask = clipped
+            .quads
+            .iter()
+            .find(|q| q.bg == green)
+            .expect("child quad")
+            .content_mask
+            .rect;
+        assert!(
+            mask.size.w <= 50.0 && mask.size.h <= 50.0,
+            "the clipped child's mask is confined to the 50x50 parent: {mask:?}"
+        );
+        // Unclipped: the same child's mask spans its full (overflowing) 100×100 bounds.
+        let open = render(
+            div()
+                .size(Size { w: 50.0, h: 50.0 })
+                .child(div().min_w(100.0).min_h(100.0).background(green))
+                .into_element(),
+            &theme,
+        );
+        let open_mask = open
+            .quads
+            .iter()
+            .find(|q| q.bg == green)
+            .expect("child quad")
+            .content_mask
+            .rect;
+        assert!(
+            open_mask.size.w >= 100.0,
+            "without clip the child overflows unmasked: {open_mask:?}"
+        );
+    }
+
+    #[test]
+    fn div_clip_should_restore_clip_for_later_siblings() {
+        let theme = Theme::from_ron(TEST_THEME_RON).unwrap();
+        let blue = Background::Solid(Color::new(0.0, 0.0, 1.0, 1.0));
+        // A clipped div followed by a SIBLING with an overflowing child: the clip must be restored after
+        // the clipped subtree, so the later sibling's child is NOT masked (push_clip/set_clip pairing).
+        let scene = render(
+            div()
+                .flex_col()
+                .child(div().size(Size { w: 50.0, h: 50.0 }).clip())
+                .child(
+                    div()
+                        .size(Size { w: 50.0, h: 50.0 })
+                        .child(div().min_w(300.0).min_h(300.0).background(blue)),
+                )
+                .into_element(),
+            &theme,
+        );
+        let mask = scene
+            .quads
+            .iter()
+            .find(|q| q.bg == blue)
+            .expect("sibling's child quad")
+            .content_mask
+            .rect;
+        assert!(
+            mask.size.w >= 300.0,
+            "the clip was restored, so the later sibling's child overflows unmasked: {mask:?}"
+        );
     }
 
     /// Renders the *same retained* `root` against `theme` into a fresh `Scene`, reusing the given

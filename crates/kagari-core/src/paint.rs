@@ -131,6 +131,9 @@ pub fn render_tree(
 /// at `origin`, above all main content and overlays (a high overlay order band) and **not** hit-tested
 /// — the shell's cursor-tracked drag-image (#178). Builds + lays the element out in its own
 /// `arena`/`layout` (fresh per drag), so it is independent of the main tree. Call after `render_tree`.
+///
+/// When `clamp_to_viewport` is set, `origin` is clamped so the whole element stays inside `viewport` (the
+/// cursor-tracked drag-image never extends off-screen, #239); otherwise it is painted exactly at `origin`.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_element_into(
     element: &mut AnyElement,
@@ -141,6 +144,7 @@ pub fn paint_element_into(
     scene: &mut Scene,
     origin: Point,
     viewport: Size,
+    clamp_to_viewport: bool,
     damage: &Arc<DamageState>,
     theme: &kagari_style::Theme,
 ) -> Result<(), LayoutError> {
@@ -159,6 +163,16 @@ pub fn paint_element_into(
     };
     layout.compute(root_id, viewport)?;
     let size = layout.layout(root_id).size;
+    // Keep the element fully on-screen when asked (#239): clamp the top-left into `[0, viewport - size]`
+    // so a cursor-tracked drag-image at a window edge stops at the edge instead of spilling off it.
+    let origin = if clamp_to_viewport {
+        Point {
+            x: origin.x.clamp(0.0, (viewport.w - size.w).max(0.0)),
+            y: origin.y.clamp(0.0, (viewport.h - size.h).max(0.0)),
+        }
+    } else {
+        origin
+    };
     let bounds = Rect { origin, size };
     // `None` hit-test: the drag-image is visual only and must not intercept pointer events (drop
     // targets under it stay reachable). The overlay band puts it above all normal primitives.
@@ -174,7 +188,7 @@ pub fn paint_element_into(
 mod tests {
     use super::*;
     use crate::element::{Element, IntoElement, LayoutCx, div, text};
-    use kagari_base::{Color, NodeId};
+    use kagari_base::{Color, NodeId, Point};
     use kagari_render::{Background, Scene};
     use kagari_style::Theme;
     use kagari_text::FontDb;
@@ -182,6 +196,53 @@ mod tests {
     struct NoopDamage;
     impl DamageSink for NoopDamage {
         fn mark_paint_dirty(&self, _id: NodeId) {}
+    }
+
+    #[test]
+    fn paint_element_into_should_clamp_to_viewport() {
+        // A cursor-tracked drag-image dragged past the window edge is clamped back inside it (#239).
+        let green = Background::Solid(Color::new(0.0, 1.0, 0.0, 1.0));
+        let viewport = Size { w: 200.0, h: 100.0 };
+        let damage = Arc::new(DamageState::default());
+        let theme = Theme::default();
+        let paint = |clamp: bool| {
+            let mut el = div()
+                .size(Size { w: 40.0, h: 20.0 })
+                .background(green)
+                .into_element();
+            let mut scene = Scene::new();
+            let mut arena = Arena::new();
+            let mut layout = LayoutTree::new();
+            let mut ts = TextSystem::new(FontDb::new());
+            paint_element_into(
+                &mut el,
+                &mut arena,
+                &mut layout,
+                &mut ts,
+                None,
+                &mut scene,
+                Point::new(300.0, 300.0), // well past the 200×100 viewport
+                viewport,
+                clamp,
+                &damage,
+                &theme,
+            )
+            .unwrap();
+            scene.quads.iter().find(|q| q.bg == green).unwrap().bounds
+        };
+        // Clamped: the element's far edges land exactly on the viewport edges (never past them).
+        let clamped = paint(true);
+        assert_eq!(
+            clamped.origin.x, 160.0,
+            "clamped to the right edge (200-40)"
+        );
+        assert_eq!(
+            clamped.origin.y, 80.0,
+            "clamped to the bottom edge (100-20)"
+        );
+        // Unclamped: painted at the raw (off-screen) origin.
+        let raw = paint(false);
+        assert_eq!(raw.origin.x, 300.0, "unclamped paints at the raw origin");
     }
 
     #[test]

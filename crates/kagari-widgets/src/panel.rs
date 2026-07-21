@@ -12,10 +12,10 @@
 //! body is rebuilt each time it is expanded (the same idiom as [`Tabs`](crate::Tabs)' panels).
 
 use kagari_base::SharedString;
-use kagari_core::element::dyn_if;
+use kagari_core::element::{Div, dyn_if};
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
-use kagari_core::{AnyElement, IntoElement, KeyCode, div, text, use_focus_handle};
+use kagari_core::{AnyElement, DragPayload, IntoElement, KeyCode, div, text, use_focus_handle};
 use kagari_style::{ColorRole, Styled};
 
 use crate::button::Button;
@@ -24,6 +24,11 @@ use crate::control::{ControlSize, apply_size, label_px};
 /// A panel's body **content builder** — called to build the body element (again each time the panel is
 /// expanded, so a `dyn_if`-unmounted body can be rebuilt; a pre-built element could not).
 type PanelContent = Box<dyn Fn() -> AnyElement>;
+
+/// An applier that makes the header a drag source (set by [`Panel::drag_handle`]). Type-erased so `Panel`
+/// stays non-generic while `drag_handle` accepts any payload type — the closure captures the payload and
+/// applies `.drag_source(..)` + a title-chip `.drag_image(..)` to the header `Div` at build time.
+type HeaderDrag = Box<dyn FnOnce(Div) -> Div>;
 
 /// A titled container (#228): a header (title + [actions](Self::actions) + a collapse caret) over a body.
 /// Build with [`panel`]; make it collapse with [`.collapsible`](Self::collapsible). Returns
@@ -36,6 +41,9 @@ pub struct Panel {
     /// The controlled collapse state; `None` = not collapsible (no caret, body always shown).
     collapsed: Option<RwSignal<bool>>,
     size: ControlSize,
+    /// An optional drag-source applier for the header ([`drag_handle`](Self::drag_handle)); `None` = the
+    /// header is not draggable.
+    header_drag: Option<HeaderDrag>,
 }
 
 /// Creates a panel titled `title` whose body is built by `content` (a builder, rebuilt on each expand).
@@ -49,6 +57,7 @@ pub fn panel<C: IntoElement>(
         actions: Vec::new(),
         collapsed: None,
         size: ControlSize::Md,
+        header_drag: None,
     }
 }
 
@@ -78,6 +87,49 @@ impl Panel {
         self.size = size;
         self
     }
+
+    /// Makes the **header** a drag source emitting `payload` (#178) — dragging the title bar past the drag
+    /// threshold begins a drag, while a plain click still toggles collapse (the shell distinguishes the two).
+    /// Payload-generic, so `Panel` stays dock-neutral: the Dock (#239) passes a `PanelId` to drive re-docking,
+    /// but any `DragPayload` works. A title chip is shown as the cursor-tracked drag image.
+    pub fn drag_handle<P: DragPayload + Clone>(mut self, payload: P) -> Self {
+        let label = self.title.clone();
+        let size = self.size;
+        self.header_drag = Some(Box::new(move |h: Div| {
+            h.drag_source(move || payload.clone())
+                .drag_image(move || drag_chip(label.clone(), size))
+        }));
+        self
+    }
+
+    /// The panel's title (the Dock #239 uses it as a tab label when a panel is docked into a `Tabs` region).
+    pub(crate) fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    /// The panel's **body only** — the content without the header, border, or separator chrome. The Dock
+    /// (#239) renders this inside a `Tabs` region, where the tab bar is the chrome (so the panel's own
+    /// header would be redundant); a `.collapsible` binding is inert here (the tab bar owns visibility).
+    pub(crate) fn into_body(self) -> AnyElement {
+        build_body(self.size, &self.content)
+    }
+}
+
+/// The panel body content (no header/border/separator): the content builder run inside a sized flex column.
+/// Shared by the collapsible and non-collapsible body arms and by [`Panel::into_body`] — one body path, so
+/// the three consumers cannot drift.
+fn build_body(size: ControlSize, content: &PanelContent) -> AnyElement {
+    apply_size(div().flex_col(), size)
+        .child(content())
+        .into_element()
+}
+
+/// The cursor-tracked drag image for a dragged panel header: a small surface chip showing the title.
+fn drag_chip(label: SharedString, size: ControlSize) -> impl IntoElement {
+    apply_size(div().flex().items_center(), size)
+        .bg(ColorRole::SurfaceRaised)
+        .rounded_md()
+        .child(text(label).color_role(ColorRole::Text).size(label_px(size)))
 }
 
 /// A 1px full-width divider between the header and the body (light `Surface` ≈ `Bg`, so a border is what
@@ -94,6 +146,7 @@ impl IntoElement for Panel {
             actions,
             collapsed,
             size,
+            header_drag,
         } = self;
         let font = label_px(size);
 
@@ -157,6 +210,10 @@ impl IntoElement for Panel {
                 header = header.child(action);
             }
         }
+        // Make the header a drag source if `drag_handle` was set (#239: drag the title bar to re-dock).
+        if let Some(apply) = header_drag {
+            header = apply(header);
+        }
 
         // Body: the separator + built content, gated on the collapse signal (mounted only while expanded).
         let body: AnyElement = match collapsed {
@@ -166,14 +223,14 @@ impl IntoElement for Panel {
                     div()
                         .flex_col()
                         .child(separator())
-                        .child(apply_size(div().flex_col(), size).child(content()))
+                        .child(build_body(size, &content))
                 },
             )
             .into_element(),
             None => div()
                 .flex_col()
                 .child(separator())
-                .child(apply_size(div().flex_col(), size).child(content()))
+                .child(build_body(size, &content))
                 .into_element(),
         };
 
@@ -203,7 +260,7 @@ mod tests {
     use kagari_core::reactive::{Owner, provide_context};
     use kagari_core::{
         DispatchState, HitTest, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
-        dispatch_key, dispatch_mouse,
+        dispatch_drag_start, dispatch_key, dispatch_mouse,
     };
     use kagari_layout::LayoutTree;
     use kagari_render::{Background, Scene};
@@ -432,6 +489,28 @@ mod tests {
             !collapsed.get_untracked(),
             "the action's click stops propagation, so the header does not toggle"
         );
+        drop(owner);
+    }
+
+    #[test]
+    fn panel_drag_handle_should_make_header_a_drag_source() {
+        // .drag_handle(payload) makes the header a drag source (#239: drag the title bar to re-dock).
+        let owner = Owner::new();
+        owner.set();
+        let mut h = harness(
+            panel("Scene", body_content)
+                .drag_handle(7u32)
+                .into_element(),
+        );
+        let hdr = header(&h);
+        let produced = dispatch_drag_start(&mut h.root, &h.arena, hdr);
+        let (payload, image) = produced.expect("the header is a drag source");
+        assert_eq!(
+            payload.into_any().downcast::<u32>().ok().map(|b| *b),
+            Some(7),
+            "the header emits the drag_handle payload"
+        );
+        assert!(image.is_some(), "a title-chip drag image is provided");
         drop(owner);
     }
 

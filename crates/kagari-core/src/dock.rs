@@ -207,6 +207,34 @@ impl DockTree {
         self.0 = self.0.take().and_then(|node| remove_panel(node, panel));
     }
 
+    /// Sets the child weights of the `Split` at `path` (a child-index path from the root), in place. A
+    /// **non-structural** edit: it neither collapses nor re-normalizes the tree (the structure is unchanged,
+    /// so the Dock widget #239 can write a live resize back without triggering a rebuild). A no-op if `path`
+    /// does not resolve to a `Split`, or if `weights.len()` differs from that split's child count. Each weight
+    /// is sanitized (`sanitize_weight`) so a non-finite/`<= 0` value can never poison the model.
+    pub fn set_weight_at(&mut self, path: &[usize], weights: &[f32]) {
+        if let Some(DockNode::Split { children, .. }) =
+            self.0.as_mut().and_then(|root| node_at_mut(root, path))
+        {
+            if children.len() == weights.len() {
+                for (child, &w) in children.iter_mut().zip(weights) {
+                    child.weight = sanitize_weight(w);
+                }
+            }
+        }
+    }
+
+    /// Sets the active tab of the `Tabs` at `path` (a child-index path from the root), in place — a
+    /// **non-structural** edit (see [`set_weight_at`](Self::set_weight_at)). `active` is clamped into range.
+    /// A no-op if `path` does not resolve to a `Tabs`.
+    pub fn set_active_at(&mut self, path: &[usize], active: usize) {
+        if let Some(DockNode::Tabs { panels, active: a }) =
+            self.0.as_mut().and_then(|root| node_at_mut(root, path))
+        {
+            *a = active.min(panels.len().saturating_sub(1));
+        }
+    }
+
     /// Another panel sharing `panel`'s tab group, if any (used to anchor a self-targeted dock).
     fn region_sibling(&self, panel: PanelId) -> Option<PanelId> {
         fn walk(node: &DockNode, panel: PanelId) -> Option<PanelId> {
@@ -271,6 +299,20 @@ pub fn drop_zone(region: Rect, p: Point) -> DropZone {
 }
 
 // --- Pure tree operations (rebuild-by-value; trees are small) ---
+
+/// Resolves a child-index `path` from `root` to a mutable node reference (`&mut root` when `path` is empty).
+/// Each step descends into a `Split`'s `children[i]`; any step that leaves a non-`Split` or an out-of-range
+/// index yields `None`. Used by the non-structural setters ([`DockTree::set_weight_at`]/[`set_active_at`]).
+fn node_at_mut<'a>(root: &'a mut DockNode, path: &[usize]) -> Option<&'a mut DockNode> {
+    let mut node = root;
+    for &i in path {
+        match node {
+            DockNode::Split { children, .. } => node = &mut children.get_mut(i)?.node,
+            _ => return None,
+        }
+    }
+    Some(node)
+}
 
 /// Collects every panel id depth-first.
 fn collect_panels(node: &DockNode, out: &mut Vec<PanelId>) {
@@ -904,5 +946,112 @@ mod tests {
     #[test]
     fn panel_id_should_round_trip() {
         assert_eq!(PanelId::from_raw(9).raw(), 9);
+    }
+
+    #[test]
+    fn set_weight_at_should_update_weights_without_restructuring() {
+        // A live resize (#239): set_weight_at rewrites a Split's child weights in place, preserving the tree
+        // shape (so the Dock widget can write it back without a structural rebuild).
+        let mut tree = DockTree::new(DockNode::Split {
+            axis: Axis::Horizontal,
+            children: vec![
+                DockChild {
+                    node: DockNode::Leaf(p(1)),
+                    weight: 1.0,
+                },
+                DockChild {
+                    node: DockNode::Leaf(p(2)),
+                    weight: 1.0,
+                },
+            ],
+        });
+        tree.set_weight_at(&[], &[3.0, 1.0]);
+        assert_eq!(
+            tree.root(),
+            Some(&DockNode::Split {
+                axis: Axis::Horizontal,
+                children: vec![
+                    DockChild {
+                        node: DockNode::Leaf(p(1)),
+                        weight: 3.0,
+                    },
+                    DockChild {
+                        node: DockNode::Leaf(p(2)),
+                        weight: 1.0,
+                    },
+                ],
+            }),
+            "the split weights update in place, shape unchanged"
+        );
+    }
+
+    #[test]
+    fn set_weight_at_should_sanitize_and_noop_on_bad_input() {
+        let mut tree = DockTree::new(DockNode::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                DockChild {
+                    node: DockNode::Leaf(p(1)),
+                    weight: 2.0,
+                },
+                DockChild {
+                    node: DockNode::Leaf(p(2)),
+                    weight: 2.0,
+                },
+            ],
+        });
+        // Wrong child count → no-op; a NaN/negative weight → sanitized to 1.0.
+        tree.set_weight_at(&[], &[5.0]);
+        tree.set_weight_at(&[0], &[1.0, 1.0]); // path resolves to a Leaf, not a Split → no-op
+        if let Some(DockNode::Split { children, .. }) = tree.root() {
+            assert_eq!(
+                children[0].weight, 2.0,
+                "mismatched len leaves weights untouched"
+            );
+        } else {
+            panic!("still a split");
+        }
+        tree.set_weight_at(&[], &[f32::NAN, -1.0]);
+        if let Some(DockNode::Split { children, .. }) = tree.root() {
+            assert_eq!(children[0].weight, 1.0, "NaN weight sanitized to 1.0");
+            assert_eq!(children[1].weight, 1.0, "negative weight sanitized to 1.0");
+        } else {
+            panic!("still a split");
+        }
+    }
+
+    #[test]
+    fn set_active_at_should_clamp_and_target_nested_tabs() {
+        // Split[ Leaf(1), Tabs(2,3,4) ] — set the nested Tabs' active via the path [1], clamped into range.
+        let mut tree = DockTree::new(DockNode::Split {
+            axis: Axis::Horizontal,
+            children: vec![
+                DockChild {
+                    node: DockNode::Leaf(p(1)),
+                    weight: 1.0,
+                },
+                DockChild {
+                    node: DockNode::Tabs {
+                        panels: vec![p(2), p(3), p(4)],
+                        active: 0,
+                    },
+                    weight: 1.0,
+                },
+            ],
+        });
+        tree.set_active_at(&[1], 2);
+        tree.set_active_at(&[1], 99); // out of range → clamps to last
+        if let Some(DockNode::Split { children, .. }) = tree.root() {
+            assert_eq!(
+                children[1].node,
+                DockNode::Tabs {
+                    panels: vec![p(2), p(3), p(4)],
+                    active: 2,
+                },
+                "the nested tabs' active is set and clamped to the last tab"
+            );
+        } else {
+            panic!("still a split");
+        }
     }
 }

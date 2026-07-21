@@ -3,7 +3,7 @@
 use std::any::TypeId;
 use std::sync::Arc;
 
-use kagari_base::{NodeId, Rect, Size, Transform};
+use kagari_base::{NodeId, Point, Rect, Size, Transform};
 use kagari_layout::LayoutTree;
 use kagari_render::{Atlas, Scene};
 use kagari_style::Theme;
@@ -390,6 +390,10 @@ pub struct EventCx<'a> {
     drag_accepted: bool,
     /// Drag (#178): the owned payload the driver ships into a `Drop` delivery; the target takes it.
     drag_drop_payload: Option<Box<dyn DragPayload>>,
+    /// Drag (#178): the pointer position (logical px, absolute) during a `DragOver`/`Drop` delivery, threaded
+    /// in by the shell driver. `None` for every other event — a drop/drag-over handler reads it via
+    /// [`drag_pointer`](Self::drag_pointer) to resolve pointer-relative geometry (e.g. a dock drop zone).
+    drag_pointer: Option<Point>,
 }
 
 impl<'a> EventCx<'a> {
@@ -404,7 +408,21 @@ impl<'a> EventCx<'a> {
             drag_produced: None,
             drag_accepted: false,
             drag_drop_payload: None,
+            drag_pointer: None,
         }
+    }
+
+    /// Driver → handler (#178): records the pointer position for a `DragOver`/`Drop` delivery, so the target's
+    /// `on_drag_over`/`drop_target` handler can read it via [`drag_pointer`](Self::drag_pointer).
+    pub(crate) fn set_drag_pointer(&mut self, pointer: Point) {
+        self.drag_pointer = Some(pointer);
+    }
+
+    /// The pointer position (logical px, absolute) during the current `DragOver`/`Drop` delivery, or `None`
+    /// for any other event. A drop target reads it — together with its own laid-out bounds — to resolve a
+    /// pointer-relative drop (e.g. [`drop_zone`](crate::drop_zone) for a dock region).
+    pub fn drag_pointer(&self) -> Option<Point> {
+        self.drag_pointer
     }
 
     /// Halts the rest of the capture/bubble walk: ancestors' handlers do not run after this.

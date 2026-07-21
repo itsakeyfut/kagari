@@ -500,12 +500,14 @@ pub fn dispatch_drag_start(
 
 /// Delivers [`Event::DragOver`] (carrying the in-flight payload's [`TypeId`]) to the drop target
 /// `node`, returning whether it accepts (a matching type). An accepting target also runs its
-/// `on_drag_over` handler (hover feedback). Filtered to `node`.
+/// `on_drag_over` handler (hover feedback), which can read `pointer` (the absolute pointer position)
+/// via [`EventCx::drag_pointer`](crate::element::EventCx::drag_pointer). Filtered to `node`.
 pub fn dispatch_drag_over(
     root: &mut AnyElement,
     arena: &Arena,
     node: NodeId,
     payload_ty: TypeId,
+    pointer: Point,
 ) -> bool {
     let path = ancestor_path(arena, node);
     let only = [node];
@@ -516,6 +518,7 @@ pub fn dispatch_drag_over(
             only: &only,
         },
     );
+    cx.set_drag_pointer(pointer);
     root.handle_event(
         &Event::DragOver {
             payload: payload_ty,
@@ -543,12 +546,14 @@ pub fn dispatch_drag_leave(root: &mut AnyElement, arena: &Arena, node: NodeId) {
 
 /// Delivers [`Event::Drop`] carrying the owned `payload` to the drop target `node`, returning whether
 /// the target consumed it (a matching `try_drop`). The driver calls this on mouse-up over an accepting
-/// target. Filtered to `node`.
+/// target, passing `pointer` (the absolute drop position) which the handler reads via
+/// [`EventCx::drag_pointer`](crate::element::EventCx::drag_pointer). Filtered to `node`.
 pub fn dispatch_drop(
     root: &mut AnyElement,
     arena: &Arena,
     node: NodeId,
     payload: Box<dyn DragPayload>,
+    pointer: Point,
 ) -> bool {
     let path = ancestor_path(arena, node);
     let only = [node];
@@ -559,6 +564,7 @@ pub fn dispatch_drop(
             only: &only,
         },
     );
+    cx.set_drag_pointer(pointer);
     cx.set_drop_payload(payload);
     root.handle_event(&Event::Drop, &mut cx);
     // The target took the payload iff the drop landed (a matching drop target ran `try_drop`).
@@ -1229,12 +1235,13 @@ mod tests {
     #[test]
     fn dispatch_drag_over_should_accept_matching_type_and_reject_wrong() {
         let (mut root, arena, id) = build(div().drop_target::<Foo>(|_f: Foo, _cx| {}));
+        let p = Point::new(0.0, 0.0);
         assert!(
-            dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>()),
+            dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>(), p),
             "a matching payload type is accepted"
         );
         assert!(
-            !dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Bar>()),
+            !dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Bar>(), p),
             "a wrong payload type is rejected"
         );
     }
@@ -1246,10 +1253,63 @@ mod tests {
         let (mut root, arena, id) =
             build(div().drop_target::<Foo>(move |f: Foo, _cx| *g.borrow_mut() = Some(f.0)));
         assert!(
-            dispatch_drop(&mut root, &arena, id, Box::new(Foo(9))),
+            dispatch_drop(
+                &mut root,
+                &arena,
+                id,
+                Box::new(Foo(9)),
+                Point::new(0.0, 0.0)
+            ),
             "the matching target consumed the payload"
         );
         assert_eq!(*got.borrow(), Some(9), "the handler received the payload");
+    }
+
+    #[test]
+    fn dispatch_drag_over_should_expose_pointer_to_handler() {
+        // The `on_drag_over` handler can read the pointer the driver threaded in (#239: a dock region
+        // resolves its hover drop-zone affordance from this point + its own bounds).
+        let seen: Rc<RefCell<Option<Point>>> = Rc::new(RefCell::new(None));
+        let s = Rc::clone(&seen);
+        let (mut root, arena, id) = build(
+            div()
+                .drop_target::<Foo>(|_f: Foo, _cx| {})
+                .on_drag_over(move |cx| *s.borrow_mut() = cx.drag_pointer()),
+        );
+        dispatch_drag_over(
+            &mut root,
+            &arena,
+            id,
+            TypeId::of::<Foo>(),
+            Point::new(7.0, 9.0),
+        );
+        assert_eq!(
+            *seen.borrow(),
+            Some(Point::new(7.0, 9.0)),
+            "on_drag_over reads the pointer via cx.drag_pointer()"
+        );
+    }
+
+    #[test]
+    fn dispatch_drop_should_expose_pointer_to_handler() {
+        // The drop handler can read the pointer position the driver threaded in (#239: a dock region
+        // resolves its drop zone from this point + its own bounds).
+        let seen: Rc<RefCell<Option<Point>>> = Rc::new(RefCell::new(None));
+        let s = Rc::clone(&seen);
+        let (mut root, arena, id) =
+            build(div().drop_target::<Foo>(move |_f: Foo, cx| *s.borrow_mut() = cx.drag_pointer()));
+        dispatch_drop(
+            &mut root,
+            &arena,
+            id,
+            Box::new(Foo(1)),
+            Point::new(12.0, 34.0),
+        );
+        assert_eq!(
+            *seen.borrow(),
+            Some(Point::new(12.0, 34.0)),
+            "the drop handler reads the pointer position via cx.drag_pointer()"
+        );
     }
 
     #[test]
@@ -1262,7 +1322,13 @@ mod tests {
                 .on_drag_over(move |_cx| lo.borrow_mut().push("over"))
                 .on_drag_leave(move |_cx| ll.borrow_mut().push("leave")),
         );
-        dispatch_drag_over(&mut root, &arena, id, TypeId::of::<Foo>());
+        dispatch_drag_over(
+            &mut root,
+            &arena,
+            id,
+            TypeId::of::<Foo>(),
+            Point::new(0.0, 0.0),
+        );
         dispatch_drag_leave(&mut root, &arena, id);
         assert_eq!(*log.borrow(), vec!["over", "leave"]);
     }
