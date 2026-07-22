@@ -114,6 +114,36 @@ pub(crate) fn slider_dims(size: ControlSize) -> (Px, Px) {
     }
 }
 
+/// A value coerced into `[min, max]` (a non-finite value → `min`); guards a degenerate range (`min > max`)
+/// so `f32::clamp` (which panics when `min > max`) is never hit and no `flex_grow` gets a NaN (RK-045). The
+/// shared slider sanitiser: used by both [`Slider`](crate::Slider) (#75) and [`RangeSlider`](crate::RangeSlider) (#234).
+pub(crate) fn sane(v: f32, min: f32, max: f32) -> f32 {
+    if !v.is_finite() {
+        return min;
+    }
+    if min <= max { v.clamp(min, max) } else { min }
+}
+
+/// The `[0, 1]` fill fraction of `v` in `[min, max]` — always finite (RK-045: fed straight into `flex_grow`,
+/// where a NaN/negative would collapse the segment). A degenerate range yields `0`.
+pub(crate) fn fraction(v: f32, min: f32, max: f32) -> f32 {
+    if max > min {
+        ((sane(v, min, max) - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// `v` clamped to `[min, max]` and snapped to the nearest `step` (a `<= 0`/non-finite step = continuous).
+pub(crate) fn snap(v: f32, min: f32, max: f32, step: f32) -> f32 {
+    let clamped = sane(v, min, max);
+    if step > 0.0 && step.is_finite() && max > min {
+        (min + ((clamped - min) / step).round() * step).clamp(min, max)
+    } else {
+        clamped
+    }
+}
+
 /// The progress-bar track `(width, height)` (logical px) for `size` — a thin, wide pill (#87).
 pub(crate) fn progress_dims(size: ControlSize) -> (Px, Px) {
     match size {
