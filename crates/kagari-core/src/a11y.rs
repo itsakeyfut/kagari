@@ -40,6 +40,9 @@ pub enum Role {
     Radio,
     /// A group of mutually-exclusive [`Radio`](Role::Radio) buttons.
     RadioGroup,
+    /// A slider (a value selected by dragging a thumb along a track, #75) — its current value is carried in
+    /// [`a11y_value`](crate::element::Div::a11y_value).
+    Slider,
     /// A list container (its items are [`Role::ListItem`]).
     List,
     /// An item within a [`Role::List`].
@@ -63,6 +66,7 @@ impl Role {
             Role::Switch => accesskit::Role::Switch,
             Role::Radio => accesskit::Role::RadioButton,
             Role::RadioGroup => accesskit::Role::RadioGroup,
+            Role::Slider => accesskit::Role::Slider,
             Role::List => accesskit::Role::List,
             Role::ListItem => accesskit::Role::ListItem,
             Role::Image => accesskit::Role::Image,
@@ -389,7 +393,7 @@ mod tests {
         let (a11y, arena) = derive(
             div()
                 .role(Role::TextInput)
-                .a11y_value("hello")
+                .a11y_value(SharedString::from("hello"))
                 .into_element(),
         );
         let update = a11y.build_update(&arena, None, 1.0);
@@ -533,6 +537,68 @@ mod tests {
             toggled(),
             Some(accesskit::Toggled::True),
             "frame 2: checked after the signal write"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn a11y_value_should_update_on_signal() {
+        // A reactive `a11y_value` (#75) re-resolves at paint, so a signal write updates the announced
+        // value (a slider's value tracks its signal) — and `Role::Slider` maps to accesskit's Slider.
+        // RK-005: serial + owner alive.
+        use crate::reactive::prelude::*;
+        use crate::reactive::{Owner, RwSignal, rx};
+
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(0.25_f32);
+        let mut root = div()
+            .role(Role::Slider)
+            .a11y_value(rx(move || SharedString::from(format!("{}", value.get()))))
+            .into_element();
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let damage = Arc::new(DamageState::default());
+        let theme = Theme::default();
+
+        let mut announced = || {
+            let mut a11y = A11yTree::default();
+            let mut scene = Scene::new();
+            render_tree(
+                &mut root,
+                &mut arena,
+                &mut layout,
+                &mut text,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut a11y),
+                &mut scene,
+                Size { w: 50.0, h: 50.0 },
+                &damage,
+                &theme,
+            )
+            .unwrap();
+            a11y.build_update(&arena, None, 1.0)
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == accesskit::Role::Slider)
+                .and_then(|(_, n)| n.value().map(str::to_owned))
+        };
+
+        assert_eq!(
+            announced().as_deref(),
+            Some("0.25"),
+            "frame 1: the initial value is announced on the Slider node"
+        );
+        value.set(0.75);
+        assert_eq!(
+            announced().as_deref(),
+            Some("0.75"),
+            "frame 2: the announced value tracks the signal write"
         );
         drop(owner);
     }

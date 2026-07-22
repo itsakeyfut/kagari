@@ -95,6 +95,12 @@ pub struct Div {
     /// The reactive toggle/selection state (#257): a static or reactive `bool` resolved at paint into
     /// the recorded a11y state, so a control's a11y state mirrors its signal (checkbox/switch/radio).
     a11y_checked: ReactiveProp<bool>,
+    /// The reactive accessibility value (#75): a static or reactive `SharedString` resolved at paint into
+    /// [`A11y::value`], so a control's announced value mirrors its signal (e.g. a slider's current value).
+    /// Not a [`ReactiveProp`] because that requires `Copy` and `SharedString` is not; resolved directly
+    /// via [`Prop::get`] at paint (a11y is re-recorded every frame, and the value only changes alongside a
+    /// visual change that already repaints, so no separate paint-dirty flag is needed).
+    a11y_value: Option<Prop<SharedString>>,
     /// Reactive/static flex-grow weight (#84): the share of a flex container's free main-axis space this
     /// child claims, relative to its siblings. A reactive weight's bind effect flags **layout**-dirty
     /// (like [`size`](Self::size)), so a signal-driven change relays out. `None` = taffy default (0).
@@ -174,6 +180,7 @@ pub fn div() -> Div {
         anchor_handle: None,
         a11y: None,
         a11y_checked: ReactiveProp::default(),
+        a11y_value: None,
     }
 }
 
@@ -520,9 +527,12 @@ impl Div {
     }
 
     /// Sets this element's accessibility value (#67) — e.g. a text input's contents or a control's
-    /// current value. Also exposes the element (default role [`Role::Label`]) if no role was set.
-    pub fn a11y_value(mut self, value: impl Into<SharedString>) -> Self {
-        self.a11y_mut().value = Some(value.into());
+    /// current value (#75). A static or **reactive** `SharedString`: resolved at paint into the recorded
+    /// a11y value, so a control's announced value mirrors its signal (like [`a11y_checked`](Self::a11y_checked)).
+    /// Also exposes the element (default role [`Role::Label`]) if no [`role`](Self::role) was set.
+    pub fn a11y_value(mut self, value: impl Into<Prop<SharedString>>) -> Self {
+        self.a11y_mut();
+        self.a11y_value = Some(value.into());
         self
     }
 
@@ -905,6 +915,10 @@ impl Element for Div {
             // at build, only here at paint, so it mirrors the control's current signal.
             let mut a11y = a11y.clone();
             a11y.checked = self.a11y_checked.current();
+            // Inject the reactive value (#75) resolved this frame, so it mirrors the control's signal.
+            if let Some(value) = &self.a11y_value {
+                a11y.value = Some(value.get());
+            }
             cx.record_a11y(id, a11y, bounds);
         }
 
