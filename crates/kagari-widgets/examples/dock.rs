@@ -14,9 +14,10 @@
 
 use kagari_base::{Axis, Px, Size};
 use kagari_core::reactive::prelude::*;
-use kagari_core::reactive::{RwSignal, create_effect};
+use kagari_core::reactive::{RwSignal, create_effect, rx};
 use kagari_core::{
     App, DockChild, DockNode, DockTree, PanelId, PersistenceService, WindowOptions, div, text,
+    use_window_size,
 };
 use kagari_style::{ColorRole, Styled};
 use kagari_widgets::{button, dock, panel};
@@ -56,7 +57,12 @@ fn default_layout() -> DockTree {
 fn main() -> Result<(), kagari_core::AppError> {
     let mut app = App::new()?;
     app.open_window(
-        WindowOptions::default().title("kagari — dock (drag a title bar to re-dock)"),
+        WindowOptions::default()
+            .title("kagari — dock (drag a title bar to re-dock; resize the window)")
+            .inner_size(Size {
+                w: 1100.0,
+                h: 720.0,
+            }),
         || {
             // App-owned persistence: restore the saved layout at startup (or the default), and save on
             // every change. An in-memory service here; an app points `PersistenceService::load()` at a file.
@@ -75,10 +81,12 @@ fn main() -> Result<(), kagari_core::AppError> {
                 });
             }
 
-            // The dock fills the window (its outer container grows into this sized flex slot).
+            // The dock fills the window and follows resize (#348): the outer flex slot is sized to the
+            // live window size (reactive), and the dock grows into it.
+            let window_size = use_window_size();
             div()
                 .flex()
-                .size(Size { w: 960.0, h: 620.0 })
+                .size(rx(move || window_size.get()))
                 .bg(ColorRole::Bg)
                 .child(dock(tree, move |id: PanelId| {
                     panel(format!("Panel {}", id.raw()), move || {

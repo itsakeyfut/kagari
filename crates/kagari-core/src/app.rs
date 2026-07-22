@@ -44,7 +44,7 @@ use crate::overlay::{OverlayLayers, OverlayRegistry};
 use crate::paint::{paint_element_into, render_tree};
 use crate::persist::{PersistenceService, WindowGeometry};
 use crate::reactive::prelude::*;
-use crate::reactive::{Owner, RwSignal, create_effect, provide_context};
+use crate::reactive::{Owner, ReadSignal, RwSignal, create_effect, provide_context, use_context};
 use crate::scheduler::{Scheduler, should_redraw};
 
 /// Extracts a human-readable message from a caught panic payload (#65). Panics carry `&str`
@@ -291,6 +291,10 @@ struct WindowState {
     // A `Copy` handle to the App-level theme signal (single source): read each frame to resolve
     // tokens. Writing happens App-side (hot-reload); the per-window theme→damage effect reskins.
     theme: RwSignal<Arc<Theme>>,
+    // The current window's logical size (#348): provided into the window context as a `ReadSignal<Size>`
+    // so a full-window widget's `use_window_size()` reads it via `.size(rx(..))` and follows resize.
+    // Updated on `WindowEvent::Resized`. Window-owned (created under the child owner, disposes on close).
+    window_size: RwSignal<Size>,
     scheduler: Scheduler,
     // The per-window animation ticker (#253): drivers (`Animated<T>`) register themselves when they
     // start; `redraw` advances them each frame. Provided into the window's reactive context so
@@ -369,6 +373,17 @@ fn bind_window_theme_damage(theme: RwSignal<Arc<Theme>>, damage: Arc<DamageState
         let _ = theme.get();
         damage.mark_all_dirty();
     });
+}
+
+/// The current window's logical size as a reactive [`ReadSignal`] (#348). A full-window widget reads it —
+/// `.size(rx(move || use_window_size().get()))` — to fill the window and follow resize; the [`App`]
+/// provides it per-window and writes it on `WindowEvent::Resized`. Idiomatic accessor (mirrors
+/// [`use_focus_handle`](crate::use_focus_handle)): outside an `App` (headless / a standalone widget test)
+/// there is no window, so it returns a detached constant `(0, 0)` signal — such tests use a fixed size
+/// instead. Must be called under a reactive owner (a widget build), like the other `use_*` accessors.
+pub fn use_window_size() -> ReadSignal<Size> {
+    use_context::<ReadSignal<Size>>()
+        .unwrap_or_else(|| RwSignal::new(Size { w: 0.0, h: 0.0 }).read_only())
 }
 
 impl App {
@@ -701,8 +716,14 @@ impl App {
         let scheduler = Scheduler::new();
         let ticker = crate::scheduler::Ticker::new();
         let ime_caret = crate::ime::ImeCaretArea::new();
-        let (root, focus, overlay_layers) = child_owner.with(|| {
+        let (root, focus, overlay_layers, window_size) = child_owner.with(|| {
             bind_window_theme_damage(theme, Arc::clone(&damage));
+            // The current window logical size (#348): a per-window signal seeded from the resolved inner
+            // size, provided as a `ReadSignal<Size>` so a full-window widget's `use_window_size()` reads it
+            // (via `.size(rx(..))`) and follows resize. Window-owned; `WindowEvent::Resized` writes it.
+            // RK-033: provided here AND captured by `use_window_size` — the provide/capture pair.
+            let window_size = RwSignal::new(inner_size);
+            provide_context(window_size.read_only());
             // `FocusRegistry::new` creates the current-focus `RwSignal`, so build it under the
             // window's child owner (RK-005/008); it disposes when the window closes.
             let focus = FocusRegistry::new();
@@ -732,7 +753,7 @@ impl App {
             // and publishes its caret area at paint; `redraw`/`sync_ime` read it to drive the OS IME.
             provide_context(ime_caret.clone());
             let root = (pending.root)();
-            (root, focus, overlay_layers)
+            (root, focus, overlay_layers, window_size)
         });
 
         // The accessibility adapter (#67) forwards accesskit events as winit user events (an initial
@@ -787,6 +808,7 @@ impl App {
                 damage,
                 _owner: child_owner,
                 theme,
+                window_size,
                 scheduler,
                 ticker,
                 last_frame: None,
@@ -1715,6 +1737,12 @@ impl ApplicationHandler<UserEvent> for App {
                             state.config.width = size.width.max(1);
                             state.config.height = size.height.max(1);
                             state.surface.configure(&state.device, &state.config);
+                            // Publish the new logical size (#348): a full-window widget bound via
+                            // `use_window_size()` relays out to the new size in the requested redraw.
+                            state.window_size.set(Size {
+                                w: state.config.width as f32 / scale,
+                                h: state.config.height as f32 / scale,
+                            });
                             state.window.request_redraw();
                         }
                         WindowEvent::RedrawRequested => state.redraw(),
@@ -1941,6 +1969,52 @@ mod tests {
             "the context reflects the swapped theme"
         );
 
+        drop(owner);
+    }
+
+    #[test]
+    fn use_window_size_should_read_provided_context_and_follow_resize() {
+        // Mirrors `create_window` providing the per-window size + the `WindowEvent::Resized` write.
+        // Synchronous effects; owner held to the end (RK-005).
+        let owner = Owner::new();
+        owner.set();
+        // Per-window: provide the read-only size handle (what `create_window` does under the child owner).
+        let window_size = RwSignal::new(Size { w: 800.0, h: 600.0 });
+        provide_context(window_size.read_only());
+        // A widget reads it through the accessor.
+        let read = use_window_size();
+        assert_eq!(
+            read.get_untracked(),
+            Size { w: 800.0, h: 600.0 },
+            "use_window_size reads the provided window size"
+        );
+        // A resize writes the signal (what the `Resized` arm does); the accessor's signal reflects it.
+        window_size.set(Size {
+            w: 1024.0,
+            h: 768.0,
+        });
+        assert_eq!(
+            read.get_untracked(),
+            Size {
+                w: 1024.0,
+                h: 768.0
+            },
+            "use_window_size follows a resize write"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn use_window_size_without_context_should_return_detached() {
+        // Outside an App (headless / a standalone widget test): no provided context → a detached (0,0)
+        // signal, no panic. Full-window widgets in headless tests use a fixed size instead.
+        let owner = Owner::new();
+        owner.set();
+        assert_eq!(
+            use_window_size().get_untracked(),
+            Size { w: 0.0, h: 0.0 },
+            "the headless fallback is a detached (0,0) signal"
+        );
         drop(owner);
     }
 
