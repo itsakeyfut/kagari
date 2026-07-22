@@ -103,6 +103,17 @@ pub(crate) fn radio_mark_px(size: ControlSize) -> Px {
     checkbox_box_px(size)
 }
 
+/// The slider metrics `(track_thickness, thumb)` (logical px) for `size` (#75): a thin track with a larger
+/// knob (the thumb overflows the track on the cross axis). The thumb doubles as the drag "divider", so its
+/// size sets the usable travel (`track_len − thumb`).
+pub(crate) fn slider_dims(size: ControlSize) -> (Px, Px) {
+    match size {
+        ControlSize::Sm => (Px(4.0), Px(14.0)),
+        ControlSize::Md => (Px(6.0), Px(18.0)),
+        ControlSize::Lg => (Px(8.0), Px(22.0)),
+    }
+}
+
 /// The progress-bar track `(width, height)` (logical px) for `size` — a thin, wide pill (#87).
 pub(crate) fn progress_dims(size: ControlSize) -> (Px, Px) {
     match size {

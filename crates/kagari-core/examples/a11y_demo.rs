@@ -13,6 +13,7 @@
 //! tested, but a consumer cannot yet register a focusable from a view (the context-provided focus
 //! registry is a #49 follow-up), so this demo exercises role/label/value **readout**, not live focus.
 
+use kagari_base::SharedString;
 use kagari_core::{App, Role, WindowOptions, div, text};
 use kagari_style::{ColorRole, Styled};
 
@@ -53,7 +54,7 @@ fn main() -> Result<(), kagari_core::AppError> {
                     .bg(ColorRole::SurfaceRaised)
                     .role(Role::TextInput)
                     .a11y_label("File name")
-                    .a11y_value("clip_01.mp4")
+                    .a11y_value(SharedString::from("clip_01.mp4"))
                     .child(text("clip_01.mp4")),
             )
             // A static label (its text is carried as the node value, accesskit convention).
