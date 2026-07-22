@@ -30,7 +30,7 @@ pub mod scheduler;
 
 pub use a11y::Role;
 pub use anim::{Animatable, Animated, AnimationSpec, Easing};
-pub use app::{App, Decorations, WindowOptions};
+pub use app::{App, Decorations, WindowOptions, use_window_size};
 pub use bridge::UiProxy;
 pub use clipboard::{Clipboard, SystemClipboard};
 pub use damage::DamageState;
