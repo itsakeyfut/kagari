@@ -32,6 +32,7 @@ pub mod tabs;
 pub mod text_input;
 pub mod tooltip;
 pub mod tree;
+pub mod vector_input;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
@@ -62,3 +63,4 @@ pub use tabs::{Tabs, tabs};
 pub use text_input::{TextInput, text_input};
 pub use tooltip::{Tooltip, tooltip};
 pub use tree::{Tree, TreeNode, TreeSelection, tree};
+pub use vector_input::{VectorInput, vector2, vector3, vector4};

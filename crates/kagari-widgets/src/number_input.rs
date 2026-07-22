@@ -29,6 +29,7 @@ pub struct NumberInput {
     min: f64,
     max: f64,
     step: f64,
+    precision: Option<u8>,
     size: ControlSize,
     disabled: bool,
 }
@@ -41,6 +42,7 @@ pub fn number_input(value: RwSignal<f64>) -> NumberInput {
         min: f64::NEG_INFINITY,
         max: f64::INFINITY,
         step: 1.0,
+        precision: None,
         size: ControlSize::Md,
         disabled: false,
     }
@@ -61,6 +63,14 @@ impl NumberInput {
         self
     }
 
+    /// Displays the value with a fixed number of decimal places (`0..` — e.g. `.precision(3)` → `1.500`).
+    /// Editing/stepping then operates at that granularity. The default (unset) shows the natural value
+    /// trimmed to at most 12 decimals. Used by [`VectorInput`](crate::VectorInput) (#233) for aligned columns.
+    pub fn precision(mut self, precision: u8) -> Self {
+        self.precision = Some(precision);
+        self
+    }
+
     /// Sets the control size (D3) — drives the field padding and the text font size.
     pub fn size(mut self, size: ControlSize) -> Self {
         self.size = size;
@@ -74,16 +84,22 @@ impl NumberInput {
     }
 }
 
-/// Formats a value for display — rounded to 12 decimals so binary-accumulation noise from a fractional step
-/// (`0.1 + 0.1 + 0.1` → `"0.3"`, not `"0.30000000000000004"`) does not surface, with trailing zeros / the
-/// dot trimmed. A non-finite value shows as empty (it should not occur for a clamped finite value). A
-/// configurable `.precision` is a future refinement (#233).
-fn format_number(v: f64) -> String {
+/// Formats a value for display. With a fixed `precision` (#233), shows exactly that many decimals (`Some(2)`,
+/// `1.5` → `"1.50"`) — aligned inspector columns. Without one, rounds to 12 decimals so binary-accumulation
+/// noise from a fractional step (`0.1 + 0.1 + 0.1` → `"0.3"`, not `"0.30000000000000004"`) does not surface,
+/// with trailing zeros / the dot trimmed. A non-finite value shows as empty (it should not occur for a clamped
+/// finite value).
+fn format_number(v: f64, precision: Option<u8>) -> String {
     if !v.is_finite() {
         return String::new();
     }
-    let s = format!("{v:.12}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    match precision {
+        Some(p) => format!("{v:.prec$}", prec = p as usize),
+        None => {
+            let s = format!("{v:.12}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        }
+    }
 }
 
 /// Clamps `n` into `[min, max]` (a no-op for the default unbounded range).
@@ -98,6 +114,7 @@ impl IntoElement for NumberInput {
             min,
             max,
             step,
+            precision,
             size,
             disabled,
         } = self;
@@ -105,7 +122,7 @@ impl IntoElement for NumberInput {
 
         if disabled {
             // Display-only: a muted static line showing the current value. No editor / steppers → inert.
-            let content = rx(move || SharedString::from(format_number(value.get())));
+            let content = rx(move || SharedString::from(format_number(value.get(), precision)));
             return field_frame(size)
                 .border_color(Some(ColorRole::Border))
                 .role(Role::TextInput)
@@ -114,29 +131,36 @@ impl IntoElement for NumberInput {
         }
 
         // The internal String projection fed to the editor leaf.
-        let text_sig = RwSignal::new(format_number(value.get_untracked()));
+        let text_sig = RwSignal::new(format_number(value.get_untracked(), precision));
         // f64 → String: reformat on a real value change (equal-write deduped). Does not fire mid-typing (the
         // value only changes on commit/step), so the user's uncommitted text is never clobbered.
         create_effect(move || {
-            let s = format_number(value.get());
+            let s = format_number(value.get(), precision);
             if text_sig.with_untracked(|t| *t != s) {
                 text_sig.set(s);
             }
         });
         // Commit: parse the current text and clamp it into `value` (the f64→String effect then normalizes the
-        // display); invalid / non-finite input reverts the text to the formatted value.
-        let commit: Arc<dyn Fn() + Send + Sync> =
-            Arc::new(
-                move || match text_sig.get_untracked().trim().parse::<f64>() {
-                    Ok(n) if n.is_finite() => value.set(clamp(n, min, max)),
-                    _ => {
-                        let s = format_number(value.get_untracked());
-                        if text_sig.with_untracked(|t| *t != s) {
-                            text_sig.set(s);
-                        }
+        // display); invalid / non-finite input reverts the text to the formatted value. A **no-op when the
+        // text still shows the formatted value** (no uncommitted edit): this stops a passive focus→blur (or a
+        // step) from re-parsing a `.precision`-rounded display and snapping the value to that precision (#233)
+        // — tabbing through a field must not mutate its value.
+        let commit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if text_sig
+                .with_untracked(|t| t.trim() == format_number(value.get_untracked(), precision))
+            {
+                return;
+            }
+            match text_sig.get_untracked().trim().parse::<f64>() {
+                Ok(n) if n.is_finite() => value.set(clamp(n, min, max)),
+                _ => {
+                    let s = format_number(value.get_untracked(), precision);
+                    if text_sig.with_untracked(|t| *t != s) {
+                        text_sig.set(s);
                     }
-                },
-            );
+                }
+            }
+        });
         // Commit any uncommitted edit first, then step the value by `delta` (clamped) — so stepping from a
         // typed-but-uncommitted number steps from what the user sees.
         let apply_step: Arc<dyn Fn(f64) + Send + Sync> = {
@@ -353,6 +377,51 @@ mod tests {
             let ev = MouseEvent::new(kind, p, Modifiers::default());
             dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
         }
+    }
+
+    #[test]
+    fn number_input_precision_should_format_fixed_decimals() {
+        // With a precision, exactly that many decimals (aligned columns); rounding applies.
+        assert_eq!(format_number(1.5, Some(2)), "1.50", "fixed 2 decimals");
+        assert_eq!(
+            format_number(1.23456, Some(3)),
+            "1.235",
+            "rounds to 3 decimals"
+        );
+        assert_eq!(
+            format_number(2.0, Some(0)),
+            "2",
+            "precision 0 → no decimals"
+        );
+        // Without a precision, the natural value is trimmed to at most 12 decimals.
+        assert_eq!(
+            format_number(1.5, None),
+            "1.5",
+            "no precision trims trailing zeros"
+        );
+        assert_eq!(
+            format_number(0.1 + 0.2, None),
+            "0.3",
+            "12-dp rounding hides binary noise"
+        );
+    }
+
+    #[test]
+    fn number_input_precision_should_not_round_on_passive_blur() {
+        let owner = Owner::new();
+        owner.set();
+        // Focusing then blurring a `.precision` field WITHOUT editing must not snap the value to the
+        // displayed precision (commit is a no-op when the text still shows the formatted value).
+        let value = RwSignal::new(1.005_f64);
+        let mut h = harness(number_input(value).precision(2));
+        click(&mut h, 20.0); // focus, no edit (display shows "1.00")
+        h.focus.current().set(None); // blur → commit
+        assert!(
+            (value.get_untracked() - 1.005).abs() < 1e-9,
+            "a passive focus->blur leaves the value intact (got {})",
+            value.get_untracked()
+        );
+        drop(owner);
     }
 
     #[test]
