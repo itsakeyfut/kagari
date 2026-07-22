@@ -124,6 +124,31 @@ impl TextBuffer {
         self.selection = if start == end { None } else { Some(start..end) };
     }
 
+    /// Select from a fixed `anchor` to `target`, placing the caret at `target` — the *moving* end of a mouse
+    /// drag. Unlike [`set_selection`](Self::set_selection) (which parks the caret at the range's max), this
+    /// lets a widget's horizontal auto-scroll follow the pointer in either drag direction (#353). Both offsets
+    /// are length-clamped and char-boundary-checked (a stray hit-test byte is rejected, no-op) so a later
+    /// `String` slice can never panic. Equal offsets collapse the selection.
+    pub fn select_to(&mut self, anchor: usize, target: usize) {
+        let anchor = anchor.min(self.text.len());
+        let target = target.min(self.text.len());
+        if !self.text.is_char_boundary(anchor) || !self.text.is_char_boundary(target) {
+            debug_assert!(
+                false,
+                "select_to: non-char-boundary anchor {anchor} / target {target}"
+            );
+            return;
+        }
+        self.coalescing = false;
+        self.goal_x = None;
+        self.cursor = target;
+        self.selection = if anchor == target {
+            None
+        } else {
+            Some(anchor.min(target)..anchor.max(target))
+        };
+    }
+
     // --- editing -----------------------------------------------------------------
 
     /// Insert `s` at the cursor, replacing the selection if any. Consecutive plain
@@ -905,5 +930,26 @@ mod tests {
         );
         buffer.move_vertical(false, false, &shaped);
         assert!(buffer.cursor() <= 5, "up returns onto line 1 (bytes 0..5)");
+    }
+
+    #[test]
+    fn select_to_should_range_and_caret_at_target() {
+        let mut buffer = TextBuffer::with_text("abcdef");
+        // Drag right: selection anchor..target, caret at the moving end (target).
+        buffer.select_to(1, 4);
+        assert_eq!(buffer.selection(), Some(1..4));
+        assert_eq!(buffer.cursor(), 4, "caret at the moving end (target)");
+        // Drag left past the anchor: normalised range, caret follows left.
+        buffer.select_to(4, 1);
+        assert_eq!(buffer.selection(), Some(1..4));
+        assert_eq!(buffer.cursor(), 1, "caret follows the pointer left");
+        // Equal offsets collapse the selection.
+        buffer.select_to(3, 3);
+        assert_eq!(buffer.selection(), None);
+        assert_eq!(buffer.cursor(), 3);
+        // Out-of-range target is clamped to the text length (no panic).
+        buffer.select_to(2, 999);
+        assert_eq!(buffer.selection(), Some(2..6));
+        assert_eq!(buffer.cursor(), 6);
     }
 }

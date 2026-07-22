@@ -431,8 +431,15 @@ impl<'a> EventCx<'a> {
     }
 
     /// Grabs the pointer to the node whose handler is running: subsequent mouse events route to it
-    /// (a drag grab) until the matching mouse-up or [`release_pointer`](Self::release_pointer).
+    /// (a drag grab) until the matching mouse-up or [`release_pointer`](Self::release_pointer). A no-op if no
+    /// current node is set — a leaf `Element` implementing `handle_event` must call `set_current` itself first
+    /// (as `Div` does before its handlers); the `debug_assert` makes a forgotten call fail loudly in tests
+    /// instead of a silent grab that never captures.
     pub fn capture_pointer(&mut self) {
+        debug_assert!(
+            self.current.is_some(),
+            "capture_pointer with no current node — call set_current(id) before capturing"
+        );
         if let Some(current) = self.current {
             self.capture = Some(CaptureOp::Capture(current));
         }

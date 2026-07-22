@@ -80,6 +80,9 @@ pub struct TextEdit {
     /// The horizontal scroll offset (px) applied in paint so the focused caret stays within the field (#72);
     /// cached so a mouse handler maps a click x back to the correct text byte.
     scroll_x: f32,
+    /// The fixed anchor byte of an in-progress mouse drag-select (#353); `Some` = dragging (the pointer is
+    /// captured), so a `Move` extends the selection from it. `None` = not dragging.
+    drag_anchor: Option<usize>,
     id: Option<NodeId>,
 }
 
@@ -107,6 +110,7 @@ pub fn text_edit(value: RwSignal<String>) -> TextEdit {
         shaped_content: None,
         last_bounds: Rect::default(),
         scroll_x: 0.0,
+        drag_anchor: None,
         id: None,
     }
 }
@@ -116,8 +120,8 @@ fn should_show_placeholder(has_placeholder: bool, is_empty: bool, is_focused: bo
     has_placeholder && is_empty && !is_focused
 }
 
-/// The outcome of a key/edit event for the leaf (#312): whether the leaf **handled** it (→ consume, so it
-/// does not bubble to ancestors) and whether paint state **changed** (→ repaint via the edit epoch).
+/// The outcome of a key / mouse / IME event for the leaf (#312): whether the leaf **handled** it (→ consume,
+/// so it does not bubble to ancestors) and whether paint state **changed** (→ repaint via the edit epoch).
 enum KeyOutcome {
     /// Handled, and the text/caret/selection changed → consume + repaint.
     Changed,
@@ -291,27 +295,65 @@ impl TextEdit {
         }
     }
 
-    /// Applies a mouse event; returns whether the caret/selection changed. Click-to-caret + Shift-click
-    /// extend (drag-select is a follow-up).
-    fn handle_mouse(&mut self, me: &MouseEvent) -> bool {
-        if let MouseKind::Down(MouseButton::Left) = me.kind {
-            self.handle.focus();
-            if let Some(shaped) = self.shaped.as_ref() {
-                // Map the window x to text-local x, adding back the horizontal scroll offset (#72) that paint
-                // applied, so a click lands on the correct byte when a long line is scrolled.
-                let x = me.pos.x - self.last_bounds.origin.x + self.scroll_x;
-                let byte = self.buffer.byte_at_point(shaped, x, 0.0);
-                if me.modifiers.shift {
-                    let anchor = self.buffer.cursor();
+    /// The text byte under a window x, mapping through the field origin + the paint-time horizontal scroll
+    /// offset (#72) so a click/drag on a long scrolled line lands on the right byte. `None` before the first
+    /// paint (no shaped text / bounds yet). `byte_at_point` clamps a past-the-text x to `[0, len]`.
+    fn byte_at(&self, window_x: f32) -> Option<usize> {
+        self.shaped.as_ref().map(|shaped| {
+            let x = window_x - self.last_bounds.origin.x + self.scroll_x;
+            self.buffer.byte_at_point(shaped, x, 0.0)
+        })
+    }
+
+    /// Applies a mouse event. Left-down places the caret (Shift-click extends) and begins a drag — capturing
+    /// the pointer so a `Move` past the field edge still extends; a captured `Move` extends the selection to
+    /// the pointer (#353); Up releases. Click / Shift-click / Ctrl+A are unchanged (the down path keeps
+    /// [`set_selection`](TextBuffer::set_selection); only the drag uses [`select_to`](TextBuffer::select_to)).
+    fn handle_mouse(&mut self, me: &MouseEvent, cx: &mut EventCx) -> KeyOutcome {
+        // Mark this leaf as the node whose handler is running, so `capture_pointer`/`release_pointer` grab
+        // THIS node (like `Div::handle_event` before its handlers) — otherwise the pointer grab is a no-op and
+        // a drag's `Move` past the field never routes back here.
+        if let Some(id) = self.id {
+            cx.set_current(id);
+        }
+        match me.kind {
+            MouseKind::Down(MouseButton::Left) => {
+                self.handle.focus();
+                if let Some(byte) = self.byte_at(me.pos.x) {
+                    // Anchor: the current caret when extending (Shift), else the click point.
+                    let anchor = if me.modifiers.shift {
+                        self.buffer.cursor()
+                    } else {
+                        byte
+                    };
                     self.buffer
                         .set_selection(anchor.min(byte)..anchor.max(byte));
+                    self.drag_anchor = Some(anchor);
+                    cx.capture_pointer();
+                }
+                KeyOutcome::Changed
+            }
+            MouseKind::Move => match (self.drag_anchor, self.byte_at(me.pos.x)) {
+                // Caret at the moving end (`byte`) so paint's horizontal auto-scroll follows the pointer.
+                (Some(anchor), Some(byte)) => {
+                    self.buffer.select_to(anchor, byte);
+                    KeyOutcome::Changed
+                }
+                // A bare hover (no drag in progress) never selects.
+                _ => KeyOutcome::Ignored,
+            },
+            MouseKind::Up(MouseButton::Left) => {
+                // `drag_anchor` is set on every left down (a plain click too, not only a real drag), so this
+                // consumes the up of any left press — the leaf handled the press — and releases the grab.
+                if self.drag_anchor.take().is_some() {
+                    cx.release_pointer();
+                    KeyOutcome::ConsumedUnchanged
                 } else {
-                    self.buffer.set_selection(byte..byte);
+                    KeyOutcome::Ignored
                 }
             }
-            return true;
+            _ => KeyOutcome::Ignored,
         }
-        false
     }
 }
 
@@ -515,13 +557,7 @@ impl Element for TextEdit {
                 self.buffer.apply_ime(ie.clone());
                 KeyOutcome::Changed
             }
-            Event::Mouse(me) => {
-                if self.handle_mouse(me) {
-                    KeyOutcome::Changed
-                } else {
-                    KeyOutcome::Ignored
-                }
-            }
+            Event::Mouse(me) => self.handle_mouse(me, cx),
             _ => KeyOutcome::Ignored,
         };
         // Consume only what the leaf handled — unhandled keys (Enter single-line, ArrowUp/Down, …) bubble to
@@ -718,6 +754,38 @@ mod tests {
         dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
     }
 
+    /// Dispatches a left-drag: down at the first x, a move at each subsequent x, then up at the last — sharing
+    /// ONE `DispatchState` so the pointer capture persists across the sequence (like the real shell).
+    fn drag(h: &mut Harness, xs: &[f32]) {
+        let mut dispatch = DispatchState::default();
+        for (i, &x) in xs.iter().enumerate() {
+            let kind = if i == 0 {
+                MouseKind::Down(MouseButton::Left)
+            } else {
+                MouseKind::Move
+            };
+            let ev = MouseEvent::new(kind, Point::new(x, 8.0), Modifiers::default());
+            dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
+        }
+        let up = MouseEvent::new(
+            MouseKind::Up(MouseButton::Left),
+            Point::new(*xs.last().unwrap(), 8.0),
+            Modifiers::default(),
+        );
+        dispatch_mouse(&mut h.root, &h.arena, &h.hit, &up, &mut dispatch);
+    }
+
+    /// Dispatches a Shift + left-button press at window x.
+    fn shift_click(h: &mut Harness, x: f32) {
+        let mut dispatch = DispatchState::default();
+        let mods = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let ev = MouseEvent::new(MouseKind::Down(MouseButton::Left), Point::new(x, 8.0), mods);
+        dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
+    }
+
     /// Dispatches an IME event to the (focused) editor.
     fn ime(h: &mut Harness, ev: ImeEvent) {
         dispatch_ime(&mut h.root, &h.arena, Some(h.root_id), &ev);
@@ -834,6 +902,107 @@ mod tests {
             "a click places the caret at the pointer, so the insert prepends"
         );
 
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_drag_should_select_range() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        // Down near the left (byte 0), then drag past the end (byte 3) → the whole text is selected; typing
+        // replaces the selection, so the value becomes just the typed char.
+        drag(&mut h, &[1.0, 250.0]);
+        press(&mut h, KeyCode::KeyX, Modifiers::default(), Some("X"));
+        assert_eq!(
+            value.get_untracked(),
+            "X",
+            "a drag selects the covered text; the type replaces it"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_drag_past_bounds_should_extend() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        // Down near the left (byte 0), then a captured move far past the right edge (way outside the field) —
+        // the move still extends to the end (byte 3) because the pointer is captured.
+        drag(&mut h, &[1.0, 5000.0]);
+        press(&mut h, KeyCode::KeyX, Modifiers::default(), Some("X"));
+        assert_eq!(
+            value.get_untracked(),
+            "X",
+            "pointer capture keeps the drag extending past the field bounds"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_bare_move_should_not_select() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        // A move with no prior down, dispatched IN-BOUNDS so it actually reaches the leaf's handle_mouse (an
+        // out-of-bounds x would be dropped at the dispatch layer and never exercise the no-drag Move guard).
+        let mut dispatch = DispatchState::default();
+        let mv = MouseEvent::new(MouseKind::Move, Point::new(1.0, 8.0), Modifiers::default());
+        dispatch_mouse(&mut h.root, &h.arena, &h.hit, &mv, &mut dispatch);
+        // A plain click then places a collapsed caret at the start; the insert prepends (nothing was selected).
+        click(&mut h, 1.0);
+        press(&mut h, KeyCode::KeyZ, Modifiers::default(), Some("Z"));
+        assert_eq!(
+            value.get_untracked(),
+            "Zabc",
+            "a bare hover never selects; the click just places the caret"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_shift_click_should_extend() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        // Focus + caret at byte 0, move the caret to the end (byte 3), then Shift-click back at byte 0 → the
+        // selection extends from the caret to the click, i.e. [0, 3] (no regression to the down path).
+        click(&mut h, 1.0);
+        press(&mut h, KeyCode::End, Modifiers::default(), None);
+        shift_click(&mut h, 1.0);
+        press(&mut h, KeyCode::KeyX, Modifiers::default(), Some("X"));
+        assert_eq!(
+            value.get_untracked(),
+            "X",
+            "Shift-click extends the selection to the pointer (unchanged behaviour)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_edit_release_should_end_the_drag() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new("abc".to_string());
+        let mut h = harness(value);
+        // Drag-select the whole text, then release (the Up must clear `drag_anchor`).
+        drag(&mut h, &[1.0, 250.0]);
+        // A move AFTER the release must not extend/collapse the selection (the drag ended). Had the Up failed
+        // to clear `drag_anchor`, this move would `select_to(0, 0)` and collapse the selection to nothing.
+        let mut dispatch = DispatchState::default();
+        let mv = MouseEvent::new(MouseKind::Move, Point::new(1.0, 8.0), Modifiers::default());
+        dispatch_mouse(&mut h.root, &h.arena, &h.hit, &mv, &mut dispatch);
+        // The [0, 3] selection persists → the type replaces it.
+        press(&mut h, KeyCode::KeyX, Modifiers::default(), Some("X"));
+        assert_eq!(
+            value.get_untracked(),
+            "X",
+            "a move after release does not extend the drag; the selection persists"
+        );
         drop(owner);
     }
 
