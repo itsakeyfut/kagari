@@ -112,6 +112,19 @@ impl Color {
         }
     }
 
+    /// Fade toward transparent by opacity `o` (element opacity, #356). Since the color is
+    /// premultiplied, scaling all four channels uniformly *is* an opacity fade — the result
+    /// stays a valid premultiplied color. `o = 1.0` is identity; `o = 0.0` is transparent.
+    /// Not clamped (callers clamp `o` to `[0, 1]`).
+    pub fn fade(self, o: f32) -> Self {
+        Color {
+            r: self.r * o,
+            g: self.g * o,
+            b: self.b * o,
+            a: self.a * o,
+        }
+    }
+
     /// Linear interpolation toward `other` by `t` (not clamped). Interpolating in
     /// premultiplied linear space avoids the dark fringing of straight-alpha lerps.
     pub fn lerp(self, other: Self, t: f32) -> Self {
@@ -321,6 +334,17 @@ mod tests {
             Color::new(0.0, 0.0, 0.0, 0.0).unpremultiply(),
             Color::TRANSPARENT
         );
+    }
+
+    #[test]
+    fn color_fade_should_scale_premultiplied_channels() {
+        // A premultiplied color at o=0.5 halves every channel (RGB and alpha together).
+        let c = Color::new(0.4, 0.6, 0.8, 1.0).fade(0.5);
+        assert!(color_close(c, 0.2, 0.3, 0.4, 0.5, 1e-6));
+        // o=1.0 is identity; o=0.0 is fully transparent.
+        let src = Color::new(0.4, 0.6, 0.8, 1.0);
+        assert!(color_close(src.fade(1.0), 0.4, 0.6, 0.8, 1.0, 1e-6));
+        assert!(color_close(src.fade(0.0), 0.0, 0.0, 0.0, 0.0, 1e-6));
     }
 
     #[test]

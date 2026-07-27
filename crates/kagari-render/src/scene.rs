@@ -37,6 +37,27 @@ pub enum Background {
     },
 }
 
+impl Background {
+    /// Fades this background by element opacity `o` (#356): the solid color, or both gradient stops,
+    /// scaled toward transparent. The gradient geometry (quad-local stop points) is unaffected.
+    pub fn fade(self, o: f32) -> Self {
+        match self {
+            Background::Solid(c) => Background::Solid(c.fade(o)),
+            Background::LinearGradient {
+                start,
+                end,
+                start_point,
+                end_point,
+            } => Background::LinearGradient {
+                start: start.fade(o),
+                end: end.fade(o),
+                start_point,
+                end_point,
+            },
+        }
+    }
+}
+
 /// Per-edge border widths plus a single border color.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Border {
@@ -216,6 +237,13 @@ impl Quad {
             left: w.left * t.scale,
         };
     }
+
+    /// Fades this quad by element opacity `o` (#356): background fill + border color scaled toward
+    /// transparent. Geometry (bounds, radii, border widths, mask) is unchanged — opacity is visual-only.
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.bg = self.bg.fade(o);
+        self.border.color = self.border.color.fade(o);
+    }
 }
 
 impl Shadow {
@@ -229,6 +257,11 @@ impl Shadow {
         self.blur *= t.scale;
         self.spread *= t.scale;
     }
+
+    /// Fades this shadow by element opacity `o` (#356): its color scaled toward transparent.
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.color = self.color.fade(o);
+    }
 }
 
 impl MonochromeSprite {
@@ -238,6 +271,12 @@ impl MonochromeSprite {
         self.bounds = t.map_rect(self.bounds);
         self.content_mask = map_mask(self.content_mask, t);
     }
+
+    /// Fades this glyph/coverage sprite by element opacity `o` (#356): the modulating color scaled
+    /// toward transparent (the shader multiplies the alpha tile by it, so the glyph fades).
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.color = self.color.fade(o);
+    }
 }
 
 impl PolychromeSprite {
@@ -245,6 +284,12 @@ impl PolychromeSprite {
     pub fn apply_transform(&mut self, t: &Transform) {
         self.bounds = t.map_rect(self.bounds);
         self.content_mask = map_mask(self.content_mask, t);
+    }
+
+    /// Fades this image sprite by element opacity `o` (#356): its `tint` scaled toward transparent.
+    /// The shader multiplies the premultiplied tile by `tint`, so scaling `tint` fades the image.
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.tint = self.tint.fade(o);
     }
 }
 
@@ -256,6 +301,12 @@ impl IconSprite {
         self.bounds = t.map_rect(self.bounds);
         self.content_mask = map_mask(self.content_mask, t);
     }
+
+    /// Fades this icon request by element opacity `o` (#356): its `tint` scaled toward transparent
+    /// (resolved into a tinted [`PolychromeSprite`] at render, so the drawn icon fades).
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.tint = self.tint.fade(o);
+    }
 }
 
 impl Underline {
@@ -265,6 +316,11 @@ impl Underline {
         self.rect = t.map_rect(self.rect);
         self.content_mask = map_mask(self.content_mask, t);
         self.thickness *= t.scale;
+    }
+
+    /// Fades this underline band by element opacity `o` (#356): its color scaled toward transparent.
+    pub fn apply_opacity(&mut self, o: f32) {
+        self.color = self.color.fade(o);
     }
 }
 
@@ -284,6 +340,19 @@ impl PathPrim {
                 v.mask_radii[1] * t.scale,
                 v.mask_radii[2] * t.scale,
                 v.mask_radii[3] * t.scale,
+            ];
+        }
+    }
+
+    /// Fades this tessellated path by element opacity `o` (#356): every vertex's flat premultiplied
+    /// color scaled toward transparent. The feather-AA pair and geometry are unchanged.
+    pub fn apply_opacity(&mut self, o: f32) {
+        for v in &mut self.vertices {
+            v.color = [
+                v.color[0] * o,
+                v.color[1] * o,
+                v.color[2] * o,
+                v.color[3] * o,
             ];
         }
     }
@@ -471,6 +540,124 @@ mod tests {
             },
             order,
         }
+    }
+
+    fn test_mask() -> RoundedRect {
+        RoundedRect {
+            rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            radii: Corners::default(),
+        }
+    }
+
+    fn test_coord() -> AtlasCoord {
+        AtlasCoord {
+            page: 0,
+            min: [0.0, 0.0],
+            max: [1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn apply_opacity_should_halve_primitive_alpha() {
+        // Quad: background fill + border color both fade.
+        let mut q = test_quad(0);
+        q.border.color = Color::new(0.4, 0.4, 0.4, 1.0);
+        q.apply_opacity(0.5);
+        assert_eq!(q.bg, Background::Solid(Color::new(0.5, 0.5, 0.5, 0.5)));
+        assert_eq!(q.border.color, Color::new(0.2, 0.2, 0.2, 0.5));
+
+        // Monochrome glyph sprite: modulating color fades.
+        let mut glyph = MonochromeSprite {
+            bounds: Rect::from_xywh(0.0, 0.0, 4.0, 4.0),
+            tex: test_coord(),
+            color: Color::new(1.0, 1.0, 1.0, 1.0),
+            content_mask: test_mask(),
+            order: 0,
+        };
+        glyph.apply_opacity(0.5);
+        assert_eq!(glyph.color, Color::new(0.5, 0.5, 0.5, 0.5));
+
+        // Polychrome image sprite: tint fades.
+        let mut img = PolychromeSprite {
+            bounds: Rect::from_xywh(0.0, 0.0, 4.0, 4.0),
+            tex: test_coord(),
+            tint: Color::new(1.0, 1.0, 1.0, 1.0),
+            content_mask: test_mask(),
+            order: 0,
+        };
+        img.apply_opacity(0.5);
+        assert_eq!(img.tint, Color::new(0.5, 0.5, 0.5, 0.5));
+
+        // Path: every vertex color fades.
+        let vtx = PathVertex {
+            position: [0.0, 0.0],
+            cov_a: 1.0,
+            cov_b: 0.0,
+            color: [0.4, 0.6, 0.8, 1.0],
+            mask_offset: [0.0, 0.0],
+            mask_half: [5.0, 5.0],
+            mask_radii: [0.0, 0.0, 0.0, 0.0],
+        };
+        let mut path = PathPrim::new(vec![vtx], vec![0], 0);
+        path.apply_opacity(0.5);
+        assert_eq!(path.vertices[0].color, [0.2, 0.3, 0.4, 0.5]);
+
+        // Shadow: its color fades (the drag ghost's `shadow_sm` relies on this).
+        let mut shadow = Shadow {
+            bounds: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            corner_radii: Corners::default(),
+            offset: Point::new(0.0, 2.0),
+            blur: 4.0,
+            spread: 0.0,
+            color: Color::new(0.4, 0.4, 0.4, 1.0),
+            content_mask: test_mask(),
+            order: 0,
+        };
+        shadow.apply_opacity(0.5);
+        assert_eq!(shadow.color, Color::new(0.2, 0.2, 0.2, 0.5));
+
+        // Underline: its color fades.
+        let mut underline = Underline {
+            rect: Rect::from_xywh(0.0, 0.0, 10.0, 1.0),
+            color: Color::new(0.4, 0.4, 0.4, 1.0),
+            style: UnderlineStyle::Solid,
+            thickness: 1.0,
+            content_mask: test_mask(),
+            order: 0,
+        };
+        underline.apply_opacity(0.5);
+        assert_eq!(underline.color, Color::new(0.2, 0.2, 0.2, 0.5));
+
+        // Icon request: its tint fades.
+        let mut icon = IconSprite {
+            bounds: Rect::from_xywh(0.0, 0.0, 16.0, 16.0),
+            icon: IconId::Check,
+            tint: Color::new(1.0, 1.0, 1.0, 1.0),
+            content_mask: test_mask(),
+            order: 0,
+        };
+        icon.apply_opacity(0.5);
+        assert_eq!(icon.tint, Color::new(0.5, 0.5, 0.5, 0.5));
+    }
+
+    #[test]
+    fn background_fade_should_scale_both_gradient_stops() {
+        let bg = Background::LinearGradient {
+            start: Color::new(0.4, 0.4, 0.4, 1.0),
+            end: Color::new(0.8, 0.8, 0.8, 1.0),
+            start_point: Point::new(0.0, 0.0),
+            end_point: Point::new(1.0, 1.0),
+        };
+        let faded = bg.fade(0.5);
+        assert_eq!(
+            faded,
+            Background::LinearGradient {
+                start: Color::new(0.2, 0.2, 0.2, 0.5),
+                end: Color::new(0.4, 0.4, 0.4, 0.5),
+                start_point: Point::new(0.0, 0.0),
+                end_point: Point::new(1.0, 1.0),
+            }
+        );
     }
 
     #[test]
