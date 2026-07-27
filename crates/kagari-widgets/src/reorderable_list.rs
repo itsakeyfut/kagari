@@ -54,9 +54,18 @@ fn insertion_line(drop_hint: RwSignal<Option<usize>>, p: usize) -> Div {
 
 /// One row: the item content, highlighted while it is the `active` (keyboard) row, draggable as a whole, and a
 /// drop target that moves the dragged item to this row's position (top half → before it, bottom half → after).
+///
+/// `item_fn` + `item` are also captured to build the **drag ghost** (#356): at drag-start the shell builds a
+/// translucent lifted copy of this row's content (`item_fn(&item)` inside an `opacity(0.6)` raised card) once,
+/// then repaints that stored element cursor-tracked above all content each frame (#172/#178).
+// An internal row builder threading the row's index, content, and the shared list signals — the arguments are
+// cohesive (all needed to wire one row's drag/drop/keyboard behavior), so a params struct would not aid clarity.
+#[allow(clippy::too_many_arguments)]
 fn build_row<T: Clone + PartialEq + Send + Sync + 'static>(
     i: usize,
     content: AnyElement,
+    item_fn: Rc<dyn Fn(&T) -> AnyElement>,
+    item: T,
     items: RwSignal<Vec<T>>,
     active: RwSignal<Option<usize>>,
     drop_hint: RwSignal<Option<usize>>,
@@ -76,6 +85,18 @@ fn build_row<T: Clone + PartialEq + Send + Sync + 'static>(
         }))
         .child(content)
         .drag_source(move || RowDrag(i))
+        // The drag ghost (#356): a translucent lifted card holding a copy of this row's content. The shell
+        // invokes this factory once at drag-start and repaints the stored element each frame (it is not
+        // re-invoked per frame); a reactive `item_fn`'s effects are scoped to the shell's per-drag owner and
+        // disposed at drag end (RK-020).
+        .drag_image(move || {
+            apply_size(div().flex().items_center(), size)
+                .opacity(0.6)
+                .bg(ColorRole::SurfaceRaised)
+                .rounded_md()
+                .shadow_sm()
+                .child(item_fn(&item))
+        })
         .drop_target::<RowDrag>(move |RowDrag(from), cx| {
             // The pointer's half of the row picks before (i) or after (i+1).
             let to = match cx.drag_pointer() {
@@ -169,6 +190,8 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> IntoElement for ReorderableLi
                     col = col.child(insertion_line(drop_hint, i)).child(build_row(
                         i,
                         item_fn(item),
+                        item_fn.clone(),
+                        item.clone(),
                         items,
                         active,
                         drop_hint,
@@ -234,6 +257,10 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> IntoElement for ReorderableLi
     }
 }
 
+// The drag ghost (#356): the shell's cursor-tracked painting is not headless-reachable, but the ghost ELEMENT
+// is — `dispatch_drag_start` returns it as the second tuple field (an `Option<AnyElement>`). So the ghost's
+// opacity/surface/content wiring is asserted by `drag_should_build_translucent_ghost` below (painting it into a
+// scene and checking the faded background quad); only the live cursor-follow is left to the example + manual QA.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +276,7 @@ mod tests {
     use kagari_core::paint::render_tree;
     use kagari_core::reactive::{Owner, provide_context};
     use kagari_layout::LayoutTree;
-    use kagari_render::Scene;
+    use kagari_render::{Background, Scene};
     use kagari_style::Theme;
     use kagari_text::{FontDb, TextSystem};
 
@@ -374,6 +401,53 @@ mod tests {
             items.get_untracked(),
             vec!['b', 'a', 'c'],
             "dragging 'a' onto row 2 (top half) moves it before 'c'"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn drag_should_build_translucent_ghost() {
+        // The drag ghost element (#356) is the second field of `dispatch_drag_start`. Paint it standalone and
+        // confirm its card is a `SurfaceRaised` fill faded to 0.6 opacity — pinning the `.drag_image` +
+        // `.opacity(0.6)` wiring (the live cursor-follow is shell-only, left to the example).
+        let owner = Owner::new();
+        owner.set();
+        let items = RwSignal::new(vec!['a', 'b', 'c']);
+        let mut h = harness(list_of(items));
+        let src = rows(&h)[0];
+        let (_payload, img) =
+            dispatch_drag_start(&mut h.root, &h.arena, src).expect("row is a drag source");
+        let mut ghost = img.expect("the row attaches a drag image");
+
+        let mut arena = Arena::new();
+        let mut layout = LayoutTree::new();
+        let mut text = TextSystem::new(FontDb::new());
+        let mut scene = Scene::new();
+        let damage = StdArc::new(DamageState::default());
+        render_tree(
+            &mut ghost,
+            &mut arena,
+            &mut layout,
+            &mut text,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut scene,
+            VIEWPORT,
+            &damage,
+            &h.theme,
+        )
+        .unwrap();
+
+        let raised = h.theme.resolve_color(ColorRole::SurfaceRaised);
+        assert!(!scene.quads.is_empty(), "the ghost paints a card quad");
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(raised.fade(0.6)),
+            "the ghost card is a SurfaceRaised fill faded to 0.6"
         );
         drop(owner);
     }

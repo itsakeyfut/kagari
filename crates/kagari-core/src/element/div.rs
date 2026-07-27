@@ -115,6 +115,11 @@ pub struct Div {
     /// overflow (the default); `true` = overflowing content is masked to the box (a dock region confines a
     /// panel's content). Unlike [`Scroll`](super::Scroll) this adds no scrolling/translation — just the mask.
     clip: bool,
+    /// Element opacity in `[0, 1]` ([`opacity`](Self::opacity), #356): `1.0` = fully opaque (the default, no
+    /// cost); `< 1.0` fades the whole subtree (this box's shadow/background/border plus every descendant) at
+    /// paint via [`PaintCx::push_opacity`]/[`pop_opacity`]. Visual-only — it does not affect layout or
+    /// hit-testing. Used e.g. for a translucent drag ghost.
+    opacity: f32,
 }
 
 /// A clone-shared handle to a [`Div`]'s last laid-out bounds (#84), published by
@@ -181,6 +186,7 @@ pub fn div() -> Div {
         a11y: None,
         a11y_checked: ReactiveProp::default(),
         a11y_value: None,
+        opacity: 1.0,
     }
 }
 
@@ -325,6 +331,23 @@ impl Div {
     /// the `Scroll` precedent).
     pub fn clip(mut self) -> Self {
         self.clip = true;
+        self
+    }
+
+    /// Sets the element opacity (#356): `o` in `[0, 1]` fades the whole subtree — this box's
+    /// shadow/background/border plus every descendant — as one composited layer at paint. `1.0` (the
+    /// default) is fully opaque with no cost; `0.0` is fully transparent. Nested opacities multiply. It is
+    /// visual-only: layout and hit-testing are unaffected (a faded element still receives events). Used for
+    /// a translucent drag ghost, a disabled overlay, or a fade. `o` is clamped to `[0, 1]`.
+    ///
+    /// **Composition boundary (MVP):** the fade is applied post-hoc over the scene primitives emitted by the
+    /// subtree (mirroring the #221 paint transform), so a portal that *escapes* the subtree's clip — an
+    /// [`Overlay`](super::Overlay) (menu / tooltip / modal scrim), which does `set_clip(None)` but does not
+    /// leave the opacity span — is faded along with the rest. Declare overlays at the window level, not inside
+    /// an `opacity(<1.0)` subtree, until this is addressed (same limitation as `transform`; see the render
+    /// design notes). The primary use — a top-level drag ghost — is unaffected.
+    pub fn opacity(mut self, o: f32) -> Self {
+        self.opacity = o.clamp(0.0, 1.0);
         self
     }
 
@@ -768,6 +791,15 @@ impl Element for Div {
             handle.store(bounds);
         }
 
+        // Element opacity (#356): open a fade layer around this whole subtree — the shadow/background/border
+        // below plus every descendant — so `pop_opacity` fades exactly them. `1.0` is opaque (no push); gated
+        // so the matching `pop_opacity` runs only when a frame was pushed (a bare `>=1.0` must not pop an
+        // outer frame). Visual-only: hit regions / a11y recorded below are not snapshotted, so unaffected.
+        let fade = self.opacity < 1.0;
+        if fade {
+            cx.push_opacity(self.opacity);
+        }
+
         // Corner radius from the `rounded` token (all corners equal); 0 when unset. Shared by the
         // shadow and the background quad so they round identically.
         let radius = self
@@ -942,6 +974,12 @@ impl Element for Div {
 
         if let Some(saved) = saved_clip {
             cx.set_clip(saved);
+        }
+
+        // Close the opacity layer (#356): fade every primitive emitted since the push by `self.opacity`.
+        // A nested child's own pop already ran, so this outer pop re-fades that range — composing the two.
+        if fade {
+            cx.pop_opacity();
         }
     }
 
@@ -1778,6 +1816,128 @@ mod tests {
         assert_eq!(scene.shadows[0].blur, 6.0);
         assert_eq!(scene.shadows[0].offset.y, 4.0);
         assert_eq!(scene.shadows[0].spread, -1.0);
+    }
+
+    #[test]
+    fn opacity_should_fade_subtree() {
+        // `div().opacity(0.5)` fades its own background quad *and* a child's quad by 0.5 (#356).
+        let theme = Theme::default();
+        let outer = Color::new(0.4, 0.6, 0.8, 1.0);
+        let inner = Color::new(0.2, 0.2, 0.2, 1.0);
+        let scene = render(
+            div()
+                .opacity(0.5)
+                .background(Background::Solid(outer))
+                .child(
+                    div()
+                        .size(Size { w: 10.0, h: 10.0 })
+                        .background(Background::Solid(inner)),
+                )
+                .into_element(),
+            &theme,
+        );
+        assert_eq!(scene.quads.len(), 2, "outer + child quads");
+        // quads[0] is the outer (painted first); quads[1] the child.
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(outer.fade(0.5)),
+            "the outer div's own background fades by 0.5"
+        );
+        assert_eq!(
+            scene.quads[1].bg,
+            Background::Solid(inner.fade(0.5)),
+            "the child's background fades by 0.5 too (whole subtree)"
+        );
+    }
+
+    #[test]
+    fn opacity_should_compose_when_nested() {
+        // A 0.5 opacity nested inside another 0.5 multiplies to 0.25 for the inner subtree (#356).
+        let theme = Theme::default();
+        let outer = Color::new(0.8, 0.8, 0.8, 1.0);
+        let inner = Color::new(0.4, 0.4, 0.4, 1.0);
+        let scene = render(
+            div()
+                .opacity(0.5)
+                .background(Background::Solid(outer))
+                .child(
+                    div()
+                        .opacity(0.5)
+                        .size(Size { w: 10.0, h: 10.0 })
+                        .background(Background::Solid(inner)),
+                )
+                .into_element(),
+            &theme,
+        );
+        assert_eq!(scene.quads.len(), 2);
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(outer.fade(0.5)),
+            "the outer quad fades by the outer opacity only"
+        );
+        assert_eq!(
+            scene.quads[1].bg,
+            Background::Solid(inner.fade(0.25)),
+            "the inner quad fades by inner*outer = 0.25"
+        );
+    }
+
+    #[test]
+    fn opacity_one_should_be_noop() {
+        // `opacity(1.0)` (the default) leaves the scene identical to no opacity at all (#356).
+        let theme = Theme::default();
+        let color = Color::new(0.4, 0.6, 0.8, 1.0);
+        let with = render(
+            div()
+                .opacity(1.0)
+                .background(Background::Solid(color))
+                .into_element(),
+            &theme,
+        );
+        let without = render(
+            div().background(Background::Solid(color)).into_element(),
+            &theme,
+        );
+        assert_eq!(with.quads.len(), 1);
+        assert_eq!(with.quads[0].bg, without.quads[0].bg);
+        assert_eq!(with.quads[0].bg, Background::Solid(color));
+    }
+
+    #[test]
+    fn opacity_should_not_leak_to_later_sibling() {
+        // Regression guard for push/pop symmetry (#356): an opaque sibling painted AFTER an opacity(0.5)
+        // sibling must stay unfaded. A mis-paired pop (leaked frame / wrong range) would fade it too.
+        let theme = Theme::default();
+        let faded = Color::new(0.4, 0.6, 0.8, 1.0);
+        let opaque = Color::new(0.2, 0.2, 0.2, 1.0);
+        let scene = render(
+            div()
+                .flex_col()
+                .child(
+                    div()
+                        .size(Size { w: 10.0, h: 10.0 })
+                        .opacity(0.5)
+                        .background(Background::Solid(faded)),
+                )
+                .child(
+                    div()
+                        .size(Size { w: 10.0, h: 10.0 })
+                        .background(Background::Solid(opaque)),
+                )
+                .into_element(),
+            &theme,
+        );
+        assert_eq!(scene.quads.len(), 2);
+        assert_eq!(
+            scene.quads[0].bg,
+            Background::Solid(faded.fade(0.5)),
+            "the opacity(0.5) sibling fades"
+        );
+        assert_eq!(
+            scene.quads[1].bg,
+            Background::Solid(opaque),
+            "the later opaque sibling is NOT faded (no stack leak)"
+        );
     }
 
     #[test]

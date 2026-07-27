@@ -46,6 +46,21 @@ struct TransformFrame {
     hits: usize,
 }
 
+/// One active element opacity (#356) plus the primitive counts captured when it was pushed, so
+/// [`pop_opacity`](PaintCx::pop_opacity) fades exactly the primitives emitted while it was active.
+/// Unlike [`TransformFrame`], it snapshots no hit-region count — opacity is visual-only and must not
+/// affect hit-testing.
+struct OpacityFrame {
+    o: f32,
+    shadows: usize,
+    quads: usize,
+    paths: usize,
+    images: usize,
+    glyphs: usize,
+    underlines: usize,
+    icons: usize,
+}
+
 /// Sink for damage raised when a reactive prop re-resolves. #31 wires the hook (a reactive
 /// paint prop's effect calls [`DamageSink::mark_paint_dirty`]); #35 implements the real
 /// layout/paint-dirty tracking and damage rects behind it ([`DamageState`](crate::damage::DamageState)).
@@ -129,6 +144,10 @@ pub struct PaintCx<'a> {
     /// on pop, the primitives + hit regions emitted since are mapped. Empty = identity (no per-primitive
     /// cost when unused).
     transforms: Vec<TransformFrame>,
+    /// The active element-opacity stack (#356): an opaque `< 1.0` opacity pushes a frame around its
+    /// subtree; on pop, the primitives emitted since are faded. Empty = fully opaque (no per-primitive
+    /// cost when unused). Nested opacities compose by range re-fade (inner × outer), like transforms.
+    opacities: Vec<OpacityFrame>,
 }
 
 impl<'a> PaintCx<'a> {
@@ -155,6 +174,7 @@ impl<'a> PaintCx<'a> {
             viewport: Size { w: 0.0, h: 0.0 },
             a11y: None,
             transforms: Vec::new(),
+            opacities: Vec::new(),
         }
     }
 
@@ -217,6 +237,58 @@ impl<'a> PaintCx<'a> {
         self.transforms
             .iter()
             .fold(Transform::IDENTITY, |acc, f| acc.compose(f.t))
+    }
+
+    /// Pushes an element opacity (#356): primitives emitted until the matching [`pop_opacity`](Self::pop_opacity)
+    /// are faded by `o` in window space. Nested pushes compose (inner × outer). Snapshots the current primitive
+    /// counts so only the enclosed geometry is faded. `o >= 1.0` is a no-op (nothing pushed — fully opaque fast
+    /// path); callers clamp `o` to `[0, 1]`. Unlike [`push_transform`](Self::push_transform), it does not snapshot
+    /// hit regions — opacity is visual-only and must not affect hit-testing.
+    pub fn push_opacity(&mut self, o: f32) {
+        if o >= 1.0 {
+            return;
+        }
+        self.opacities.push(OpacityFrame {
+            o,
+            shadows: self.scene.shadows.len(),
+            quads: self.scene.quads.len(),
+            paths: self.scene.paths.len(),
+            images: self.scene.images.len(),
+            glyphs: self.scene.glyphs.len(),
+            underlines: self.scene.underlines.len(),
+            icons: self.scene.icons.len(),
+        });
+    }
+
+    /// Fades every primitive emitted since the matching [`push_opacity`](Self::push_opacity) by that opacity,
+    /// then pops it. Must be paired with a `push_opacity` that actually pushed (i.e. `o < 1.0`); a no-op push
+    /// (`o >= 1.0`) must not be popped. A nested inner pop fades first, so the outer pop re-fades the same range
+    /// — composing `inner * outer` (no explicit composition needed at pop).
+    pub fn pop_opacity(&mut self) {
+        let Some(f) = self.opacities.pop() else {
+            return;
+        };
+        for s in &mut self.scene.shadows[f.shadows..] {
+            s.apply_opacity(f.o);
+        }
+        for q in &mut self.scene.quads[f.quads..] {
+            q.apply_opacity(f.o);
+        }
+        for p in &mut self.scene.paths[f.paths..] {
+            p.apply_opacity(f.o);
+        }
+        for i in &mut self.scene.images[f.images..] {
+            i.apply_opacity(f.o);
+        }
+        for g in &mut self.scene.glyphs[f.glyphs..] {
+            g.apply_opacity(f.o);
+        }
+        for u in &mut self.scene.underlines[f.underlines..] {
+            u.apply_opacity(f.o);
+        }
+        for ic in &mut self.scene.icons[f.icons..] {
+            ic.apply_opacity(f.o);
+        }
     }
 
     /// Sets the window viewport size for anchored-overlay placement (#175); `render_tree` calls this.
