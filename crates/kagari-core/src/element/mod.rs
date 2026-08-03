@@ -28,7 +28,7 @@ pub use scroll::{Scroll, ScrollHandle, scroll};
 pub use text::{Text, text};
 pub use text_edit::{TextEdit, text_edit};
 pub use transform::{TransformOrigin, Transformed, transform};
-pub use virtualized::{VirtualizedList, virtualized_list};
+pub use virtualized::{VirtualizedList, virtualized_list, virtualized_list_keyed};
 
 use kagari_base::{NodeId, Rect};
 

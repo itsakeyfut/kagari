@@ -5,7 +5,9 @@
 //! Run with: `cargo run -p kagari-widgets --example table`
 //!
 //! A 500-row table with three columns and a sticky header; the body virtualizes (only the visible rows are
-//! built) and scrolls with the mouse wheel. Click a row to select it (the selected row tints Accent).
+//! built) and scrolls with the mouse wheel. Click a row to select it (the selected row tints Accent). Every
+//! column is **sortable** (#325): click a header to cycle `Asc → Desc → none` (a `▲`/`▼` marks the active one);
+//! the rows reorder without stale cells and the selection stays on its logical row.
 
 use kagari_base::Px;
 use kagari_core::reactive::RwSignal;
@@ -42,9 +44,19 @@ fn main() -> Result<(), kagari_core::AppError> {
             let selection = RwSignal::new(Selection::none());
             div().p_4().bg(ColorRole::Surface).child(
                 table(clips(500))
-                    .column("Name", 180.0, |c: &Clip| cell(c.name.clone()))
-                    .column("Duration", 90.0, |c: &Clip| cell(c.duration.clone()))
-                    .column("Kind", 80.0, |c: &Clip| cell(c.kind))
+                    .column_sortable(
+                        "Name",
+                        180.0,
+                        |c: &Clip| cell(c.name.clone()),
+                        |c: &Clip| c.name.clone(),
+                    )
+                    .column_sortable(
+                        "Duration",
+                        90.0,
+                        |c: &Clip| cell(c.duration.clone()),
+                        |c: &Clip| c.duration.clone(),
+                    )
+                    .column_sortable("Kind", 80.0, |c: &Clip| cell(c.kind), |c: &Clip| c.kind)
                     .selection(selection)
                     .height(360.0),
             )

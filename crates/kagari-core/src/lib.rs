@@ -38,7 +38,7 @@ pub use dock::{DockChild, DockNode, DockTarget, DockTree, DropZone, PanelId, dro
 pub use element::{
     AnchorHandle, AnyElement, BoundsHandle, Element, Icon, IntoElement, Placement, ScrollHandle,
     TextEdit, TransformOrigin, Transformed, div, icon, overlay, scroll, text, text_edit, transform,
-    virtualized_list,
+    virtualized_list, virtualized_list_keyed,
 };
 pub use error::AppError;
 pub use event::{

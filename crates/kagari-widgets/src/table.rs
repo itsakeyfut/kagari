@@ -8,11 +8,18 @@
 //! `cell` renderer `Fn(&R) -> impl IntoElement`. Selection is **controlled** via `RwSignal<Selection>` (D2);
 //! a clicked row's **logical index** becomes the selection and its row is tinted.
 //!
-//! MVP scope (Phase-1): render + single-select. **Follow-ups**: header sort, keyboard row nav, resizable
-//! columns, multi-select, DataGrid editable cells (a cell can already *be* a `text_input` bound to a
-//! `RwSignal` field of `R`), reactive/streaming rows, horizontal scroll. The Table builds the core element and
-//! owns the body `ScrollHandle`, so keyboard-nav / scroll-restore can land additively.
+//! Sortable columns (#325): a column added with [`.column_sortable`](Table::column_sortable) gets a clickable
+//! header that cycles `Asc → Desc → none`, reordering the rows by that column's key (with a `▲`/`▼` indicator).
+//! Sort is keyed on the **logical row id** through the core's
+//! [`virtualized_list_keyed`](kagari_core::virtualized_list_keyed), so re-sorting never leaves stale cells and
+//! selection tracks the logical row across a sort.
+//!
+//! MVP scope: render + single-select + single-column sort. **Follow-ups**: keyboard row nav, resizable columns,
+//! multi-column (Shift-click) sort, multi-select, DataGrid editable cells (a cell can already *be* a `text_input`
+//! bound to a `RwSignal` field of `R`), reactive/streaming rows, horizontal scroll. The Table builds the core
+//! element and owns the body `ScrollHandle`, so keyboard-nav / scroll-restore can land additively.
 
+use std::cmp::Ordering;
 use std::rc::Rc;
 
 use kagari_base::{Point, SharedString, Size};
@@ -21,7 +28,7 @@ use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
 use kagari_core::{
     AnyElement, IntoElement, MouseKind, ScrollHandle, div, text,
-    virtualized_list as core_virtualized_list,
+    virtualized_list_keyed as core_virtualized_list_keyed,
 };
 use kagari_style::{ColorRole, Styled};
 
@@ -55,11 +62,44 @@ impl Selection {
     }
 }
 
-/// One table column: a header label, a fixed width, and a per-row cell renderer.
+/// A boxed row comparator: a sortable column's `key` extractor is erased into this (#325).
+type RowCmp<R> = Box<dyn Fn(&R, &R) -> Ordering>;
+
+/// One table column: a header label, a fixed width, a per-row cell renderer, and (when sortable, #325) a
+/// comparator used to order the rows when this column's header is clicked.
 struct Column<R> {
     header: SharedString,
     width: f32,
     cell: Box<dyn Fn(&R) -> AnyElement>,
+    sort: Option<RowCmp<R>>,
+}
+
+/// A sort direction (#325). A sortable header cycles `Asc → Desc → none` on successive clicks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// The display→logical row permutation for `sort` (#325): `(0..count)` stably ordered by the active column's
+/// comparator (reversed for `Desc`). Identity when nothing is sorted or the column carries no comparator. Stable,
+/// so equal keys keep their input order and the `None` state restores the original row order.
+fn sort_order<R>(
+    sort: Option<(usize, SortDir)>,
+    rows: &[R],
+    columns: &[Column<R>],
+    count: usize,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..count).collect();
+    if let Some((col, dir)) = sort {
+        if let Some(cmp) = columns.get(col).and_then(|c| c.sort.as_ref()) {
+            order.sort_by(|&a, &b| {
+                let o = cmp(&rows[a], &rows[b]);
+                if dir == SortDir::Desc { o.reverse() } else { o }
+            });
+        }
+    }
+    order
 }
 
 /// A columnar table with a sticky header and a virtualized body (#224). Build with [`table`], add columns with
@@ -101,6 +141,27 @@ impl<R: 'static> Table<R> {
             header: header.into(),
             width,
             cell: Box::new(move |r| cell(r).into_element()),
+            sort: None,
+        });
+        self
+    }
+
+    /// Appends a **sortable** column (#325): like [`.column`](Self::column) plus a `key` extractor — clicking this
+    /// column's header cycles asc/desc/none and reorders the rows by `key(row)` (`K: Ord`; the key is boxed into a
+    /// comparator internally, so columns may sort on different key types). A `▲`/`▼` indicator marks the active
+    /// column and direction.
+    pub fn column_sortable<E: IntoElement, K: Ord + 'static>(
+        mut self,
+        header: impl Into<SharedString>,
+        width: f32,
+        cell: impl Fn(&R) -> E + 'static,
+        key: impl Fn(&R) -> K + 'static,
+    ) -> Self {
+        self.columns.push(Column {
+            header: header.into(),
+            width,
+            cell: Box::new(move |r| cell(r).into_element()),
+            sort: Some(Box::new(move |a, b| key(a).cmp(&key(b)))),
         });
         self
     }
@@ -213,33 +274,67 @@ impl<R: 'static> IntoElement for Table<R> {
         let rows = Rc::new(rows);
         let columns = Rc::new(columns);
 
-        // Sticky header (non-virtualized): a raised flex row of fixed-width header cells.
+        // Sort state (#325): `sort_signal` drives the header indicator; `order_signal` is the display→logical row
+        // permutation the body's key_fn reads. Created once, before the header (its clicks write both).
+        let sort_signal = RwSignal::new(None::<(usize, SortDir)>);
+        let order_signal = RwSignal::new((0..count).collect::<Vec<usize>>());
+
+        // Sticky header (non-virtualized): a raised flex row of fixed-width header cells. A sortable column's cell
+        // gets a `▲`/`▼` indicator and a click that cycles asc→desc→none and recomputes the row order.
         let mut header = div().flex().bg(ColorRole::SurfaceRaised);
-        for c in columns.iter() {
-            header = header.child(
-                hpad(
-                    div().size(Size {
-                        w: c.width,
-                        h: header_h,
-                    }),
-                    size,
-                )
-                .items_center()
-                .child(
-                    text(c.header.clone())
-                        .size(font)
-                        .color_role(ColorRole::Text),
-                ),
+        for (ci, c) in columns.iter().enumerate() {
+            let mut cell = hpad(
+                div().size(Size {
+                    w: c.width,
+                    h: header_h,
+                }),
+                size,
+            )
+            .flex()
+            .items_center()
+            .child(
+                text(c.header.clone())
+                    .size(font)
+                    .color_role(ColorRole::Text),
             );
+            if c.sort.is_some() {
+                cell = cell.child(
+                    text(rx(move || match sort_signal.get() {
+                        Some((cc, SortDir::Asc)) if cc == ci => SharedString::from(" ▲"),
+                        Some((cc, SortDir::Desc)) if cc == ci => SharedString::from(" ▼"),
+                        _ => SharedString::from(""),
+                    }))
+                    .size(font)
+                    .color_role(ColorRole::TextMuted),
+                );
+                // The click cycles this column's 3-state sort and recomputes the order. It captures the row/column
+                // `Rc`s to sort by the active comparator — fine, a `Div` handler is not `Send + Sync` (like Menu).
+                let rows_h = rows.clone();
+                let cols_h = columns.clone();
+                cell = cell.on_click(move |_, _| {
+                    let next = match sort_signal.get_untracked() {
+                        Some((cc, SortDir::Asc)) if cc == ci => Some((ci, SortDir::Desc)),
+                        Some((cc, SortDir::Desc)) if cc == ci => None,
+                        _ => Some((ci, SortDir::Asc)),
+                    };
+                    order_signal.set(sort_order(next, &rows_h, &cols_h, count));
+                    sort_signal.set(next);
+                });
+            }
+            header = header.child(cell);
         }
 
         // Virtualized body: build the CORE element so the Table owns the scroll handle (forward-fits
-        // keyboard-nav / scroll-restore); re-add the wheel handler (the widget's ~8-line version).
+        // keyboard-nav / scroll-restore); re-add the wheel handler (the widget's ~8-line version). The **keyed**
+        // core (#325 / RK-049) identifies rows by their **logical id** (`order[slot]`), so a re-sort repositions
+        // rows without stale cells; `build_row` is unchanged (it builds `rows[id]` by logical index, so selection
+        // tracks the logical row across a sort). `key_fn` is `Send + Sync` (captures only the order signal).
         let handle = ScrollHandle::new();
         let max_y = (count as f32 * row_h - body_height).max(0.0);
         let rows_b = rows.clone();
         let cols_b = columns.clone();
-        let core = core_virtualized_list(
+        let key_fn = move |slot: usize| order_signal.with(|o| o[slot]);
+        let core = core_virtualized_list_keyed(
             row_h,
             count,
             Size {
@@ -247,7 +342,8 @@ impl<R: 'static> IntoElement for Table<R> {
                 h: body_height,
             },
             &handle,
-            move |i| build_row(i, &rows_b, &cols_b, selection, total_w, row_h, size),
+            key_fn,
+            move |id| build_row(id, &rows_b, &cols_b, selection, total_w, row_h, size),
         );
         let wheel = handle.clone();
         let body = div()
@@ -257,7 +353,10 @@ impl<R: 'static> IntoElement for Table<R> {
             })
             .on_wheel(move |ev, _| {
                 if let MouseKind::Wheel { dy, .. } = ev.kind {
-                    let next = (wheel.offset().y - dy * row_h).clamp(0.0, max_y);
+                    // `dy` is already a logical-pixel scroll distance (the app layer scales a wheel notch by
+                    // `WHEEL_LINE_PX`), so apply it directly — multiplying by `row_h` again over-scrolls by a
+                    // whole row-height per pixel.
+                    let next = (wheel.offset().y - dy).clamp(0.0, max_y);
                     wheel.jump_to(Point::new(0.0, next));
                 }
             })
@@ -488,6 +587,263 @@ mod tests {
             body_rows(&h).len(),
             0,
             "a zero-row table renders the header but no body rows"
+        );
+        drop(owner);
+    }
+
+    /// `n` rows whose age is the permutation `age(i) = (i + 1) % n`, so the logical order is neither ascending nor
+    /// descending in age — sorting genuinely reorders and asc/desc/none each put a distinct logical row at slot 0.
+    fn perm_rows(n: usize) -> Vec<Row> {
+        (0..n)
+            .map(|i| Row {
+                name: "row",
+                age: ((i + 1) % n) as u32,
+            })
+            .collect()
+    }
+
+    /// A table over [`perm_rows`] whose column 1 (`Age`) is **sortable** by `age`, in a 100px body (so it
+    /// virtualizes), optionally wired to `sel`.
+    fn sortable_table(n: usize, sel: Option<RwSignal<Selection>>) -> AnyElement {
+        let mut t = table(perm_rows(n))
+            .column("Name", 120.0, |r: &Row| text(r.name))
+            .column_sortable(
+                "Age",
+                80.0,
+                |r: &Row| text(format!("{}", r.age)),
+                |r: &Row| r.age,
+            )
+            .size(ControlSize::Md)
+            .height(100.0);
+        if let Some(s) = sel {
+            t = t.selection(s);
+        }
+        t.into_element()
+    }
+
+    /// Clicks the header cell for column `col` (its `on_click` cycles that column's sort when sortable).
+    fn click_header(h: &mut Harness, col: usize) {
+        let header = h.arena.get(h.root_id).unwrap().children[0];
+        let cell = h.arena.get(header).unwrap().children[col];
+        let cb = h.layout.absolute_layout(cell);
+        let p = Point::new(cb.origin.x + cb.size.w / 2.0, cb.origin.y + cb.size.h / 2.0);
+        let mut dispatch = DispatchState::default();
+        for kind in [
+            MouseKind::Down(MouseButton::Left),
+            MouseKind::Up(MouseButton::Left),
+        ] {
+            let ev = MouseEvent::new(kind, p, Modifiers::default());
+            dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
+        }
+    }
+
+    /// Scrolls the body by dispatching a wheel event over it (the body's handler jumps by `dy` logical px, no spring).
+    fn wheel(h: &mut Harness, dy: f32) {
+        let body = h.arena.get(h.root_id).unwrap().children[2];
+        let bb = h.layout.absolute_layout(body);
+        let p = Point::new(bb.origin.x + 10.0, bb.origin.y + 10.0);
+        let ev = MouseEvent::new(MouseKind::Wheel { dx: 0.0, dy }, p, Modifiers::default());
+        let mut dispatch = DispatchState::default();
+        dispatch_mouse(&mut h.root, &h.arena, &h.hit, &ev, &mut dispatch);
+    }
+
+    #[test]
+    fn table_header_should_sort() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sortable_table(100, Some(sel)));
+
+        // Unsorted: identity order → slot 0 is logical row 0.
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "unsorted: slot 0 is logical row 0"
+        );
+        // Ascending by age: the smallest age (logical row 99, age 0) rises to slot 0.
+        click_header(&mut h, 1);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(99),
+            "ascending by age puts logical row 99 (age 0) at slot 0"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_sort_should_cycle_asc_desc_none() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sortable_table(100, Some(sel)));
+
+        // Each header click advances Asc → Desc → none; slot 0's logical row is distinct in each state.
+        click_header(&mut h, 1);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(99),
+            "1st click → ascending (logical 99 at slot 0)"
+        );
+        click_header(&mut h, 1);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(98),
+            "2nd click → descending (logical 98 at slot 0)"
+        );
+        click_header(&mut h, 1);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "3rd click → unsorted (logical 0 at slot 0)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_sort_should_keep_logical_selection() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sortable_table(100, Some(sel)));
+
+        // Select logical row 99 while unsorted — far down and NOT realized (virtualized), so no tint yet.
+        sel.set(Selection::single(99));
+        let accent = h.theme.resolve_color(ColorRole::Accent);
+        let (_, scene) = frame(&mut h);
+        assert!(
+            !scene
+                .quads
+                .iter()
+                .any(|q| q.bg == kagari_render::Background::Solid(accent)),
+            "the selected logical row is scrolled out of the window, so nothing tints"
+        );
+        // Sort ascending → logical 99 (age 0) moves to slot 0, is realized, and still paints its Accent tint.
+        click_header(&mut h, 1);
+        let (_, scene) = frame(&mut h);
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|q| q.bg == kagari_render::Background::Solid(accent)),
+            "the selected logical row rides the sort into view and stays tinted"
+        );
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(99),
+            "sorting does not change the logical selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_sort_then_scroll_should_not_stale() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sortable_table(100, Some(sel)));
+
+        // Ascending → order = [99, 0, 1, 2, 3, 4, …]; then scroll down exactly 5 rows. `dy` is in logical pixels,
+        // so 5 rows == `5 * row_h` px (the handler applies `dy` directly).
+        click_header(&mut h, 1);
+        frame(&mut h);
+        wheel(&mut h, -5.0 * default_row_height(ControlSize::Md));
+        frame(&mut h);
+        // With an exact 5-row offset the top slot paints slot 5 = order[5] = logical row 4. A stale/mis-keyed body
+        // would select the wrong logical row here.
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(4),
+            "after sort+scroll the top slot maps to the correct logical row (no stale cell)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_sort_should_keep_input_order_for_equal_keys() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        // Two tie groups: odd logical rows have age 0, even rows have age 1. An ascending sort must place the
+        // whole age-0 group (the odd indices) first AND keep them in input (logical) order — a *stable* sort.
+        let rows: Vec<Row> = (0..100)
+            .map(|i| Row {
+                name: "row",
+                age: if i % 2 == 0 { 1 } else { 0 },
+            })
+            .collect();
+        let mut h = harness(
+            table(rows)
+                .column("Name", 120.0, |r: &Row| text(r.name))
+                .column_sortable(
+                    "Age",
+                    80.0,
+                    |r: &Row| text(format!("{}", r.age)),
+                    |r: &Row| r.age,
+                )
+                .size(ControlSize::Md)
+                .height(100.0)
+                .selection(sel)
+                .into_element(),
+        );
+        click_header(&mut h, 1);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(1),
+            "ascending: the first age-0 tie row is logical 1 (stable → lowest input index first)"
+        );
+        click_row(&mut h, 1);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(3),
+            "ascending: the second age-0 tie row is logical 3 (ties keep input order)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_nonsortable_header_click_should_not_reorder() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sortable_table(100, Some(sel)));
+        // Column 0 ("Name") is a plain non-sortable column (no comparator, no click handler) → clicking its
+        // header is inert and must not reorder the body.
+        click_header(&mut h, 0);
+        frame(&mut h);
+        click_row(&mut h, 0);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "clicking a non-sortable header leaves the order unchanged (slot 0 stays logical 0)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_empty_header_click_should_not_panic() {
+        let owner = Owner::new();
+        owner.set();
+        // A 0-row table still builds a sortable header; clicking it computes `sort_order` over `0..0` and an
+        // empty `order` the (never-called) key_fn would read — this must not panic.
+        let mut h = harness(sortable_table(0, None));
+        click_header(&mut h, 1);
+        frame(&mut h);
+        assert_eq!(
+            body_rows(&h).len(),
+            0,
+            "an empty table has no body rows after a header click"
         );
         drop(owner);
     }

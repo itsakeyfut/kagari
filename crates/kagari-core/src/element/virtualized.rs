@@ -1,7 +1,10 @@
 //! The [`VirtualizedList`] element (#61): a fixed-height virtualized list that realizes only the rows
 //! in the visible range (plus a buffer), reusing [`DynList`](super::DynList)'s keyed reconcile. It
-//! reads a [`ScrollHandle`] offset, positions each realized row at `index * item_height - offset`, and
-//! clips to a fixed viewport (a standalone virtual viewport — not nested in a #60 `Scroll`).
+//! reads a [`ScrollHandle`] offset, positions each realized row by its display slot at
+//! `slot * item_height - offset`, and clips to a fixed viewport (a standalone virtual viewport — not
+//! nested in a #60 `Scroll`). The inner reconcile keys rows on a caller-supplied **logical id** (default
+//! identity = the slot, via [`virtualized_list`]; a re-mapping caller uses [`virtualized_list_keyed`],
+//! #325/RK-049), and paint positions by realized order so a re-key repositions rows without stale cells.
 
 use kagari_base::{Color, Corners, Edges, NodeId, Point, Rect, Size};
 use kagari_layout::scroll::{thumb, thumb_drag_to_offset, visible_range};
@@ -29,8 +32,11 @@ struct ThumbDragV {
 }
 
 /// A fixed-height virtualized list: only the rows intersecting the viewport (± a buffer) are built,
-/// and an offset change incrementally realizes/releases rows by index key (in-range rows keep their
-/// `NodeId`). Rows are `item_height` tall and positioned at `index * item_height - offset`.
+/// and an offset change incrementally realizes/releases rows by their **logical-id key** (in-range ids
+/// keep their `NodeId`). Rows are `item_height` tall and positioned by their display slot at
+/// `slot * item_height - offset` (realized in slot order, so the n-th realized row is the n-th visible
+/// slot). The key defaults to the slot itself ([`virtualized_list`], identity); a caller whose slot→row
+/// mapping changes uses [`virtualized_list_keyed`] so a re-key repositions rows without stale cells.
 ///
 /// Built with [`virtualized_list`]. The offset comes from a [`ScrollHandle`] (shared with a scroll
 /// gesture / #60 scrollbar); [`reconcile`](Self::reconcile) applies a scroll's range change (the
@@ -53,7 +59,10 @@ pub struct VirtualizedList {
 
 /// Creates a fixed-height virtualized list of `count` rows, each `item_height` tall, clipped to
 /// `viewport`. `view_fn(index)` builds row `index`; the offset is read from `offset`. Only the rows
-/// in the visible range (± a buffer) are ever built.
+/// in the visible range (± a buffer) are ever built. Rows are keyed by their display index — correct
+/// for a **fixed** dataset (a scroll reuses in-range rows), but if the *mapping* from display slot to
+/// underlying row changes (e.g. a re-sort or filter over the same slots), use
+/// [`virtualized_list_keyed`] so kept rows refresh (RK-049).
 pub fn virtualized_list<V, F>(
     item_height: f32,
     count: usize,
@@ -65,24 +74,52 @@ where
     F: Fn(usize) -> V + 'static,
     V: IntoElement,
 {
+    // The default identity key: the logical id of display slot `s` is `s` — behaviour identical to the
+    // pre-#325 list (paint by realized order == paint by slot when the key is the slot).
+    virtualized_list_keyed(item_height, count, viewport, offset, |slot| slot, view_fn)
+}
+
+/// Like [`virtualized_list`], but the inner keyed reconcile identifies rows by a **logical id** rather than the
+/// display slot: `key_fn(slot)` maps a display slot to the id of the row shown there, and `view_fn(id)` builds a
+/// row **for that id** (from stable, id-addressed data). This fixes the stale-cell trap (RK-049) when the slot→row
+/// mapping changes without changing the visible slot set — a header **re-sort** (#325) or a filter: a kept id keeps
+/// its (already-correct) node and is repositioned to its new slot, a newly-visible id is built fresh, and a
+/// no-longer-visible id is disposed. `key_fn` is read inside the staging effect, so it must be `Send + Sync` and
+/// reactive reads inside it (e.g. a sort-order signal) subscribe the list — a re-key then triggers a reconcile.
+pub fn virtualized_list_keyed<V, F, K>(
+    item_height: f32,
+    count: usize,
+    viewport: Size,
+    offset: &ScrollHandle,
+    key_fn: K,
+    view_fn: F,
+) -> VirtualizedList
+where
+    F: Fn(usize) -> V + 'static,
+    V: IntoElement,
+    K: Fn(usize) -> usize + Send + Sync + 'static,
+{
     let handle = offset.clone();
     let (vp_w, vp_h) = (viewport.w, viewport.h);
-    // The list's items are the visible indices; a scroll re-derives them (the read of the offset
-    // signal subscribes the staging effect, so a `scroll_to` flags a reconcile).
+    // The list's items are the **logical ids** of the visible slots, in slot order; a scroll re-derives them (the
+    // read of the offset signal subscribes the staging effect), and a re-key does too (via `key_fn`'s reactive reads).
     let items_fn = move || {
-        visible_range(handle.offset().y, vp_h, item_height, count, BUFFER).collect::<Vec<usize>>()
+        visible_range(handle.offset().y, vp_h, item_height, count, BUFFER)
+            .map(&key_fn)
+            .collect::<Vec<usize>>()
     };
-    // Each row is wrapped in an `item_height` slot so taffy lays its subtree out at the size the
-    // manual paint positions it into. Keyed by index → in-range rows are reused across scrolls.
-    let view = move |idx: &usize| {
+    // Each row is wrapped in an `item_height` slot so taffy lays its subtree out at the size the manual paint
+    // positions it into. Keyed by **logical id** → a re-key reuses the id's node (content already correct) and the
+    // paint repositions it by realized order (= its new visible slot).
+    let view = move |id: &usize| {
         div()
             .size(Size {
                 w: vp_w,
                 h: item_height,
             })
-            .child(view_fn(*idx))
+            .child(view_fn(*id))
     };
-    let list = dyn_list(items_fn, |idx: &usize| *idx, view);
+    let list = dyn_list(items_fn, |id: &usize| *id, view);
     VirtualizedList {
         list,
         item_height,
@@ -220,11 +257,18 @@ impl Element for VirtualizedList {
         // `DynList`'s staging effect, which subscribes to the offset and flags structure-dirty on a scroll).
         let offset = self.offset.offset_untracked();
         let item_height = self.item_height;
-        // Clip to the viewport, then paint each realized row at `index * item_height - offset`
-        // (offset-based, not flex). A row fully outside the viewport is clipped away by Div's mask.
+        // Position each realized row by its display **slot**, not by its (logical-id) key: the realized rows are in
+        // `items_fn` order (= `visible_range` order, `apply_staged` preserves it), so the n-th realized row is the
+        // n-th visible slot, `start + n`. Within a frame the paint offset == the last-staged offset (RK-009), so
+        // `start` matches the staged window. (Under the identity key the id == slot, so this is unchanged.)
+        let start = visible_range(offset.y, self.viewport.h, item_height, self.count, BUFFER)
+            .next()
+            .unwrap_or(0);
+        // Clip to the viewport, then paint each realized row at `slot * item_height - offset` (offset-based, not
+        // flex). A row fully outside the viewport is clipped away by Div's mask.
         let saved = cx.push_clip(bounds);
-        for (&idx, _node_id, element) in self.list.realized_children() {
-            let y = bounds.origin.y + idx as f32 * item_height - offset.y;
+        for (n, (_id, _node_id, element)) in self.list.realized_children().enumerate() {
+            let y = bounds.origin.y + (start + n) as f32 * item_height - offset.y;
             let row_bounds = Rect {
                 origin: Point {
                     x: bounds.origin.x,
@@ -305,6 +349,8 @@ mod tests {
     use crate::event::{
         DispatchState, HitTest, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse,
     };
+    use crate::reactive::RwSignal;
+    use crate::reactive::prelude::*;
     use kagari_base::Color;
     use kagari_layout::LayoutTree;
     use kagari_render::{Background, Scene};
@@ -375,6 +421,81 @@ mod tests {
             "only the visible rows (0..5) + buffer (±2) are built"
         );
         assert!(realized < 1000, "the huge list is not fully realized");
+
+        drop(owner);
+    }
+
+    #[test]
+    fn virtualized_keyed_should_reposition_on_key_remap() {
+        // A keyed list (#325 fix a / RK-049): each row's WIDTH encodes its logical id `(id+1)*10`; `order` is the
+        // display→logical permutation (a "sort") that `key_fn` reads. A re-sort must move each logical row to its
+        // new slot AND keep its correct content — no stale cells.
+        let owner = Owner::new();
+        owner.set();
+
+        let order = RwSignal::new((0..10).collect::<Vec<usize>>());
+        let handle = ScrollHandle::new();
+        let mut env = Env::new();
+        let key_fn = move |slot: usize| order.with(|o| o[slot]);
+        let mut vl = virtualized_list_keyed(
+            20.0,
+            10,
+            Size { w: 200.0, h: 100.0 },
+            &handle,
+            key_fn,
+            |id| {
+                div()
+                    .size(Size {
+                        w: (id + 1) as f32 * 10.0,
+                        h: 20.0,
+                    })
+                    .background(green())
+            },
+        );
+        let vid = vl.request_layout(&mut env.cx());
+
+        // The width of the (green) row painted at slot 0 (viewport-top, y == 0) — its logical id is `w/10 - 1`.
+        fn width_at_top(env: &mut Env, vl: &mut VirtualizedList, vid: NodeId) -> f32 {
+            env.layout
+                .compute(vid, Size { w: 200.0, h: 100.0 })
+                .unwrap();
+            let mut scene = Scene::new();
+            let bounds = env.layout.layout(vid);
+            vl.paint(
+                bounds,
+                &mut PaintCx::new(
+                    &mut scene,
+                    &env.layout,
+                    &mut env.text,
+                    None,
+                    None,
+                    &env.theme,
+                ),
+            );
+            scene
+                .quads
+                .iter()
+                .filter(|q| q.bg == green())
+                .find(|q| q.bounds.origin.y == 0.0)
+                .map(|q| q.bounds.size.w)
+                .expect("a row paints at slot 0 (y == 0)")
+        }
+
+        assert_eq!(
+            width_at_top(&mut env, &mut vl, vid),
+            10.0,
+            "identity order: slot 0 shows logical id 0 (width 10)"
+        );
+
+        // Re-sort: reverse the order so slot 0 now shows logical id 9 (width 100).
+        order.set((0..10).rev().collect::<Vec<usize>>());
+        assert!(vl.is_dirty(), "a re-key flags the visible range dirty");
+        vl.reconcile(&mut env.cx());
+        assert_eq!(
+            width_at_top(&mut env, &mut vl, vid),
+            100.0,
+            "after the re-sort slot 0 shows logical id 9 (width 100) — fresh content, not stale"
+        );
 
         drop(owner);
     }
