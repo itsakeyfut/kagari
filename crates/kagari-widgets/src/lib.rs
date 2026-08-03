@@ -5,6 +5,7 @@
 
 pub mod button;
 pub mod checkbox;
+pub mod command_palette;
 pub mod context_menu;
 pub mod control;
 pub mod dialog;
@@ -37,6 +38,7 @@ pub mod vector_input;
 
 pub use button::{Button, button};
 pub use checkbox::{Checkbox, checkbox};
+pub use command_palette::{Command, CommandPalette, command, command_palette};
 pub use context_menu::{ContextMenu, context_menu};
 pub use control::ControlSize;
 pub use dialog::{Dialog, dialog};

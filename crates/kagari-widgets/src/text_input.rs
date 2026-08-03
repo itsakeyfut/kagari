@@ -25,6 +25,7 @@ pub struct TextInput {
     placeholder: Option<SharedString>,
     size: ControlSize,
     disabled: bool,
+    autofocus: bool,
 }
 
 /// Creates a medium, enabled single-line text input bound to the controlled `value` (#72).
@@ -34,6 +35,7 @@ pub fn text_input(value: RwSignal<String>) -> TextInput {
         placeholder: None,
         size: ControlSize::Md,
         disabled: false,
+        autofocus: false,
     }
 }
 
@@ -55,6 +57,15 @@ impl TextInput {
         self.disabled = disabled;
         self
     }
+
+    /// Focuses the editor as soon as it is built (mounted). Useful for a field that should be immediately typable
+    /// on appearance — e.g. a CommandPalette (#232) opened by keyboard. No-op when `disabled` (no editor is
+    /// mounted). Since a freshly-mounted field (e.g. under a `dyn_if` gated on an `open` signal) runs `build`
+    /// each time it appears, this focuses on every open.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = autofocus;
+        self
+    }
 }
 
 impl IntoElement for TextInput {
@@ -64,6 +75,7 @@ impl IntoElement for TextInput {
             placeholder,
             size,
             disabled,
+            autofocus,
         } = self;
         let font: Px = label_px(size);
 
@@ -94,6 +106,10 @@ impl IntoElement for TextInput {
         // A read-only clone of the editor's focus handle — the field does not register it (the editor is the
         // sole focus target), it only reads `is_focus_visible` to color the ring (keyboard modality only).
         let handle = editor.focus_handle();
+        // Auto-focus on mount (#232): focus the editor now so a freshly-appearing field is immediately typable.
+        if autofocus {
+            handle.focus();
+        }
 
         field_frame(size)
             .border_color(rx(move || {
@@ -348,6 +364,22 @@ mod tests {
             h.focus.focused_node(),
             None,
             "a disabled input is inert and not focusable"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn text_input_autofocus_should_focus_on_build() {
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(String::new());
+        // `.autofocus(true)` focuses the editor at build — no click needed (a keyboard-opened field is typable).
+        let h = harness(text_input(value).autofocus(true));
+        let editor = h.arena.get(h.root_id).unwrap().children[0];
+        assert_eq!(
+            h.focus.focused_node(),
+            Some(editor),
+            "autofocus focuses the editor on build"
         );
         drop(owner);
     }
