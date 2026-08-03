@@ -11,7 +11,7 @@
 //! part, so [`IconCache`] parses each [`IconId`] once and re-renders the cached [`usvg::Tree`]
 //! ([`rasterize_tree`]) per `px` — otherwise a size-animated / zoomed icon re-parses every frame.
 //!
-//! Bundled icons are **monochrome white** strokes on transparent ground: the polychrome `tint` *multiplies*
+//! Bundled icons are **monochrome white** shapes (stroked or filled) on transparent ground: the polychrome `tint` *multiplies*
 //! the sampled texel (#55), so a white icon is tinted to any theme color (a black icon could not be), and
 //! `tint = WHITE` draws it white.
 
@@ -34,14 +34,21 @@ pub enum IconId {
     Check,
     /// A downward chevron "⌄".
     ChevronDown,
+    /// A vertical drag-handle grip "⠿" (two columns of dots), used as a reorder drag source.
+    GripVertical,
 }
 
 /// All bundled icons — for tests that enumerate the set (test-only until a non-test consumer needs it).
 #[cfg(test)]
-const ALL_ICONS: &[IconId] = &[IconId::Close, IconId::Check, IconId::ChevronDown];
+const ALL_ICONS: &[IconId] = &[
+    IconId::Close,
+    IconId::Check,
+    IconId::ChevronDown,
+    IconId::GripVertical,
+];
 
-/// The inline SVG source for a bundled icon (24×24 viewBox, monochrome white stroked paths on a
-/// transparent ground — tintable via the polychrome `tint`).
+/// The inline SVG source for a bundled icon (24×24 viewBox, monochrome white shapes — stroked paths or
+/// filled — on a transparent ground, tintable via the polychrome `tint`).
 fn icon_svg(id: IconId) -> &'static str {
     match id {
         IconId::Close => {
@@ -52,6 +59,9 @@ fn icon_svg(id: IconId) -> &'static str {
         }
         IconId::ChevronDown => {
             r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>"##
+        }
+        IconId::GripVertical => {
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="white"><circle cx="9" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="15" cy="18" r="1.6"/></g></svg>"##
         }
     }
 }
