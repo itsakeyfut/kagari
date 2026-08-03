@@ -1346,13 +1346,17 @@ impl WindowState {
     /// nothing (`over`/`accepted` gate it), so it is a no-op end.
     fn end_drag(&mut self, commit: bool) {
         if let DragState::Active(d) = std::mem::replace(&mut self.drag, DragState::Idle) {
-            if let Some(target) = d.over {
-                if d.accepted {
-                    if commit {
-                        dispatch_drop(&mut self.root, &self.arena, target, d.payload, self.pointer);
-                    }
-                    dispatch_drag_leave(&mut self.root, &self.arena, target);
+            // Re-resolve the drop target from the current pointer rather than trusting the cached `over`:
+            // a widget that restructures its subtree *during* the drag (e.g. ReorderableList's live reflow,
+            // #357) replaces its drop-target nodes each frame, so `over` can reference a node that no longer
+            // exists by release — delivering the drop/leave to it would silently no-op (missed commit / stuck
+            // hover). Re-hit-testing against the current tree finds the live target under the release point.
+            // `dispatch_drop` type-checks the payload, so a non-matching target is a no-op (RK: stale-over).
+            if let Some(target) = self.hit_test.pick_where(self.pointer, |f| f.drop_target) {
+                if commit {
+                    dispatch_drop(&mut self.root, &self.arena, target, d.payload, self.pointer);
                 }
+                dispatch_drag_leave(&mut self.root, &self.arena, target);
             }
         }
         // Dispose the per-drag owner so the drag-image's reactive effects are torn down, not leaked
