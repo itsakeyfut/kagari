@@ -103,7 +103,9 @@ impl IntoElement for VirtualizedList {
             .size(viewport)
             .on_wheel(move |ev, _cx| {
                 if let MouseKind::Wheel { dy, .. } = ev.kind {
-                    let next = (handle.target().y - dy * item_height).clamp(0.0, max_y);
+                    // `dy` is already a logical-pixel scroll distance (the app scales a notch by `WHEEL_LINE_PX`),
+                    // so apply it directly — multiplying by `item_height` again over-scrolls by a row per pixel.
+                    let next = (handle.target().y - dy).clamp(0.0, max_y);
                     handle.scroll_to(Point::new(0.0, next));
                 }
             })
@@ -286,9 +288,9 @@ mod tests {
         let rows0 = realized_rows(&h);
         assert_eq!(rows0.len(), 7);
 
-        // Wheel down 3 rows (dy = -3 → +60px target): the spring settles (snaps) at 60, then the frame
+        // Wheel down 3 rows (dy = -60 px → +60px target): the spring settles (snaps) at 60, then the frame
         // realizes the shifted window (0..7 → 1..10, so index 0 is released).
-        wheel(&mut h, -3.0);
+        wheel(&mut h, -60.0);
         settle(&ticker, &sources);
         frame(&mut h); // reconcile realizes the shifted window
         let rows1 = realized_rows(&h);
@@ -373,9 +375,9 @@ mod tests {
         owner.set();
         let (mut h, handle, ticker, sources) = scrolling_harness(1000);
 
-        // A wheel notch springs (does not jump): dy -3 → clamped target 60, but the offset does not reach
+        // A wheel notch springs (does not jump): dy -60 px → clamped target 60, but the offset does not reach
         // it until the ticker (the app frame clock) drives the spring.
-        wheel(&mut h, -3.0);
+        wheel(&mut h, -60.0);
         assert!(
             handle.offset().y < 60.0,
             "smooth scroll animates rather than jumping (got {})",
@@ -398,16 +400,16 @@ mod tests {
         let (mut h, handle, ticker, sources) = scrolling_harness(1000);
 
         // Two wheel notches while the spring is still in flight must accumulate on the *target*, not the
-        // momentary offset — otherwise a mid-flight notch drops the earlier delta. dy -3 (→ target 60),
-        // advance one frame (offset ≪ 60), then dy -3 again → target 120 (2·60), not ~66 (60 + a bit).
-        wheel(&mut h, -3.0);
+        // momentary offset — otherwise a mid-flight notch drops the earlier delta. dy -60 px (→ target 60),
+        // advance one frame (offset ≪ 60), then dy -60 again → target 120 (2·60), not ~66 (60 + a bit).
+        wheel(&mut h, -60.0);
         ticker.tick_all(Duration::from_secs_f32(1.0 / 60.0));
         assert!(
             handle.offset().y < 60.0,
             "still mid-flight after one tick (got {})",
             handle.offset().y
         );
-        wheel(&mut h, -3.0);
+        wheel(&mut h, -60.0);
         settle(&ticker, &sources);
         assert!(
             (handle.offset().y - 120.0).abs() <= 0.1,

@@ -257,7 +257,9 @@ impl IntoElement for GridView {
             .size(viewport)
             .on_wheel(move |ev, _| {
                 if let MouseKind::Wheel { dy, .. } = ev.kind {
-                    let next = (wheel.offset().y - dy * row_h).clamp(0.0, max_y);
+                    // `dy` is already a logical-pixel scroll distance (the app scales a notch by `WHEEL_LINE_PX`),
+                    // so apply it directly — multiplying by `row_h` again over-scrolls by a row per pixel.
+                    let next = (wheel.offset().y - dy).clamp(0.0, max_y);
                     wheel.jump_to(Point::new(0.0, next));
                 }
             })

@@ -15,10 +15,6 @@
 use kagari_base::{Point, Size};
 use kagari_core::{AnyElement, IntoElement, MouseKind, ScrollHandle, div, scroll};
 
-/// Logical px scrolled per wheel notch (the core clamps the visible offset; a fixed step is fine here since
-/// the content extent is arbitrary, unlike the virtualized widgets' row-height step).
-const WHEEL_STEP: f32 = 40.0;
-
 /// A scroll region with draggable overlay scrollbars (#83). Build with [`scroll_view`]; set the viewport with
 /// [`.size(..)`](Self::size), toggle axes with [`.horizontal`](Self::horizontal)/[`.vertical`](Self::vertical),
 /// and optionally drive it programmatically with [`.handle(..)`](Self::handle). Returns `impl IntoElement`;
@@ -104,13 +100,15 @@ impl IntoElement for ScrollView {
                     let off = wheel.offset_untracked();
                     let max_x = (content.w - viewport.w).max(0.0);
                     let max_y = (content.h - viewport.h).max(0.0);
+                    // `dx`/`dy` are already logical-pixel scroll distances (the app scales a notch by
+                    // `WHEEL_LINE_PX`), so apply them directly rather than re-scaling by a fixed step.
                     let x = if horizontal {
-                        (off.x - dx * WHEEL_STEP).clamp(0.0, max_x)
+                        (off.x - dx).clamp(0.0, max_x)
                     } else {
                         0.0
                     };
                     let y = if vertical {
-                        (off.y - dy * WHEEL_STEP).clamp(0.0, max_y)
+                        (off.y - dy).clamp(0.0, max_y)
                     } else {
                         0.0
                     };
@@ -216,25 +214,32 @@ mod tests {
         owner.set();
         let handle = ScrollHandle::new();
         let mut h = harness(tall_view(Some(handle.clone())));
-        // A wheel over the content centre scrolls: dy -3 → offset.y = 0 - (-3)*40 = 120, clamped to max 200.
+        // A wheel over the content centre scrolls: dy is logical px applied directly → offset.y = 0 - (-120) = 120,
+        // clamped to max 200.
         let mut st = DispatchState::default();
         send(
             &mut h,
             &mut st,
-            MouseKind::Wheel { dx: 0.0, dy: -3.0 },
+            MouseKind::Wheel {
+                dx: 0.0,
+                dy: -120.0,
+            },
             50.0,
             50.0,
         );
         assert_eq!(
             handle.offset().y,
             120.0,
-            "a wheel notch scrolls the content by a fixed step"
+            "a wheel scrolls the content by its logical-pixel delta"
         );
         // A large wheel over-scrolls past the content: it clamps to max (content 300 − viewport 100 = 200).
         send(
             &mut h,
             &mut st,
-            MouseKind::Wheel { dx: 0.0, dy: -10.0 },
+            MouseKind::Wheel {
+                dx: 0.0,
+                dy: -200.0,
+            },
             50.0,
             50.0,
         );
