@@ -14,10 +14,14 @@
 //! [`virtualized_list_keyed`](kagari_core::virtualized_list_keyed), so re-sorting never leaves stale cells and
 //! selection tracks the logical row across a sort.
 //!
-//! MVP scope: render + single-select + single-column sort. **Follow-ups**: keyboard row nav, resizable columns,
-//! multi-column (Shift-click) sort, multi-select, DataGrid editable cells (a cell can already *be* a `text_input`
-//! bound to a `RwSignal` field of `R`), reactive/streaming rows, horizontal scroll. The Table builds the core
-//! element and owns the body `ScrollHandle`, so keyboard-nav / scroll-restore can land additively.
+//! Keyboard row navigation (#326): when a selection is wired the table is focusable (focus ring); Arrow ↑/↓ move the
+//! selection by one row (Home/End jump to the first/last), and the body auto-scrolls to keep the selected row visible.
+//!
+//! MVP scope: render + single-select + single-column sort + keyboard row nav. **Follow-ups**: resizable columns,
+//! multi-column (Shift-click) sort, multi-select, row *activation* (`.on_activate`, Enter/Space), DataGrid editable
+//! cells (a cell can already *be* a `text_input` bound to a `RwSignal` field of `R`), reactive/streaming rows,
+//! horizontal scroll. The Table builds the core element and owns the body `ScrollHandle`, so scroll-restore can land
+//! additively.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -27,7 +31,7 @@ use kagari_core::element::Div;
 use kagari_core::reactive::prelude::*;
 use kagari_core::reactive::{RwSignal, rx};
 use kagari_core::{
-    AnyElement, IntoElement, MouseKind, ScrollHandle, div, text,
+    AnyElement, IntoElement, KeyCode, MouseKind, ScrollHandle, div, text, use_focus_handle,
     virtualized_list_keyed as core_virtualized_list_keyed,
 };
 use kagari_style::{ColorRole, Styled};
@@ -362,13 +366,103 @@ impl<R: 'static> IntoElement for Table<R> {
             })
             .child(core);
 
-        div()
+        let table = div()
             .flex_col()
             .child(header)
             .child(div().h_px().bg(ColorRole::Border)) // header / body divider
-            .child(body)
-            .into_element()
+            .child(body);
+
+        // Keyboard row navigation (#326): focus + arrow/Home/End move the selection and scroll it into view — only
+        // when a selection signal is wired (it is the nav cursor), mirroring `grid`. The focus/key/ring modifiers go
+        // on the `flex_col` itself (not a new wrapper), so the root's child structure is unchanged. `selection` is
+        // `Copy`, so it is still usable after the keyed body captured it.
+        match selection {
+            Some(sel) => {
+                let focus = use_focus_handle();
+                let ring = focus.clone();
+                let click_focus = focus.clone();
+                let kb_handle = handle.clone();
+                table
+                    .track_focus(&focus)
+                    .rounded_md()
+                    .border_w_1()
+                    .border_color(rx(move || {
+                        ring.is_focus_visible().then_some(ColorRole::FocusRing)
+                    }))
+                    // Acquire focus on press so the subsequent arrow keys route here — `track_focus` only marks the
+                    // node focusable; nothing focuses it on click automatically. A press anywhere in the table
+                    // (a row, the header) bubbles up to this handler.
+                    .on_mouse_down(move |_, _| click_focus.focus())
+                    // Navigation keys auto-repeat: holding an arrow (or Home/End) keeps moving the selection.
+                    // Unlike one-shot *activation* (RK-026 guards `kev.repeat`), row nav should repeat on long-press.
+                    .on_key_down(move |kev, _| {
+                        keyboard(kev.code, count, sel, &kb_handle, row_h, body_height);
+                    })
+                    .into_element()
+            }
+            None => table.into_element(),
+        }
     }
+}
+
+/// Moves the single selection by one key press and scrolls the new row into view (#326). Arrow Up/Down step ±1
+/// (clamped at the ends, no `usize` underflow); Home/End jump to the first/last row; Enter/Space/NumpadEnter mirror
+/// `grid` (select row 0 when nothing is selected, else stay — there is no activation hook in the MVP). A press with
+/// no matching key is a no-op. Empty tables ignore all keys.
+fn keyboard(
+    code: KeyCode,
+    count: usize,
+    selection: RwSignal<Selection>,
+    handle: &ScrollHandle,
+    row_h: f32,
+    body_height: f32,
+) {
+    if count == 0 {
+        return;
+    }
+    let cur = selection.get_untracked().selected();
+    let next = match cur {
+        Some(i) => match code {
+            KeyCode::ArrowDown => (i + 1).min(count - 1),
+            KeyCode::ArrowUp => i.saturating_sub(1),
+            KeyCode::Home => 0,
+            KeyCode::End => count - 1,
+            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => i,
+            _ => return,
+        },
+        None => match code {
+            KeyCode::ArrowDown
+            | KeyCode::ArrowUp
+            | KeyCode::Home
+            | KeyCode::Enter
+            | KeyCode::NumpadEnter
+            | KeyCode::Space => 0,
+            KeyCode::End => count - 1,
+            _ => return,
+        },
+    };
+    // No-op move (e.g. an arrow held at a boundary, or Enter/Space with a selection): skip the redundant signal
+    // write + scroll — matters now that navigation keys auto-repeat.
+    if cur == Some(next) {
+        return;
+    }
+    selection.set(Selection::single(next));
+    scroll_into_view(handle, next, row_h, body_height);
+}
+
+/// Keeps the row at `row` within the viewport by nudging the scroll offset (mirrors `grid`/`tree`'s helper). Instant
+/// `jump_to` (spring scroll for the virtualized-widget family is #341).
+fn scroll_into_view(handle: &ScrollHandle, row: usize, row_h: f32, body_height: f32) {
+    let y = row as f32 * row_h;
+    let cur = handle.offset().y;
+    let next = if y < cur {
+        y
+    } else if y + row_h > cur + body_height {
+        y + row_h - body_height
+    } else {
+        cur
+    };
+    handle.jump_to(Point::new(0.0, next));
 }
 
 #[cfg(test)]
@@ -379,10 +473,12 @@ mod tests {
     use kagari_base::{NodeId, Point, Size as BSize};
     use kagari_core::arena::Arena;
     use kagari_core::damage::DamageState;
+    use kagari_core::event::FocusRegistry;
     use kagari_core::paint::render_tree;
-    use kagari_core::reactive::Owner;
+    use kagari_core::reactive::{Owner, provide_context};
     use kagari_core::{
-        DispatchState, HitTest, Modifiers, MouseButton, MouseEvent, MouseKind, dispatch_mouse,
+        DispatchState, HitTest, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind,
+        dispatch_key, dispatch_mouse,
     };
     use kagari_layout::LayoutTree;
     use kagari_render::Scene;
@@ -425,11 +521,14 @@ mod tests {
         layout: LayoutTree,
         text: TextSystem,
         hit: HitTest,
+        focus: FocusRegistry,
         damage: StdArc<DamageState>,
         theme: Theme,
         root_id: NodeId,
     }
 
+    /// Builds a pre-constructed element (its `use_focus_handle` calls got detached handles — fine for tests that
+    /// don't exercise focus). Use [`focus_harness`] when a test needs real focus (click-to-focus + key routing).
     fn harness(root: AnyElement) -> Harness {
         let mut h = Harness {
             root,
@@ -437,6 +536,28 @@ mod tests {
             layout: LayoutTree::new(),
             text: TextSystem::new(FontDb::new()),
             hit: HitTest::new(),
+            focus: FocusRegistry::new(),
+            damage: StdArc::new(DamageState::default()),
+            theme: Theme::light(),
+            root_id: NodeId::from_raw(0),
+        };
+        h.root_id = frame(&mut h).0;
+        h
+    }
+
+    /// Like [`harness`], but provides a [`FocusRegistry`] as context **before** `build` runs, so the table's
+    /// `use_focus_handle()` mints into it — a test can then observe focus acquisition (`h.focus.focused_node()`)
+    /// and route keys the way the App does (via the focused node).
+    fn focus_harness(build: impl FnOnce() -> AnyElement) -> Harness {
+        let focus = FocusRegistry::new();
+        provide_context(focus.clone());
+        let mut h = Harness {
+            root: build(),
+            arena: Arena::new(),
+            layout: LayoutTree::new(),
+            text: TextSystem::new(FontDb::new()),
+            hit: HitTest::new(),
+            focus,
             damage: StdArc::new(DamageState::default()),
             theme: Theme::light(),
             root_id: NodeId::from_raw(0),
@@ -455,7 +576,7 @@ mod tests {
             None,
             Some(&mut h.hit),
             None,
-            None,
+            Some(&mut h.focus),
             None,
             None,
             &mut scene,
@@ -844,6 +965,165 @@ mod tests {
             body_rows(&h).len(),
             0,
             "an empty table has no body rows after a header click"
+        );
+        drop(owner);
+    }
+
+    /// Dispatches a key press to the table's root node (its `flex_col` carries the `on_key_down` listener).
+    fn press(h: &mut Harness, code: KeyCode) {
+        let kev = KeyEvent::new(code, Modifiers::default(), true, false);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+    }
+
+    #[test]
+    fn table_keyboard_arrows_should_move_selection() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sample_table(100, Some(sel)));
+
+        press(&mut h, KeyCode::ArrowDown); // no cursor → row 0
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "the first arrow press with no selection selects row 0"
+        );
+        press(&mut h, KeyCode::ArrowDown); // 0 → 1
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(1),
+            "ArrowDown moves +1"
+        );
+        press(&mut h, KeyCode::ArrowUp); // 1 → 0
+        assert_eq!(sel.get_untracked().selected(), Some(0), "ArrowUp moves -1");
+        drop(owner);
+    }
+
+    #[test]
+    fn table_keyboard_arrow_up_at_top_should_not_underflow() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(0));
+        let mut h = harness(sample_table(100, Some(sel)));
+
+        press(&mut h, KeyCode::ArrowUp); // no row above → stay at 0 (no usize underflow / panic)
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "ArrowUp at the top row clamps to 0"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_keyboard_home_end_should_jump() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(5));
+        let mut h = harness(sample_table(100, Some(sel)));
+
+        press(&mut h, KeyCode::End);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(99),
+            "End jumps to the last row"
+        );
+        press(&mut h, KeyCode::Home);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "Home jumps to the first row"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_keyboard_end_should_scroll_selection_into_view() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let mut h = harness(sample_table(100, Some(sel)));
+        let accent = h.theme.resolve_color(ColorRole::Accent);
+
+        // Nothing selected yet, and the last row is far below the ~100px window → no Accent tint paints.
+        assert!(
+            !frame(&mut h)
+                .1
+                .quads
+                .iter()
+                .any(|q| q.bg == kagari_render::Background::Solid(accent)),
+            "no selection → nothing tinted, and the last row is windowed out"
+        );
+        // End selects the last row AND scrolls it into view, so it realizes and paints its Accent tint.
+        press(&mut h, KeyCode::End);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(99),
+            "End selects row 99"
+        );
+        assert!(
+            frame(&mut h)
+                .1
+                .quads
+                .iter()
+                .any(|q| q.bg == kagari_render::Background::Solid(accent)),
+            "the selected last row is scrolled into view and paints its Accent tint"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_click_should_focus_and_route_arrow_keys() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        // Built inside a real FocusRegistry so we can observe focus acquisition and route keys the way the App
+        // does — to the *focused* node, not a hard-coded target (which is what the other keyboard tests use).
+        let mut h = focus_harness(|| sample_table(100, Some(sel)));
+
+        assert_eq!(
+            h.focus.focused_node(),
+            None,
+            "the table is not focused before any interaction"
+        );
+        // Clicking a row must both select it AND focus the table, so subsequent keys route here.
+        click_row(&mut h, 2);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(2),
+            "the click selects the row"
+        );
+        assert_eq!(
+            h.focus.focused_node(),
+            Some(h.root_id),
+            "the click focuses the table (so the App will route keys to it)"
+        );
+        // An arrow key routed via the focused node (the real App path) moves the selection.
+        let kev = KeyEvent::new(KeyCode::ArrowDown, Modifiers::default(), true, false);
+        dispatch_key(&mut h.root, &h.arena, h.focus.focused_node(), &kev);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(3),
+            "an arrow key routed through focus moves the selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_keyboard_autorepeat_should_move_selection() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(0));
+        let mut h = harness(sample_table(100, Some(sel)));
+
+        // An auto-repeat ArrowDown (`repeat = true`, a long-press tick) must still advance the selection —
+        // navigation repeats, unlike one-shot activation.
+        let kev = KeyEvent::new(KeyCode::ArrowDown, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(1),
+            "auto-repeat (long-press) keeps moving the selection"
         );
         drop(owner);
     }
