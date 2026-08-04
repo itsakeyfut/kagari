@@ -176,7 +176,8 @@ fn keyboard(
     if count == 0 {
         return;
     }
-    let next = match selection.get_untracked().selected() {
+    let cur = selection.get_untracked().selected();
+    let next = match cur {
         Some(i) => match code {
             KeyCode::ArrowRight => {
                 if i % cols != cols - 1 && i + 1 < count {
@@ -219,6 +220,11 @@ fn keyboard(
             _ => return,
         },
     };
+    // No-op move (an arrow held at an edge, or Enter with a selection): skip the redundant signal write + scroll —
+    // matters now that navigation keys auto-repeat.
+    if cur == Some(next) {
+        return;
+    }
     selection.set(GridSelection::single(next));
     scroll_into_view(handle, next / cols, row_h, body_height);
 }
@@ -270,6 +276,7 @@ impl IntoElement for GridView {
             Some(sel) => {
                 let focus = use_focus_handle();
                 let ring = focus.clone();
+                let click_focus = focus.clone();
                 let kb_handle = handle.clone();
                 let body_h = viewport.h;
                 div()
@@ -279,10 +286,11 @@ impl IntoElement for GridView {
                         ring.is_focus_visible().then_some(ColorRole::FocusRing)
                     }))
                     .track_focus(&focus)
+                    // Acquire focus on press so the arrow keys route here — `track_focus` only marks the node
+                    // focusable; nothing focuses it on click automatically (RK-051).
+                    .on_mouse_down(move |_, _| click_focus.focus())
+                    // Navigation keys auto-repeat (hold to keep moving); unlike one-shot activation (RK-026).
                     .on_key_down(move |kev, _| {
-                        if kev.repeat {
-                            return;
-                        }
                         keyboard(kev.code, count, cols, sel, &kb_handle, row_h, body_h);
                     })
                     .child(body)
@@ -573,6 +581,55 @@ mod tests {
             row_cells(&h, 0).len(),
             1,
             "cols=1 fallback: the first row has 1 cell, not all 6 (no usize::MAX collapse)"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_click_should_focus_and_route_arrow_keys() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::none());
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        assert_eq!(
+            h.focus.focused_node(),
+            None,
+            "the grid is not focused before a click"
+        );
+        // Clicking an item must select it AND focus the grid, so keys route here (RK-051).
+        click_item(&mut h, 0);
+        assert_eq!(selection.get_untracked().selected(), Some(0));
+        assert_eq!(
+            h.focus.focused_node(),
+            Some(h.root_id),
+            "clicking an item focuses the grid"
+        );
+        // An arrow routed via the focused node (the real App path) moves the selection.
+        let kev = KeyEvent::new(KeyCode::ArrowRight, Modifiers::default(), true, false);
+        dispatch_key(&mut h.root, &h.arena, h.focus.focused_node(), &kev);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(1),
+            "an arrow key routed through focus moves the selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_autorepeat_should_move_selection() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(0));
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        // An auto-repeat ArrowRight (`repeat = true`, a long-press tick) must still advance the selection.
+        let kev = KeyEvent::new(KeyCode::ArrowRight, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(1),
+            "auto-repeat (long-press) keeps moving the selection"
         );
         drop(owner);
     }

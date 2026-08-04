@@ -373,7 +373,13 @@ fn keyboard<K: Copy + Eq + Hash + Send + Sync + 'static>(
         .and_then(|k| vis.iter().position(|&i| meta[i].key == k));
 
     let select = |pos: usize| {
-        selection.set(TreeSelection::single(meta[vis[pos]].key));
+        let key = meta[vis[pos]].key;
+        // No-op move (an arrow held at an edge): skip the redundant signal write + scroll — matters now that
+        // navigation keys auto-repeat. Expand/collapse (which don't call `select`) are unaffected.
+        if selection.get_untracked().selected() == Some(key) {
+            return;
+        }
+        selection.set(TreeSelection::single(key));
         scroll_into_view(handle, pos, row_h, body_height);
     };
 
@@ -480,6 +486,7 @@ where
             Some(sel) => {
                 let focus = use_focus_handle();
                 let ring = focus.clone();
+                let click_focus = focus.clone();
                 let meta_kb = meta.clone();
                 let kb_handle = handle.clone();
                 div()
@@ -489,10 +496,11 @@ where
                         ring.is_focus_visible().then_some(ColorRole::FocusRing)
                     }))
                     .track_focus(&focus)
+                    // Acquire focus on press so the arrow keys route here — `track_focus` only marks the node
+                    // focusable; nothing focuses it on click automatically (RK-051).
+                    .on_mouse_down(move |_, _| click_focus.focus())
+                    // Navigation keys auto-repeat (hold to keep moving); unlike one-shot activation (RK-026).
                     .on_key_down(move |kev, _| {
-                        if kev.repeat {
-                            return;
-                        }
                         keyboard(
                             kev.code,
                             &meta_kb,
@@ -831,6 +839,57 @@ mod tests {
                 .into_element()
         });
         assert_eq!(visible_row_count(&h), 0, "an empty tree renders no rows");
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_click_should_focus_and_route_arrow_keys() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::none());
+        let mut h = harness(|| sample_tree(expanded, Some(selection)));
+
+        assert_eq!(
+            h.focus.focused_node(),
+            None,
+            "the tree is not focused before a click"
+        );
+        // Collapsed visible = [0, 3, 6]. Clicking row 2 selects key 6 AND focuses the tree (RK-051).
+        click_row_body(&mut h, 2);
+        assert_eq!(selection.get_untracked().selected(), Some(6));
+        assert_eq!(
+            h.focus.focused_node(),
+            Some(h.root_id),
+            "clicking a row focuses the tree"
+        );
+        // ArrowUp routed via the focused node moves to the previous visible row (key 3).
+        let kev = KeyEvent::new(KeyCode::ArrowUp, Modifiers::default(), true, false);
+        dispatch_key(&mut h.root, &h.arena, h.focus.focused_node(), &kev);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(3),
+            "an arrow key routed through focus moves the selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_autorepeat_should_move_selection() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::single(0)); // visible [0, 3, 6], selected key 0
+        let mut h = harness(|| sample_tree(expanded, Some(selection)));
+
+        // An auto-repeat ArrowDown (`repeat = true`, a long-press tick) must still advance the selection.
+        let kev = KeyEvent::new(KeyCode::ArrowDown, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(3),
+            "auto-repeat (long-press) keeps moving the selection"
+        );
         drop(owner);
     }
 }
