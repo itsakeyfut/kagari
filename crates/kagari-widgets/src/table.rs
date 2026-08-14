@@ -17,11 +17,13 @@
 //! Keyboard row navigation (#326): when a selection is wired the table is focusable (focus ring); Arrow ↑/↓ move the
 //! selection by one row (Home/End jump to the first/last), and the body auto-scrolls to keep the selected row visible.
 //!
-//! MVP scope: render + single-select + single-column sort + keyboard row nav. **Follow-ups**: resizable columns,
-//! multi-column (Shift-click) sort, multi-select, row *activation* (`.on_activate`, Enter/Space), DataGrid editable
-//! cells (a cell can already *be* a `text_input` bound to a `RwSignal` field of `R`), reactive/streaming rows,
-//! horizontal scroll. The Table builds the core element and owns the body `ScrollHandle`, so scroll-restore can land
-//! additively.
+//! Row activation (#365): Enter/Space/NumpadEnter on the selected row fires `.on_activate(Fn(usize))` with the
+//! logical row index (one-shot, unlike navigation which repeats) — distinct from moving the selection cursor.
+//!
+//! MVP scope: render + single-select + single-column sort + keyboard row nav + activation. **Follow-ups**: resizable
+//! columns, multi-column (Shift-click) sort, multi-select, double-click activation (#367), DataGrid editable cells
+//! (a cell can already *be* a `text_input` bound to a `RwSignal` field of `R`), reactive/streaming rows, horizontal
+//! scroll. The Table builds the core element and owns the body `ScrollHandle`, so scroll-restore can land additively.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -113,6 +115,7 @@ pub struct Table<R> {
     rows: Vec<R>,
     columns: Vec<Column<R>>,
     selection: Option<RwSignal<Selection>>,
+    on_activate: Option<Rc<dyn Fn(usize)>>,
     size: ControlSize,
     row_height: Option<f32>,
     body_height: f32,
@@ -125,6 +128,7 @@ pub fn table<R: 'static>(rows: Vec<R>) -> Table<R> {
         rows,
         columns: Vec::new(),
         selection: None,
+        on_activate: None,
         size: ControlSize::Md,
         row_height: None,
         body_height: 320.0,
@@ -174,6 +178,16 @@ impl<R: 'static> Table<R> {
     /// the selected row is tinted. When unset, rows render but are not selectable.
     pub fn selection(mut self, selection: RwSignal<Selection>) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    /// Sets the row **activation** callback (#365): invoked with the **logical row index** when the user activates
+    /// the keyboard-selected row via Enter/Space/NumpadEnter. Distinct from [`.selection`](Self::selection), which
+    /// only moves the cursor. Optional — without it, Enter/Space merely settle the selection (today's behavior).
+    /// One-shot: a long-press does not re-fire it (RK-026). Activation needs a wired selection cursor and a selected
+    /// row; pressing Enter with nothing selected selects the first row instead (a second press then activates it).
+    pub fn on_activate(mut self, f: impl Fn(usize) + 'static) -> Self {
+        self.on_activate = Some(Rc::new(f));
         self
     }
 
@@ -266,6 +280,7 @@ impl<R: 'static> IntoElement for Table<R> {
             rows,
             columns,
             selection,
+            on_activate,
             size,
             row_height,
             body_height,
@@ -382,6 +397,7 @@ impl<R: 'static> IntoElement for Table<R> {
                 let ring = focus.clone();
                 let click_focus = focus.clone();
                 let kb_handle = handle.clone();
+                let activate = on_activate.clone();
                 table
                     .track_focus(&focus)
                     .rounded_md()
@@ -394,9 +410,19 @@ impl<R: 'static> IntoElement for Table<R> {
                     // (a row, the header) bubbles up to this handler.
                     .on_mouse_down(move |_, _| click_focus.focus())
                     // Navigation keys auto-repeat: holding an arrow (or Home/End) keeps moving the selection.
-                    // Unlike one-shot *activation* (RK-026 guards `kev.repeat`), row nav should repeat on long-press.
+                    // Activation (Enter/Space) is one-shot — `keyboard` guards it on `kev.repeat` (RK-026), while
+                    // row nav repeats on long-press.
                     .on_key_down(move |kev, _| {
-                        keyboard(kev.code, count, sel, &kb_handle, row_h, body_height);
+                        keyboard(
+                            kev.code,
+                            kev.repeat,
+                            count,
+                            sel,
+                            &kb_handle,
+                            row_h,
+                            body_height,
+                            activate.as_deref(),
+                        );
                     })
                     .into_element()
             }
@@ -405,29 +431,46 @@ impl<R: 'static> IntoElement for Table<R> {
     }
 }
 
-/// Moves the single selection by one key press and scrolls the new row into view (#326). Arrow Up/Down step ±1
-/// (clamped at the ends, no `usize` underflow); Home/End jump to the first/last row; Enter/Space/NumpadEnter mirror
-/// `grid` (select row 0 when nothing is selected, else stay — there is no activation hook in the MVP). A press with
-/// no matching key is a no-op. Empty tables ignore all keys.
+/// Moves the single selection by one key press and scrolls the new row into view (#326), and fires row
+/// **activation** (#365). Arrow Up/Down step ±1 (clamped at the ends, no `usize` underflow); Home/End jump to the
+/// first/last row. Enter/Space/NumpadEnter on the selected row fire `on_activate` with the logical row index —
+/// one-shot (guarded by `repeat`, RK-026, unlike navigation which repeats); with nothing selected they select the
+/// first row instead (a second press then activates it). A press with no matching key is a no-op. Empty tables
+/// ignore all keys.
+#[allow(clippy::too_many_arguments)]
 fn keyboard(
     code: KeyCode,
+    repeat: bool,
     count: usize,
     selection: RwSignal<Selection>,
     handle: &ScrollHandle,
     row_h: f32,
     body_height: f32,
+    on_activate: Option<&dyn Fn(usize)>,
 ) {
     if count == 0 {
         return;
     }
     let cur = selection.get_untracked().selected();
+    // Activation (#365): Enter/Space/NumpadEnter on the selected row fires `on_activate` with the logical row index,
+    // one-shot — `repeat` is guarded so a long-press does not re-fire it (RK-026); the selected row stays put. With
+    // no selection yet, fall through to select the first row below.
+    if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+        if let Some(i) = cur {
+            if !repeat {
+                if let Some(f) = on_activate {
+                    f(i);
+                }
+            }
+            return;
+        }
+    }
     let next = match cur {
         Some(i) => match code {
             KeyCode::ArrowDown => (i + 1).min(count - 1),
             KeyCode::ArrowUp => i.saturating_sub(1),
             KeyCode::Home => 0,
             KeyCode::End => count - 1,
-            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => i,
             _ => return,
         },
         None => match code {
@@ -468,6 +511,7 @@ fn scroll_into_view(handle: &ScrollHandle, row: usize, row_h: f32, body_height: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc as StdArc;
 
     use kagari_base::{NodeId, Point, Size as BSize};
@@ -1124,6 +1168,125 @@ mod tests {
             sel.get_untracked().selected(),
             Some(1),
             "auto-repeat (long-press) keeps moving the selection"
+        );
+        drop(owner);
+    }
+
+    /// A sample table wired with a selection and an `.on_activate` that records the fired logical row index.
+    fn activatable_table(
+        n: usize,
+        sel: RwSignal<Selection>,
+        fired: Rc<Cell<Option<usize>>>,
+    ) -> AnyElement {
+        table(sample_rows(n))
+            .column("Name", 120.0, |r: &Row| text(r.name))
+            .column("Age", 80.0, |r: &Row| text(format!("{}", r.age)))
+            .size(ControlSize::Md)
+            .height(100.0)
+            .selection(sel)
+            .on_activate(move |i| fired.set(Some(i)))
+            .into_element()
+    }
+
+    #[test]
+    fn table_activate_enter_should_fire_on_activate_with_selected_index() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(2));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness(activatable_table(100, sel, fired.clone()));
+
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            fired.get(),
+            Some(2),
+            "Enter on the selected row fires on_activate with the logical row index"
+        );
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(2),
+            "activation does not move the selection"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_activate_space_should_fire_on_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(3));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness(activatable_table(100, sel, fired.clone()));
+
+        press(&mut h, KeyCode::Space);
+        assert_eq!(
+            fired.get(),
+            Some(3),
+            "Space on the selected row fires on_activate"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_activate_autorepeat_should_not_refire() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(1));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness(activatable_table(100, sel, fired.clone()));
+
+        // An auto-repeat Enter (`repeat = true`, a long-press tick) must NOT fire activation — unlike navigation,
+        // activation is one-shot (RK-026).
+        let kev = KeyEvent::new(KeyCode::Enter, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            fired.get(),
+            None,
+            "auto-repeat Enter does not re-fire activation"
+        );
+        // A genuine (non-repeat) Enter still fires it.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(fired.get(), Some(1), "a non-repeat Enter fires activation");
+        drop(owner);
+    }
+
+    #[test]
+    fn table_activate_without_callback_should_not_panic() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::single(0));
+        // No `.on_activate` wired: Enter must be a safe no-op (no panic), leaving the selection put.
+        let mut h = harness(sample_table(100, Some(sel)));
+
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "Enter with no activation callback leaves the selection unchanged"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn table_activate_with_no_selection_should_select_first_not_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let sel = RwSignal::new(Selection::none());
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness(activatable_table(100, sel, fired.clone()));
+
+        // With nothing selected, Enter selects the first row (a second press then activates it) — it does not fire
+        // activation, which is defined only "on the selected row".
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            sel.get_untracked().selected(),
+            Some(0),
+            "Enter with no selection selects the first row"
+        );
+        assert_eq!(
+            fired.get(),
+            None,
+            "Enter with no selection does not fire activation"
         );
         drop(owner);
     }

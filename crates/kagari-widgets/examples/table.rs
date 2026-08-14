@@ -7,10 +7,13 @@
 //! A 500-row table with three columns and a sticky header; the body virtualizes (only the visible rows are
 //! built) and scrolls with the mouse wheel. Click a row to select it (the selected row tints Accent). Every
 //! column is **sortable** (#325): click a header to cycle `Asc → Desc → none` (a `▲`/`▼` marks the active one);
-//! the rows reorder without stale cells and the selection stays on its logical row.
+//! the rows reorder without stale cells and the selection stays on its logical row. Click the table (or a row)
+//! to focus it, then Arrow ↑/↓ + Home/End move the selection (#326) and **Enter/Space activate** the selected
+//! row (#365) — the status line above the table shows the last activated logical row index.
 
-use kagari_base::Px;
-use kagari_core::reactive::RwSignal;
+use kagari_base::{Px, SharedString};
+use kagari_core::reactive::prelude::*;
+use kagari_core::reactive::{RwSignal, rx};
 use kagari_core::{App, WindowOptions, div, text};
 use kagari_style::{ColorRole, Styled};
 use kagari_widgets::{Selection, table};
@@ -42,24 +45,40 @@ fn main() -> Result<(), kagari_core::AppError> {
         WindowOptions::default().title("kagari — table (500 rows, virtualized)"),
         || {
             let selection = RwSignal::new(Selection::none());
-            div().p_4().bg(ColorRole::Surface).child(
-                table(clips(500))
-                    .column_sortable(
-                        "Name",
-                        180.0,
-                        |c: &Clip| cell(c.name.clone()),
-                        |c: &Clip| c.name.clone(),
-                    )
-                    .column_sortable(
-                        "Duration",
-                        90.0,
-                        |c: &Clip| cell(c.duration.clone()),
-                        |c: &Clip| c.duration.clone(),
-                    )
-                    .column_sortable("Kind", 80.0, |c: &Clip| cell(c.kind), |c: &Clip| c.kind)
-                    .selection(selection)
-                    .height(360.0),
-            )
+            let activated = RwSignal::new(SharedString::from(
+                "Activated row: — (click the table, then press Enter/Space on a selected row)",
+            ));
+            div()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .bg(ColorRole::Surface)
+                .child(
+                    text(rx(move || activated.get()))
+                        .color_role(ColorRole::TextMuted)
+                        .size(Px(14.0)),
+                )
+                .child(
+                    table(clips(500))
+                        .column_sortable(
+                            "Name",
+                            180.0,
+                            |c: &Clip| cell(c.name.clone()),
+                            |c: &Clip| c.name.clone(),
+                        )
+                        .column_sortable(
+                            "Duration",
+                            90.0,
+                            |c: &Clip| cell(c.duration.clone()),
+                            |c: &Clip| c.duration.clone(),
+                        )
+                        .column_sortable("Kind", 80.0, |c: &Clip| cell(c.kind), |c: &Clip| c.kind)
+                        .selection(selection)
+                        .on_activate(move |i| {
+                            activated.set(SharedString::from(format!("Activated row: {i}")))
+                        })
+                        .height(360.0),
+                )
         },
     )?;
     app.run()
