@@ -10,9 +10,11 @@
 //! [`Div::gap`](kagari_core::element::Div::gap) between cells), and the vertical gap is folded into the row
 //! height. The widget owns the body [`ScrollHandle`] (wheel + keyboard scroll-to-selected).
 //!
-//! MVP scope: render + single-select + 2D keyboard nav + focus. Uniform item size is an invariant (the
-//! virtualized body requires it). **Follow-ups**: multi-select (Ctrl/Shift), resize-reactive column count
-//! (the viewport width is fixed at build), `Role::Grid`/`GridCell` a11y.
+//! MVP scope: render + single-select + 2D keyboard nav + focus + row activation. Uniform item size is an
+//! invariant (the virtualized body requires it). Activation (#368, mirroring [`Table`](crate::Table)):
+//! [`.on_activate`](GridView::on_activate) fires with the item index on Enter/Space/NumpadEnter over the
+//! keyboard-selected cell (one-shot per RK-026). **Follow-ups**: multi-select (Ctrl/Shift), resize-reactive
+//! column count (the viewport width is fixed at build), `Role::Grid`/`GridCell` a11y.
 
 use std::rc::Rc;
 
@@ -66,6 +68,7 @@ pub struct GridView {
     gap: f32,
     viewport: Size,
     selection: Option<RwSignal<GridSelection>>,
+    on_activate: Option<Rc<dyn Fn(usize)>>,
 }
 
 /// Creates a grid over `count` items, each `item_size` (logical px), building item `index` with
@@ -83,6 +86,7 @@ pub fn grid_view(
         gap: 0.0,
         viewport: Size { w: 240.0, h: 320.0 },
         selection: None,
+        on_activate: None,
     }
 }
 
@@ -106,6 +110,17 @@ impl GridView {
     /// but are not selectable.
     pub fn selection(mut self, selection: RwSignal<GridSelection>) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    /// Sets the cell **activation** callback (#368): invoked with the item index when the user activates the
+    /// keyboard-selected cell via Enter/Space/NumpadEnter. Distinct from [`.selection`](Self::selection), which
+    /// only moves the cursor. Optional — without it, Enter/Space merely settle the selection. One-shot: a
+    /// long-press does not re-fire it (RK-026). Mirrors [`Table::on_activate`](crate::Table::on_activate).
+    /// Activation needs a wired [`selection`](Self::selection) cursor and a selected cell; pressing Enter with
+    /// nothing selected selects item 0 instead (a second press then activates it).
+    pub fn on_activate(mut self, f: impl Fn(usize) + 'static) -> Self {
+        self.on_activate = Some(Rc::new(f));
         self
     }
 }
@@ -164,19 +179,35 @@ fn scroll_into_view(handle: &ScrollHandle, pos: usize, row_h: f32, body_height: 
 /// past the row edges); Down/Up move ±`cols` (staying put when there is no cell directly below/above). All
 /// moves are guarded (no `usize` underflow). The first nav press with no selection selects item 0. Scrolls to
 /// keep the selected item's row visible.
+#[allow(clippy::too_many_arguments)]
 fn keyboard(
     code: KeyCode,
+    repeat: bool,
     count: usize,
     cols: usize,
     selection: RwSignal<GridSelection>,
     handle: &ScrollHandle,
     row_h: f32,
     body_height: f32,
+    on_activate: Option<&dyn Fn(usize)>,
 ) {
     if count == 0 {
         return;
     }
     let cur = selection.get_untracked().selected();
+    // Activation (#368): Enter/Space/NumpadEnter on the selected cell fires `on_activate` with the item index —
+    // one-shot (RK-026: guard `repeat`; navigation, below, repeats). With no selection yet, fall through to select
+    // the first item (a second press then activates it).
+    if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+        if let Some(i) = cur {
+            if !repeat {
+                if let Some(f) = on_activate {
+                    f(i);
+                }
+            }
+            return;
+        }
+    }
     let next = match cur {
         Some(i) => match code {
             KeyCode::ArrowRight => {
@@ -207,7 +238,6 @@ fn keyboard(
                     i
                 }
             }
-            KeyCode::Enter | KeyCode::NumpadEnter => i,
             _ => return,
         },
         None => match code {
@@ -216,7 +246,8 @@ fn keyboard(
             | KeyCode::ArrowDown
             | KeyCode::ArrowUp
             | KeyCode::Enter
-            | KeyCode::NumpadEnter => 0,
+            | KeyCode::NumpadEnter
+            | KeyCode::Space => 0,
             _ => return,
         },
     };
@@ -238,6 +269,7 @@ impl IntoElement for GridView {
             gap,
             viewport,
             selection,
+            on_activate,
         } = self;
 
         // Column count from the viewport width. Guard the denominator: a zero-width item (or w+gap == 0) would
@@ -279,6 +311,7 @@ impl IntoElement for GridView {
                 let click_focus = focus.clone();
                 let kb_handle = handle.clone();
                 let body_h = viewport.h;
+                let activate = on_activate.clone();
                 div()
                     .rounded_md()
                     .border_w_1()
@@ -291,7 +324,17 @@ impl IntoElement for GridView {
                     .on_mouse_down(move |_, _| click_focus.focus())
                     // Navigation keys auto-repeat (hold to keep moving); unlike one-shot activation (RK-026).
                     .on_key_down(move |kev, _| {
-                        keyboard(kev.code, count, cols, sel, &kb_handle, row_h, body_h);
+                        keyboard(
+                            kev.code,
+                            kev.repeat,
+                            count,
+                            cols,
+                            sel,
+                            &kb_handle,
+                            row_h,
+                            body_h,
+                            activate.as_deref(),
+                        );
                     })
                     .child(body)
                     .into_element()
@@ -304,6 +347,7 @@ impl IntoElement for GridView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc as StdArc;
 
     use kagari_base::{NodeId, Size as BSize};
@@ -630,6 +674,132 @@ mod tests {
             selection.get_untracked().selected(),
             Some(1),
             "auto-repeat (long-press) keeps moving the selection"
+        );
+        drop(owner);
+    }
+
+    /// A 10-item grid wired to `sel` with an `.on_activate` that records the fired item index into `fired`.
+    fn activatable_grid(
+        n: usize,
+        sel: RwSignal<GridSelection>,
+        fired: Rc<Cell<Option<usize>>>,
+    ) -> AnyElement {
+        grid_view(n, ITEM, |i| text(format!("#{i}")).into_element())
+            .size(BSize { w: 320.0, h: 400.0 })
+            .selection(sel)
+            .on_activate(move |i| fired.set(Some(i)))
+            .into_element()
+    }
+
+    #[test]
+    fn grid_view_activate_enter_should_fire_on_activate_with_selected_index() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(4));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_grid(10, selection, fired)
+        });
+
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            fired.get(),
+            Some(4),
+            "Enter fires on_activate with the selected item index"
+        );
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(4),
+            "activation leaves the selection in place"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_activate_space_should_fire_on_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(3));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_grid(10, selection, fired)
+        });
+
+        press(&mut h, KeyCode::Space);
+        assert_eq!(
+            fired.get(),
+            Some(3),
+            "Space also fires on_activate with the selected item index"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_activate_autorepeat_should_not_refire() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(1));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_grid(10, selection, fired)
+        });
+
+        // An auto-repeat Enter (`repeat = true`, a long-press tick) must NOT re-fire activation (one-shot, RK-026).
+        let kev = KeyEvent::new(KeyCode::Enter, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            fired.get(),
+            None,
+            "auto-repeat Enter does not fire activation (one-shot, RK-026)"
+        );
+        // A genuine (non-repeat) Enter does fire.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(fired.get(), Some(1), "a non-repeat Enter fires activation");
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_activate_without_callback_should_not_panic() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::single(0));
+        let mut h = harness(|| sample_grid(10, Some(selection)));
+
+        // Enter with a selection but no `.on_activate` wired: no fire, no panic, selection unchanged.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(0),
+            "Enter with no callback leaves the selection unchanged and does not panic"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn grid_view_activate_with_no_selection_should_select_first_not_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let selection = RwSignal::new(GridSelection::none());
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_grid(10, selection, fired)
+        });
+
+        // Enter with nothing selected selects item 0 (does not activate — activation needs a selected cell).
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(0),
+            "Enter with no selection selects the first item"
+        );
+        assert_eq!(
+            fired.get(),
+            None,
+            "and does not fire activation (needs a selected cell)"
         );
         drop(owner);
     }
