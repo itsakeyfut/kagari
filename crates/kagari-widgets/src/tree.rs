@@ -10,9 +10,12 @@
 //! `RwSignal<TreeSelection<K>>` (an opaque type mirroring the [`Table`](crate::Table)'s — multi-select
 //! extends it non-breakingly), and `expanded` via `RwSignal<HashSet<K>>`.
 //!
-//! MVP scope: render + expand/collapse + single-select + keyboard nav. **Node keys must be unique**
-//! (`debug_assert`ed at build). Uniform row height is an invariant (the virtualized body requires it).
-//! **Follow-ups**: multi-select, drag-reorder (#178), lazy `TreeSource`, `Role::Tree` a11y.
+//! MVP scope: render + expand/collapse + single-select + keyboard nav + row activation. **Node keys must be
+//! unique** (`debug_assert`ed at build). Uniform row height is an invariant (the virtualized body requires it).
+//! Activation (#368, mirroring [`Table`](crate::Table)): [`.on_activate`](Tree::on_activate) fires with the
+//! node **key** on Enter/Space/NumpadEnter over the keyboard-selected row (one-shot per RK-026) — the payload is
+//! the key `K`, not a row index, since Tree selection is key-based. **Follow-ups**: multi-select, drag-reorder
+//! (#178), lazy `TreeSource`, `Role::Tree` a11y.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -108,6 +111,7 @@ pub struct Tree<K, T> {
     node_view: Option<NodeView<T>>,
     expanded: Option<RwSignal<HashSet<K>>>,
     selection: Option<RwSignal<TreeSelection<K>>>,
+    on_activate: Option<Rc<dyn Fn(K)>>,
     size: ControlSize,
     body_height: f32,
 }
@@ -124,6 +128,7 @@ where
         node_view: None,
         expanded: None,
         selection: None,
+        on_activate: None,
         size: ControlSize::Md,
         body_height: 320.0,
     }
@@ -152,6 +157,18 @@ where
     /// `Accent`. Unset ⇒ rows render inert (no selection, no keyboard nav).
     pub fn selection(mut self, selection: RwSignal<TreeSelection<K>>) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    /// Sets the row **activation** callback (#368): invoked with the node **key** `K` when the user activates the
+    /// keyboard-selected row via Enter/Space/NumpadEnter. Distinct from [`.selection`](Self::selection), which only
+    /// moves the cursor. The payload is the node **key** (not a row index) — Tree selection is key-based, unlike
+    /// [`Table`](crate::Table)/[`GridView`](crate::GridView) whose ids are `usize`. Optional. One-shot: a
+    /// long-press does not re-fire it (RK-026). Activation needs a wired [`selection`](Self::selection) cursor and
+    /// a selected row; pressing Enter with nothing selected selects the first visible row instead (a second press
+    /// then activates it).
+    pub fn on_activate(mut self, f: impl Fn(K) + 'static) -> Self {
+        self.on_activate = Some(Rc::new(f));
         self
     }
 
@@ -353,15 +370,19 @@ fn scroll_into_view(handle: &ScrollHandle, pos: usize, row_h: f32, body_height: 
 
 /// Handles a key press: Down/Up move the selection over the visible order (falling back to the first visible
 /// when the current selection is hidden); Right expands or descends; Left collapses or ascends to the parent;
-/// Enter selects. Scrolls to keep the selected row visible.
+/// Enter/Space/NumpadEnter activate the selected row via `on_activate` (one-shot, RK-026), or select the first
+/// visible row when nothing is selected yet. Scrolls to keep the selected row visible.
+#[allow(clippy::too_many_arguments)]
 fn keyboard<K: Copy + Eq + Hash + Send + Sync + 'static>(
     code: KeyCode,
+    repeat: bool,
     meta: &[NodeMeta<K>],
     expanded: RwSignal<HashSet<K>>,
     selection: RwSignal<TreeSelection<K>>,
     handle: &ScrollHandle,
     row_h: f32,
     body_height: f32,
+    on_activate: Option<&dyn Fn(K)>,
 ) {
     let vis = expanded.with_untracked(|s| visible(meta, s));
     if vis.is_empty() {
@@ -382,6 +403,24 @@ fn keyboard<K: Copy + Eq + Hash + Send + Sync + 'static>(
         selection.set(TreeSelection::single(key));
         scroll_into_view(handle, pos, row_h, body_height);
     };
+
+    // Activation (#368): Enter/Space/NumpadEnter on the selected row fires `on_activate` with the node key —
+    // one-shot (RK-026: guard `repeat`; navigation, below, repeats). With no selection yet, fall through to select
+    // the first visible row (a second press then activates it). Fires on the selected key (mirrors Table); a
+    // selected-but-hidden node still activates on its key.
+    if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+        match selection.get_untracked().selected() {
+            Some(k) => {
+                if !repeat {
+                    if let Some(f) = on_activate {
+                        f(k);
+                    }
+                }
+            }
+            None => select(0),
+        }
+        return;
+    }
 
     match code {
         KeyCode::ArrowDown => select(cur_pos.map(|p| (p + 1).min(vis.len() - 1)).unwrap_or(0)),
@@ -413,7 +452,6 @@ fn keyboard<K: Copy + Eq + Hash + Send + Sync + 'static>(
                 }
             }
         }
-        KeyCode::Enter | KeyCode::NumpadEnter if cur_pos.is_none() => select(0),
         _ => {}
     }
 }
@@ -429,6 +467,7 @@ where
             node_view,
             expanded,
             selection,
+            on_activate,
             size,
             body_height,
         } = self;
@@ -489,6 +528,7 @@ where
                 let click_focus = focus.clone();
                 let meta_kb = meta.clone();
                 let kb_handle = handle.clone();
+                let activate = on_activate.clone();
                 div()
                     .rounded_md()
                     .border_w_1()
@@ -503,12 +543,14 @@ where
                     .on_key_down(move |kev, _| {
                         keyboard(
                             kev.code,
+                            kev.repeat,
                             &meta_kb,
                             expanded,
                             sel,
                             &kb_handle,
                             row_h,
                             body_height,
+                            activate.as_deref(),
                         );
                     })
                     .child(body)
@@ -522,6 +564,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc as StdArc;
 
     use kagari_base::{NodeId, Point, Size as BSize};
@@ -889,6 +932,140 @@ mod tests {
             selection.get_untracked().selected(),
             Some(3),
             "auto-repeat (long-press) keeps moving the selection"
+        );
+        drop(owner);
+    }
+
+    /// A tree wired to `sel` with an `.on_activate` that records the fired node key into `fired`.
+    fn activatable_tree(
+        expanded: RwSignal<HashSet<u32>>,
+        sel: RwSignal<TreeSelection<u32>>,
+        fired: Rc<Cell<Option<u32>>>,
+    ) -> AnyElement {
+        tree(sample())
+            .node(|n: &&'static str| text(*n))
+            .expanded(expanded)
+            .selection(sel)
+            .on_activate(move |k| fired.set(Some(k)))
+            .size(ControlSize::Md)
+            .height(200.0)
+            .into_element()
+    }
+
+    #[test]
+    fn tree_activate_enter_should_fire_on_activate_with_selected_key() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::single(3)); // visible [0, 3, 6], selected key 3
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_tree(expanded, selection, fired)
+        });
+
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            fired.get(),
+            Some(3),
+            "Enter fires on_activate with the selected node key"
+        );
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(3),
+            "activation leaves the selection in place"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_activate_space_should_fire_on_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::single(6));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_tree(expanded, selection, fired)
+        });
+
+        press(&mut h, KeyCode::Space);
+        assert_eq!(
+            fired.get(),
+            Some(6),
+            "Space also fires on_activate with the selected node key"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_activate_autorepeat_should_not_refire() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::single(0));
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_tree(expanded, selection, fired)
+        });
+
+        // An auto-repeat Enter (`repeat = true`, a long-press tick) must NOT re-fire activation (one-shot, RK-026).
+        let kev = KeyEvent::new(KeyCode::Enter, Modifiers::default(), true, true);
+        dispatch_key(&mut h.root, &h.arena, Some(h.root_id), &kev);
+        assert_eq!(
+            fired.get(),
+            None,
+            "auto-repeat Enter does not fire activation (one-shot, RK-026)"
+        );
+        // A genuine (non-repeat) Enter does fire.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(fired.get(), Some(0), "a non-repeat Enter fires activation");
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_activate_without_callback_should_not_panic() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::single(0));
+        let mut h = harness(|| sample_tree(expanded, Some(selection)));
+
+        // Enter with a selection but no `.on_activate` wired: no fire, no panic, selection unchanged.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(0),
+            "Enter with no callback leaves the selection unchanged and does not panic"
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn tree_activate_with_no_selection_should_select_first_not_activate() {
+        let owner = Owner::new();
+        owner.set();
+        let expanded = RwSignal::new(HashSet::new());
+        let selection = RwSignal::new(TreeSelection::none());
+        let fired = Rc::new(Cell::new(None));
+        let mut h = harness({
+            let fired = fired.clone();
+            move || activatable_tree(expanded, selection, fired)
+        });
+
+        // Enter with nothing selected selects the first visible row (key 0); it does not activate.
+        press(&mut h, KeyCode::Enter);
+        assert_eq!(
+            selection.get_untracked().selected(),
+            Some(0),
+            "Enter with no selection selects the first visible row"
+        );
+        assert_eq!(
+            fired.get(),
+            None,
+            "and does not fire activation (needs a selected row)"
         );
         drop(owner);
     }
